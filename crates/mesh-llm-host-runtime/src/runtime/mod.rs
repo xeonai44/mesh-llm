@@ -902,6 +902,7 @@ fn runtime_process_payload_with_status(
     api::RuntimeProcessPayload {
         name: name.to_string(),
         instance_id: instance_id.map(str::to_string),
+        profile: String::new(),
         backend: handle.backend.clone(),
         status: status.to_string(),
         port: handle.port,
@@ -1033,7 +1034,7 @@ async fn register_runtime_instance(
             capabilities,
         )
         .await;
-        advertise_model_ready(node, primary_model_name, model_name).await;
+        advertise_model_ready(node, primary_model_name, model_name, "").await;
     }
 }
 
@@ -1068,7 +1069,7 @@ async fn unregister_runtime_instance(
     }
     if became_empty {
         set_advertised_model_context(node, model_name, None).await;
-        withdraw_advertised_model(node, model_name).await;
+        withdraw_advertised_model(node, model_name, "").await;
         remove_serving_assignment(node, model_name).await;
         true
     } else {
@@ -1784,6 +1785,7 @@ async fn startup_register_loaded_runtime(
     let payload = local_process_payload(
         loaded_name,
         Some(ctx.instance_id),
+        "",
         &handle.backend,
         handle.port,
         handle.pid(),
@@ -2818,6 +2820,7 @@ struct StartupModelSpec {
     n_batch: Option<u32>,
     n_ubatch: Option<u32>,
     flash_attention: FlashAttentionType,
+    profile: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2849,6 +2852,8 @@ struct StartupModelPlan {
     n_batch: Option<u32>,
     n_ubatch: Option<u32>,
     flash_attention: FlashAttentionType,
+    #[allow(dead_code)]
+    profile: String,
 }
 
 fn resolve_runtime_owner_key_path(options: &RuntimeOptions) -> Result<Option<PathBuf>> {
@@ -3650,6 +3655,7 @@ async fn run_runtime_cli(
     }
 
     let config = plugin::load_config(options.config.as_deref())?;
+    apply_runtime_config_options(&mut options, &config);
     let startup_mesh_creation_state = resolve_startup_mesh_creation_state(&options, &config)?;
     let cli_has_explicit_models = cli_has_explicit_models(&options);
     let has_config_models = !config.models.is_empty();
@@ -3702,6 +3708,11 @@ async fn run_runtime_cli(
         embedded_control_rx,
     })
     .await
+}
+
+fn apply_runtime_config_options(options: &mut RuntimeOptions, config: &plugin::MeshConfig) {
+    options.debug |= config.runtime.debug;
+    options.listen_all |= config.runtime.listen_all;
 }
 
 #[cfg(test)]
@@ -3864,6 +3875,7 @@ async fn reconcile_model_targets_once(ctx: ReconcileModelTargetsContext<'_>) {
             ModelTargetReconciliationCandidate {
                 rank: target.rank,
                 model_ref: target.model_ref,
+                profile: target.profile,
                 model_name: target.model_name,
                 wanted: target.wanted,
                 wanted_reason: target.wanted_reason,
@@ -3893,17 +3905,26 @@ async fn reconcile_model_targets_once(ctx: ReconcileModelTargetsContext<'_>) {
 
     for action in actions {
         let load_spec = action.load_spec.to_string_lossy().to_string();
-        state.mark_load_started(&action.model_ref);
+        let profile = action.profile.clone();
+        state.mark_load_started(&action.model_ref, &profile);
         let event_tx = runtime_event_tx.clone();
         let model_ref = action.model_ref.clone();
         let control_tx = control_tx.clone();
         let replace_model_ref = action.replace_model_ref.clone();
+        let event_profile = action.profile.clone();
         tokio::spawn(async move {
-            let result =
-                run_model_target_reconciliation_action(control_tx, load_spec, replace_model_ref)
-                    .await;
-            let _ = event_tx
-                .send(RuntimeEvent::ModelTargetReconciliationLoadFinished { model_ref, result });
+            let result = run_model_target_reconciliation_action(
+                control_tx,
+                load_spec,
+                replace_model_ref,
+                profile,
+            )
+            .await;
+            let _ = event_tx.send(RuntimeEvent::ModelTargetReconciliationLoadFinished {
+                model_ref,
+                profile: event_profile,
+                result,
+            });
         });
         emit_model_target_reconciliation_queued(&action);
     }
@@ -3913,11 +3934,12 @@ async fn run_model_target_reconciliation_action(
     control_tx: tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
     load_spec: String,
     replace_model_ref: Option<String>,
+    profile: String,
 ) -> std::result::Result<api::RuntimeLoadResponse, String> {
     if let Some(replace_model_ref) = replace_model_ref {
         run_model_target_reconciliation_unload(control_tx.clone(), replace_model_ref).await?;
     }
-    run_model_target_reconciliation_load(control_tx, load_spec).await
+    run_model_target_reconciliation_load(control_tx, load_spec, profile).await
 }
 
 async fn run_model_target_reconciliation_unload(
@@ -3941,11 +3963,13 @@ async fn run_model_target_reconciliation_unload(
 async fn run_model_target_reconciliation_load(
     control_tx: tokio::sync::mpsc::UnboundedSender<api::RuntimeControlRequest>,
     load_spec: String,
+    profile: String,
 ) -> std::result::Result<api::RuntimeLoadResponse, String> {
     let (resp, response) = tokio::sync::oneshot::channel();
     control_tx
         .send(api::RuntimeControlRequest::Load {
             spec: load_spec.clone(),
+            profile: profile.clone(),
             resp,
         })
         .map_err(|_| format!("runtime load queue closed for '{load_spec}'"))?;
@@ -4060,6 +4084,7 @@ fn build_startup_model_specs(
                 n_batch: None,
                 n_ubatch: None,
                 flash_attention: FlashAttentionType::Auto,
+                profile: String::new(),
             });
         }
         for model in &options.model {
@@ -4075,6 +4100,7 @@ fn build_startup_model_specs(
                 n_batch: None,
                 n_ubatch: None,
                 flash_attention: FlashAttentionType::Auto,
+                profile: String::new(),
             });
         }
         if let Some(mmproj) = &options.mmproj
@@ -4098,6 +4124,7 @@ fn build_startup_model_specs(
             n_batch: model.batch,
             n_ubatch: model.ubatch,
             flash_attention: model.flash_attention.unwrap_or(FlashAttentionType::Auto),
+            profile: model.derived_profile(),
         });
     }
     Ok(specs)
@@ -4162,6 +4189,7 @@ async fn resolve_startup_models(
             n_batch: spec.n_batch,
             n_ubatch: spec.n_ubatch,
             flash_attention: spec.flash_attention,
+            profile: spec.profile.clone(),
         });
     }
     Ok(plans)
@@ -4767,6 +4795,7 @@ fn startup_model_plan_fixture() -> Vec<StartupModelPlan> {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         },
         StartupModelPlan {
             declared_ref: "Model-B".to_string(),
@@ -4787,6 +4816,7 @@ fn startup_model_plan_fixture() -> Vec<StartupModelPlan> {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         },
     ]
 }
@@ -4858,6 +4888,7 @@ fn startup_launch_plan_uses_metal_device_fallback_for_unpinned_model() {
         n_batch: None,
         n_ubatch: None,
         flash_attention: FlashAttentionType::Auto,
+        profile: String::new(),
     }];
 
     let plan = startup_launch_plan(
@@ -4996,6 +5027,7 @@ fn dashboard_lanes_prefer_sparse_slot_ids() {
     let process = api::RuntimeProcessPayload {
         name: "model-a".to_string(),
         instance_id: None,
+        profile: String::new(),
         backend: "skippy".to_string(),
         status: "ready".to_string(),
         port: 4001,
@@ -5031,6 +5063,7 @@ fn dashboard_lanes_fall_back_to_slot_index_when_id_is_missing() {
     let process = api::RuntimeProcessPayload {
         name: "model-a".to_string(),
         instance_id: None,
+        profile: String::new(),
         backend: "skippy".to_string(),
         status: "ready".to_string(),
         port: 4001,
@@ -5074,6 +5107,7 @@ fn dashboard_lanes_prefer_instance_snapshot_for_duplicate_models() {
     let process = api::RuntimeProcessPayload {
         name: "model-a".to_string(),
         instance_id: Some("runtime-2".to_string()),
+        profile: String::new(),
         backend: "skippy".to_string(),
         status: "ready".to_string(),
         port: 4002,
@@ -7159,6 +7193,7 @@ fn cleanup_run_auto_runtime_dir(
 async fn run_auto_load_runtime_model(
     ctx: &mut RunAutoRuntimeLoopContext<'_>,
     spec: String,
+    profile: String,
 ) -> Result<api::RuntimeLoadResponse> {
     let model_path = resolve_model(&PathBuf::from(&spec)).await?;
     let runtime_model_name = find_remote_catalog_model_exact_blocking(spec.clone())
@@ -7186,7 +7221,11 @@ async fn run_auto_load_runtime_model(
                 fallback
             })
     };
-    let model_overrides = ctx.config.models.iter().find(|m| m.model == spec);
+    let model_overrides = ctx
+        .config
+        .models
+        .iter()
+        .find(|m| m.model == spec && m.derived_profile() == *profile);
     let ctx_size_override = runtime_model_ctx_size_override(ctx.options, model_overrides);
     let parallel_override = model_overrides
         .and_then(|m| m.parallel)
@@ -7277,6 +7316,7 @@ async fn run_auto_load_runtime_model(
     let payload = local_process_payload(
         &loaded_name,
         Some(&instance_id),
+        &profile,
         &handle.backend,
         handle.port,
         handle.pid(),
@@ -7337,6 +7377,7 @@ async fn run_auto_load_runtime_model(
         model_ref: requested_model,
         model: loaded_name,
         instance_id,
+        profile: profile.clone(),
         backend: Some(loaded_backend),
         context_length: Some(loaded_context_length),
     })
@@ -7376,7 +7417,7 @@ async fn run_auto_unload_runtime_model(
                     &model,
                     Some(&unload.instance_id),
                 );
-                withdraw_advertised_model(ctx.node, &model).await;
+                withdraw_advertised_model(ctx.node, &model, "").await;
                 set_advertised_model_context(ctx.node, &model, None).await;
                 remove_serving_assignment(ctx.node, &model).await;
             }
@@ -7587,12 +7628,14 @@ fn run_auto_record_model_target_manual_unload(
     let now_secs = runtime_unix_secs();
     ctx.model_target_reconciliation_state.record_manual_unload(
         requested_target,
+        "",
         now_secs,
         &ctx.model_target_reconciliation_policy,
     );
     if response.model != requested_target {
         ctx.model_target_reconciliation_state.record_manual_unload(
             &response.model,
+            "",
             now_secs,
             &ctx.model_target_reconciliation_policy,
         );
@@ -7602,12 +7645,26 @@ fn run_auto_record_model_target_manual_unload(
 fn run_auto_handle_model_target_reconciliation_result(
     ctx: &mut RunAutoRuntimeLoopContext<'_>,
     model_ref: String,
+    profile: String,
     result: std::result::Result<api::RuntimeLoadResponse, String>,
 ) {
     match result {
         Ok(response) => {
+            let load_profile = if response.profile.is_empty() {
+                profile.clone()
+            } else {
+                response.profile.clone()
+            };
             ctx.model_target_reconciliation_state
-                .record_load_success(&model_ref);
+                .record_load_success(&model_ref, &load_profile);
+            if !load_profile.is_empty() && load_profile != profile {
+                tracing::warn!(
+                    model_ref = %model_ref,
+                    requested_profile = %profile,
+                    loaded_profile = %load_profile,
+                    "model target reconciliation load response profile differs from requested profile"
+                );
+            }
             let _ = emit_event(OutputEvent::Info {
                 message: format!("Model target reconciliation loaded '{}'", response.model),
                 context: Some(format!(
@@ -7619,6 +7676,7 @@ fn run_auto_handle_model_target_reconciliation_result(
         Err(error) => {
             ctx.model_target_reconciliation_state.record_load_failure(
                 &model_ref,
+                &profile,
                 runtime_unix_secs(),
                 &ctx.model_target_reconciliation_policy,
             );
@@ -7640,8 +7698,12 @@ async fn run_auto_handle_control_request(
             let _ = resp.send(result);
             false
         }
-        api::RuntimeControlRequest::Load { spec, resp } => {
-            let result = run_auto_load_runtime_model(ctx, spec).await;
+        api::RuntimeControlRequest::Load {
+            spec,
+            profile,
+            resp,
+        } => {
+            let result = run_auto_load_runtime_model(ctx, spec, profile).await;
             let _ = resp.send(result);
             false
         }
@@ -7780,8 +7842,17 @@ async fn run_auto_runtime_event_loop(
             }
             Some(event) = runtime_event_rx.recv() => {
                 match event {
-                    RuntimeEvent::ModelTargetReconciliationLoadFinished { model_ref, result } => {
-                        run_auto_handle_model_target_reconciliation_result(ctx, model_ref, result);
+                    RuntimeEvent::ModelTargetReconciliationLoadFinished {
+                        model_ref,
+                        profile,
+                        result,
+                    } => {
+                        run_auto_handle_model_target_reconciliation_result(
+                            ctx,
+                            model_ref,
+                            profile,
+                            result,
+                        );
                     }
                     RuntimeEvent::Exited { instance_id, model, port } => {
                         run_auto_handle_runtime_exit(ctx, instance_id, model, port).await;
@@ -9209,6 +9280,7 @@ mod tests {
             rank: 1,
             model_ref: "org/model@main:model.gguf".to_string(),
             display_name: "Model".to_string(),
+            profile: String::new(),
             model_name: Some("Model".to_string()),
             explicit_interest_count: 1,
             request_count: 0,
@@ -9275,6 +9347,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_enables_debug_and_listen_all_options() {
+        let mut options = RuntimeOptions::default();
+        let mut config = plugin::MeshConfig::default();
+        config.runtime.debug = true;
+        config.runtime.listen_all = true;
+
+        apply_runtime_config_options(&mut options, &config);
+
+        assert!(options.debug);
+        assert!(options.listen_all);
+    }
+
+    #[test]
+    fn explicit_debug_and_listen_all_options_survive_false_config_defaults() {
+        let mut options = RuntimeOptions {
+            debug: true,
+            listen_all: true,
+            ..RuntimeOptions::default()
+        };
+        let config = plugin::MeshConfig::default();
+
+        apply_runtime_config_options(&mut options, &config);
+
+        assert!(options.debug);
+        assert!(options.listen_all);
+    }
+
+    #[test]
     fn mdns_discovery_does_not_start_relay_health_monitor() {
         assert!(!should_start_relay_health_monitor(
             mesh_discovery::MeshDiscoveryMode::Mdns
@@ -9308,10 +9408,12 @@ mod tests {
     async fn model_target_reconciliation_replacement_unloads_before_loading() {
         let (control_tx, mut control_rx) =
             tokio::sync::mpsc::unbounded_channel::<api::RuntimeControlRequest>();
+        let profile = "low-ctx".to_string();
         let task = tokio::spawn(run_model_target_reconciliation_action(
             control_tx,
             "/models/large.gguf".to_string(),
             Some("Small".to_string()),
+            profile.clone(),
         ));
 
         match control_rx.recv().await {
@@ -9327,12 +9429,18 @@ mod tests {
             _ => panic!("expected unload request before load"),
         }
         match control_rx.recv().await {
-            Some(api::RuntimeControlRequest::Load { spec, resp }) => {
+            Some(api::RuntimeControlRequest::Load {
+                spec,
+                profile,
+                resp,
+            }) => {
                 assert_eq!(spec, "/models/large.gguf");
+                assert_eq!(profile, "low-ctx");
                 resp.send(Ok(api::RuntimeLoadResponse {
                     model_ref: spec,
                     model: "Large".to_string(),
                     instance_id: "runtime-2".to_string(),
+                    profile,
                     backend: Some("skippy".to_string()),
                     context_length: Some(4096),
                 }))
@@ -9402,6 +9510,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }
     }
 
@@ -9753,6 +9862,7 @@ mod tests {
             pid: 1234,
             slots: 4,
             context_length: Some(8192),
+            profile: String::new(),
         }]));
         let inventory_model_name = model_name.clone();
         let provider = RuntimeDashboardSnapshotProvider::with_inventory_loader(
@@ -9830,6 +9940,7 @@ mod tests {
                 pid: 1234,
                 slots: 2,
                 context_length: Some(8192),
+                profile: String::new(),
             },
             api::RuntimeProcessPayload {
                 name: "model-b".to_string(),
@@ -9840,6 +9951,7 @@ mod tests {
                 pid: 1235,
                 slots: 2,
                 context_length: Some(8192),
+                profile: String::new(),
             },
         ]));
         producer.publish_llama_slots_snapshot(crate::runtime_data::RuntimeLlamaSlotsSnapshot {
@@ -9945,6 +10057,7 @@ mod tests {
             pid: 132098,
             slots: 4,
             context_length: Some(65_536),
+            profile: String::new(),
         }]));
         let provider = RuntimeDashboardSnapshotProvider::with_inventory_loader(
             node,
@@ -10001,6 +10114,7 @@ mod tests {
             pid: 132099,
             slots: 4,
             context_length: None,
+            profile: String::new(),
         }]));
         let provider = RuntimeDashboardSnapshotProvider::with_inventory_loader(
             node,
@@ -10331,6 +10445,63 @@ mod tests {
     }
 
     #[test]
+    fn test_build_startup_model_specs_carries_profile_from_config() {
+        let options = runtime_options_for_test(&["mesh-llm"]);
+        let config = plugin::MeshConfig {
+            models: vec![
+                plugin::ModelConfigEntry {
+                    model: "Qwen3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ctx_size: Some(4096),
+                    gpu_id: None,
+                    parallel: None,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    batch: None,
+                    ubatch: None,
+                    flash_attention: None,
+                    ..Default::default()
+                },
+                plugin::ModelConfigEntry {
+                    model: "Qwen3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ctx_size: Some(8192),
+                    gpu_id: None,
+                    parallel: None,
+                    cache_type_k: None,
+                    cache_type_v: None,
+                    batch: None,
+                    ubatch: None,
+                    flash_attention: None,
+                    ..Default::default()
+                },
+                plugin::ModelConfigEntry {
+                    model: "Llama-3-8B-Q4_K_M".into(),
+                    mmproj: None,
+                    ..Default::default()
+                },
+            ],
+            ..plugin::MeshConfig::default()
+        };
+
+        let specs = build_startup_model_specs(&options, &config).unwrap();
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].model_ref, PathBuf::from("Qwen3-8B-Q4_K_M"));
+        let profile_4096 = config.models[0].derived_profile();
+        let profile_8192 = config.models[1].derived_profile();
+        let profile_default = config.models[2].derived_profile();
+        assert_eq!(specs[0].profile, profile_4096);
+        assert_eq!(specs[1].model_ref, PathBuf::from("Qwen3-8B-Q4_K_M"));
+        assert_eq!(specs[1].profile, profile_8192);
+        assert_ne!(
+            profile_4096, profile_8192,
+            "different ctx_size must produce different derived profiles"
+        );
+        assert_eq!(specs[2].model_ref, PathBuf::from("Llama-3-8B-Q4_K_M"));
+        assert_eq!(specs[2].profile, profile_default);
+    }
+
+    #[test]
     fn early_tui_spawns_before_llama_ready_in_active_flow() {
         assert_active_serve_path_spawn_gate_behavior();
     }
@@ -10382,6 +10553,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let gpus = vec![
             synthetic_gpu(0, Some("pci:0000:65:00.0"), Some("CUDA0")),
@@ -10438,6 +10610,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let mut plans = vec![StartupModelPlan {
             declared_ref: "Qwen3-8B-Q4_K_M".into(),
@@ -10452,6 +10625,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let gpus = vec![synthetic_gpu(1, Some("pci:0000:b3:00.0"), Some("Vulkan1"))];
         let backend_probe = backend::BinaryBackendDeviceProbe {
@@ -10496,6 +10670,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let mut plans = vec![StartupModelPlan {
             declared_ref: "Qwen3-8B-Q4_K_M".into(),
@@ -10510,6 +10685,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let gpus = vec![synthetic_gpu(1, Some("pci:0000:b3:00.0"), Some("ROCm1"))];
         let backend_probe = backend::BinaryBackendDeviceProbe {
@@ -10587,6 +10763,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let gpus = vec![synthetic_gpu(0, Some("pci:0000:65:00.0"), Some("CUDA0"))];
 
@@ -10620,6 +10797,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let mut plans = vec![StartupModelPlan {
             declared_ref: "Qwen3-8B-Q4_K_M".into(),
@@ -10634,6 +10812,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let gpus = vec![synthetic_gpu(0, Some("pci:0000:65:00.0"), Some("CUDA0"))];
 
@@ -10668,6 +10847,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let mut plans = vec![StartupModelPlan {
             declared_ref: "Qwen3-8B-Q4_K_M".into(),
@@ -10682,6 +10862,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let mut gpus = vec![synthetic_gpu(3, Some("uuid:GPU-123"), Some("CUDA3"))];
         gpus[0].reserved_bytes = Some(500_000_000);
@@ -10718,6 +10899,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let mut plans = vec![StartupModelPlan {
             declared_ref: "Qwen3-8B-Q4_K_M".into(),
@@ -10732,6 +10914,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let gpus = vec![synthetic_gpu(3, Some("uuid:GPU-123"), None)];
 
@@ -10766,6 +10949,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let mut plans = vec![StartupModelPlan {
             declared_ref: "Qwen3-8B-Q4_K_M".into(),
@@ -10780,6 +10964,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
         let gpus = vec![synthetic_gpu(0, Some("pci:0000:65:00.0"), Some("CUDA0"))];
 
@@ -10820,6 +11005,7 @@ mod tests {
             n_batch: None,
             n_ubatch: None,
             flash_attention: FlashAttentionType::Auto,
+            profile: String::new(),
         }];
 
         assert!(!should_show_serve_config_help(
@@ -10977,7 +11163,7 @@ mod tests {
         .await;
 
         add_serving_assignment(&host, "Primary", "Runtime").await;
-        advertise_model_ready(&host, "Primary", "Runtime").await;
+        advertise_model_ready(&host, "Primary", "Runtime", "").await;
         observer.sync_from_peer_for_tests(&host).await;
 
         wait_for_condition(Duration::from_secs(5), || {
@@ -10996,7 +11182,7 @@ mod tests {
         .await;
 
         remove_serving_assignment(&host, "Runtime").await;
-        withdraw_advertised_model(&host, "Runtime").await;
+        withdraw_advertised_model(&host, "Runtime", "").await;
         observer.sync_from_peer_for_tests(&host).await;
 
         wait_for_condition(Duration::from_secs(5), || {
