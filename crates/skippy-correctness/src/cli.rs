@@ -18,6 +18,8 @@ pub enum CommandKind {
     DtypeMatrix(DtypeMatrixArgs),
     StateHandoff(StateHandoffArgs),
     NativeMtpOpenAiAb(Box<NativeMtpOpenAiAbArgs>),
+    GlmDsaStage0Trace(Box<GlmDsaStage0TraceArgs>),
+    StageFaParity(StageFaParityArgs),
 }
 
 #[derive(Args, Clone)]
@@ -270,6 +272,51 @@ pub struct NativeMtpOpenAiAbArgs {
     pub allow_mismatch: bool,
 }
 
+#[derive(Args)]
+pub struct GlmDsaStage0TraceArgs {
+    #[command(flatten)]
+    pub runtime: RuntimeArgs,
+    #[command(flatten)]
+    pub server: ServerArgs,
+    #[command(flatten)]
+    pub output: OutputArgs,
+    #[arg(long, default_value = "target/debug/skippy-prompt")]
+    pub prompt_bin: PathBuf,
+    #[arg(long, default_value = "127.0.0.1:19285")]
+    pub stage0_bind_addr: SocketAddr,
+    #[arg(long, default_value = "127.0.0.1:19286")]
+    pub fake_downstream_bind_addr: SocketAddr,
+    #[arg(long, default_value_t = 2)]
+    pub stage_layer_end: u32,
+    #[arg(long, default_value_t = 6144)]
+    pub activation_width: i32,
+    #[arg(long, default_value = "f16")]
+    pub activation_wire_dtype: String,
+    #[arg(long, default_value_t = 128)]
+    pub prefill_chunk_size: u32,
+    #[arg(long, default_value_t = 1)]
+    pub max_new_tokens: u32,
+    #[arg(long, default_value_t = 16)]
+    pub trace_values: u32,
+    #[arg(long, default_value_t = 256)]
+    pub trace_nodes: u32,
+    #[arg(long, default_value = "kqv_out-0,dsa_sparse_attn-0,indexer_score-1")]
+    pub trace_filter: String,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    pub trace_stats_max_bytes: u32,
+    #[arg(
+        long,
+        help = "Allow fused/direct traced tensor digest mismatches. By default, matching trace points must be byte-identical."
+    )]
+    pub allow_trace_mismatch: bool,
+    #[arg(long, default_value_t = 2e-4)]
+    pub activation_atol: f32,
+    #[arg(long, default_value_t = 5e-4)]
+    pub activation_relative_rmse_tolerance: f64,
+    #[arg(long)]
+    pub case_root: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum StatePayloadKind {
@@ -277,4 +324,28 @@ pub enum StatePayloadKind {
     FullState,
     RecurrentOnly,
     KvRecurrent,
+}
+
+#[derive(Args)]
+pub struct StageFaParityArgs {
+    #[arg(long)]
+    pub model: PathBuf,
+    #[arg(long, default_value = "unsloth/inkling-GGUF:UD-Q2_K_XL")]
+    pub model_id: String,
+    #[arg(long, default_value_t = 0)]
+    pub layer_start: u32,
+    #[arg(long)]
+    pub layer_end: u32,
+    #[arg(long, default_value_t = 2048)]
+    pub ctx_size: u32,
+    #[arg(long, default_value_t = 99)]
+    pub n_gpu_layers: i32,
+    #[arg(long, default_value = "Hello")]
+    pub prompt: String,
+    #[arg(long, default_value_t = 5e-3)]
+    pub max_abs: f32,
+    #[arg(long)]
+    pub enabled_output: Option<PathBuf>,
+    #[arg(long)]
+    pub disabled_output: Option<PathBuf>,
 }

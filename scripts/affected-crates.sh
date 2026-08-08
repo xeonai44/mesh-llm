@@ -20,6 +20,7 @@ WORKSPACE_MEMBERS=(
   "mesh-llm-identity"
   "mesh-llm-native-runtime"
   "mesh-llm-protocol"
+  "mesh-llm-release-footer"
   "mesh-llm-routing"
   "mesh-llm-runtime-install"
   "mesh-llm-sdk"
@@ -35,6 +36,8 @@ WORKSPACE_MEMBERS=(
   "mesh-llm-plugin-manager"
   "mesh-llm-client"
   "mesh-mixture-of-agents"
+  "mesh-native-serving-plugin-api"
+  "mesh-native-serving-plugin-host"
   "mesh-llm-api-client"
   "mesh-llm-api-server"
   "mesh-llm-node"
@@ -171,6 +174,7 @@ main() {
             [[ "$file" =~ ^scripts/(build-llama|prepare-llama|build-linux|build-linux-rocm|build-mac|build-windows|skippy-ci-smoke|ci-install-native-runtime|ci-prepare-native-runtime|ci-smoke-test|ci-compat-smoke|ci-client-auto-test|ci-two-node-client-serving-smoke|ci-two-node-split-smoke)\. ]] || \
        [[ "$file" =~ ^\.github/cache-version\.txt$ ]] || \
        [[ "$file" =~ ^scripts/plan-clippy-batches\.sh$ ]] || \
+       [[ "$file" =~ ^scripts/plan-test-batches\.sh$ ]] || \
        [[ "$file" =~ ^rust-toolchain(\.toml)?$ ]]; then
       escalate=true
     fi

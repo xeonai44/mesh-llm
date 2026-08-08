@@ -38,6 +38,7 @@ export default function(eleventyConfig) {
   eleventyConfig.addPassthroughCopy("src/assets");
   eleventyConfig.addPassthroughCopy({ "../install.sh": "install.sh" });
   eleventyConfig.addPassthroughCopy({ "../install.ps1": "install.ps1" });
+  eleventyConfig.addPassthroughCopy({ "../install.md": "setup-mesh" });
 
   eleventyConfig.amendLibrary("md", (md) => {
     md.set({
@@ -50,6 +51,9 @@ export default function(eleventyConfig) {
           } catch (e) {
             console.debug("highlight.js error for lang=%s: %s", hl, e);
           }
+        }
+        if (lang === "mermaid") {
+          return `<pre class="language-mermaid"><code class="language-mermaid">${md.utils.escapeHtml(str)}</code></pre>`;
         }
         return `<pre><code>${md.utils.escapeHtml(str)}</code></pre>`;
       },

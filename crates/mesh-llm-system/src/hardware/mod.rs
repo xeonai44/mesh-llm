@@ -235,6 +235,17 @@ fn read_windows_total_ram_bytes() -> Option<u64> {
     parse_windows_total_physical_memory(&output)
 }
 
+/// Per-GPU VRAM in adapter order.
+///
+/// Adapters that report no VRAM (virtual and headless displays commonly report
+/// none) keep a zero entry so this stays index-aligned with the adapter name
+/// list that `hydrate_gpu_facts_with_identities` indexes into. Dropping those
+/// entries shifts every later adapter's VRAM onto the wrong device.
+#[cfg(any(target_os = "windows", test))]
+fn windows_per_gpu_vram(controllers: &[(String, u64)]) -> Vec<u64> {
+    controllers.iter().map(|(_, ram)| *ram).collect()
+}
+
 #[cfg(target_os = "windows")]
 fn read_windows_video_controllers() -> Vec<(String, u64)> {
     let Some(output) = powershell_output(
@@ -249,11 +260,6 @@ fn read_windows_video_controllers() -> Vec<(String, u64)> {
 fn query_metal_recommended_working_set_bytes() -> Option<u64> {
     use std::ffi::{c_char, c_void};
 
-    #[link(name = "Metal", kind = "framework")]
-    unsafe extern "C" {
-        fn MTLCreateSystemDefaultDevice() -> *mut c_void;
-    }
-
     #[link(name = "objc")]
     unsafe extern "C" {
         fn sel_registerName(name: *const c_char) -> *mut c_void;
@@ -261,7 +267,13 @@ fn query_metal_recommended_working_set_bytes() -> Option<u64> {
     }
 
     unsafe {
-        let device = MTLCreateSystemDefaultDevice();
+        let metal =
+            libloading::Library::new("/System/Library/Frameworks/Metal.framework/Versions/A/Metal")
+                .ok()?;
+        let create_device = metal
+            .get::<unsafe extern "C" fn() -> *mut c_void>(b"MTLCreateSystemDefaultDevice")
+            .ok()?;
+        let device = create_device();
         if device.is_null() {
             return None;
         }
@@ -676,14 +688,10 @@ impl Collector for DefaultCollector {
                         survey.vram_bytes = total + (ram_offload as f64 * 0.90) as u64;
                     }
                 } else {
-                    let per_gpu: Vec<u64> = windows_gpus
-                        .iter()
-                        .map(|(_, ram)| *ram)
-                        .filter(|ram| *ram > 0)
-                        .collect();
+                    let per_gpu: Vec<u64> = windows_per_gpu_vram(&windows_gpus);
                     let total: u64 = per_gpu.iter().sum();
+                    survey.gpu_vram = per_gpu;
                     if total > 0 {
-                        survey.gpu_vram = per_gpu;
                         let ram_offload = system_ram.saturating_sub(total);
                         survey.vram_bytes = total + (ram_offload as f64 * 0.90) as u64;
                     } else if system_ram > 0 {

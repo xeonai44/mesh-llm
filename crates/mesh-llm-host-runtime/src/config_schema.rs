@@ -9,14 +9,10 @@ use mesh_llm_config::{
     built_in_config_schema,
 };
 use mesh_llm_plugin_manager::{
-    InstalledPluginApplyMode, InstalledPluginConditionOperator, InstalledPluginConditionValue,
-    InstalledPluginConditionalDisable, InstalledPluginConfigSchema, InstalledPluginConflictRule,
-    InstalledPluginConstraint, InstalledPluginControlAvailability,
-    InstalledPluginControlAvailabilitySource, InstalledPluginControlBehavior,
-    InstalledPluginControlCondition, InstalledPluginDisabledWritePolicy, InstalledPluginMetadata,
-    InstalledPluginOptionsSource, InstalledPluginPresentationMetadata, InstalledPluginRestartScope,
-    InstalledPluginTextFormat, InstalledPluginValueKind, InstalledPluginValueSchema,
-    InstalledPluginVisibility, PluginStore, default_store_root,
+    InstalledPluginApplyMode, InstalledPluginConfigSchema, InstalledPluginConstraint,
+    InstalledPluginMetadata, InstalledPluginPresentationMetadata, InstalledPluginRestartScope,
+    InstalledPluginValueKind, InstalledPluginValueSchema, InstalledPluginVisibility, PluginStore,
+    default_store_root,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -1000,6 +996,7 @@ mod tests {
                 enabled: true,
                 manifest: Some(InstalledPluginManifestMetadata {
                     config_schema: None,
+                    web_ui: None,
                 }),
                 last_protocol_version: None,
                 last_status: None,
@@ -1241,6 +1238,7 @@ mod tests {
                             }),
                         }],
                     }),
+                    web_ui: None,
                 }),
                 last_protocol_version: None,
                 last_status: None,
@@ -1292,6 +1290,7 @@ mod tests {
                     allow_unvalidated_config: false,
                     settings,
                 }),
+                web_ui: None,
             }),
             last_protocol_version: None,
             last_status: None,

@@ -17,7 +17,7 @@ fn skippy_stage_subprotocols(
     let mut features = vec![skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL.to_string()];
     if stage_protocol_generation_supported {
         features.push(
-            skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3.to_string(),
+            skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V4.to_string(),
         );
     }
     if artifact_transfer_supported {
@@ -50,7 +50,7 @@ fn supports_skippy_status_list(subprotocols: &[crate::proto::node::MeshSubprotoc
 fn supports_skippy_stage_generation(subprotocols: &[crate::proto::node::MeshSubprotocol]) -> bool {
     supports_skippy_stage_feature(
         subprotocols,
-        skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V3,
+        skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_PROTOCOL_GENERATION_V4,
     ) && supports_skippy_stage_feature(
         subprotocols,
         skippy_protocol::STAGE_SUBPROTOCOL_FEATURE_STAGE_CONTROL,
@@ -698,6 +698,7 @@ pub(crate) fn local_ann_to_proto_ann(
             ann.stage_protocol_generation_supported,
             ann.stage_status_list_supported,
         ),
+        inference_admission_state: ann.inference_admission_state.map(|state| state as i32),
     }
 }
 
@@ -896,6 +897,9 @@ pub(crate) fn proto_ann_to_local(
             let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
             iroh::PublicKey::from_bytes(&arr).ok()
         }),
+        inference_admission_state: pa
+            .inference_admission_state
+            .and_then(|v| crate::proto::node::InferenceAdmissionState::try_from(v).ok()),
     };
     crate::mesh::backfill_legacy_descriptors(&mut ann);
     ann.advertised_model_throughput = sanitize_model_throughput_hints_for_ann(&ann);
@@ -1057,6 +1061,7 @@ fn legacy_proto_config_to_mesh(
         .map(|p| PluginConfigEntry {
             name: p.name.clone(),
             enabled: p.enabled,
+            web_ui_enabled: None,
             command: p.command.clone(),
             args: p.args.clone(),
             url: None,

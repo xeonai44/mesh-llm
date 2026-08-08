@@ -1,10 +1,15 @@
 mod built_in_schema;
+mod runtime;
 mod schema_types;
 
 pub use built_in_schema::{
     BuiltInConfigPathResolution, built_in_config_schema_descriptor, built_in_config_settings,
     canonicalize_built_in_config_identifier, canonicalize_built_in_config_path,
     resolve_built_in_config_identifier, resolve_built_in_config_path,
+};
+pub use runtime::{
+    ActivityAdvertisement, ActivityResponse, DEFAULT_DRAIN_TIMEOUT_MAX_SECS,
+    DEFAULT_DRAIN_TIMEOUT_SECS, RuntimeActivityConfig, RuntimeMode, StartupFailurePolicy,
 };
 pub use schema_types::*;
 
@@ -65,12 +70,35 @@ fn default_model_target_demand_upgrade_max_age_secs() -> u64 {
     DEFAULT_MODEL_TARGET_DEMAND_UPGRADE_MAX_AGE_SECS
 }
 
+fn default_drain_timeout_secs() -> u64 {
+    runtime::DEFAULT_DRAIN_TIMEOUT_SECS
+}
+
+fn default_drain_timeout_max_secs() -> u64 {
+    runtime::DEFAULT_DRAIN_TIMEOUT_MAX_SECS
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RuntimeConfig {
     #[serde(default)]
     pub debug: bool,
     #[serde(default)]
     pub listen_all: bool,
+    /// Operating mode. Absent resolves to `Serve` for backward compatibility.
+    #[serde(default)]
+    pub mode: runtime::RuntimeMode,
+    /// How the runtime reacts when a model fails to load during startup.
+    #[serde(default)]
+    pub startup_failure_policy: runtime::StartupFailurePolicy,
+    /// Seconds before forcibly unloading a draining instance (default 30).
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+    /// Maximum allowed drain timeout cap in seconds (default 300).
+    #[serde(default = "default_drain_timeout_max_secs")]
+    pub drain_timeout_max_secs: u64,
+    /// Host activity detection and response policy.
+    #[serde(default)]
+    pub activity: runtime::RuntimeActivityConfig,
     #[serde(default)]
     pub reconcile_model_targets: bool,
     #[serde(default)]
@@ -88,6 +116,11 @@ impl Default for RuntimeConfig {
         Self {
             debug: false,
             listen_all: false,
+            mode: runtime::RuntimeMode::default(),
+            startup_failure_policy: runtime::StartupFailurePolicy::default(),
+            drain_timeout_secs: runtime::DEFAULT_DRAIN_TIMEOUT_SECS,
+            drain_timeout_max_secs: runtime::DEFAULT_DRAIN_TIMEOUT_MAX_SECS,
+            activity: runtime::RuntimeActivityConfig::default(),
             reconcile_model_targets: false,
             reconcile_model_target_demand_upgrades: false,
             native_runtime: NativeRuntimeConfig::default(),
@@ -559,8 +592,74 @@ pub struct SpeculativeConfig {
     pub draft_cache_type_v: Option<String>,
     pub ngram_min: Option<u32>,
     pub ngram_max: Option<u32>,
+    pub ngram_max_proposal_tokens: Option<u32>,
+    pub ngram_proposer: Option<String>,
+    pub extension_max_tokens: Option<u32>,
+    pub native_mtp_reject_cooldown_tokens: Option<u32>,
+    pub native_mtp_suppress_cooldown_drafts: Option<bool>,
+    pub native_mtp_suppress_cooldown_draft_limit: Option<u32>,
+    pub verify_window_min_tokens: Option<u32>,
+    pub verify_window_max_tokens: Option<u32>,
+    pub verify_window_pipeline_depth: Option<u32>,
     pub spec_default: Option<BoolOrAuto>,
     pub(crate) legacy_draft_model_path_used: bool,
+}
+
+impl SpeculativeConfig {
+    /// Resolves the three supported policy layers without discarding fields
+    /// that are not overridden by a more specific layer.
+    pub fn with_precedence(
+        overrides: Option<&Self>,
+        model: Option<&Self>,
+        defaults: Option<&Self>,
+    ) -> Self {
+        macro_rules! pick {
+            ($field:ident) => {
+                overrides
+                    .and_then(|config| config.$field.clone())
+                    .or_else(|| model.and_then(|config| config.$field.clone()))
+                    .or_else(|| defaults.and_then(|config| config.$field.clone()))
+            };
+        }
+
+        Self {
+            strategy: pick!(strategy),
+            mode: pick!(mode),
+            draft_model: pick!(draft_model),
+            draft_hf_repo: pick!(draft_hf_repo),
+            draft_hf_file: pick!(draft_hf_file),
+            draft_selection_policy: pick!(draft_selection_policy),
+            pairing_fault: pick!(pairing_fault),
+            draft_max_tokens: pick!(draft_max_tokens),
+            draft_min_tokens: pick!(draft_min_tokens),
+            draft_acceptance_threshold: pick!(draft_acceptance_threshold),
+            draft_split_probability: pick!(draft_split_probability),
+            draft_gpu_layers: pick!(draft_gpu_layers),
+            draft_device: pick!(draft_device),
+            draft_threads: pick!(draft_threads),
+            draft_cache_type_k: pick!(draft_cache_type_k),
+            draft_cache_type_v: pick!(draft_cache_type_v),
+            ngram_min: pick!(ngram_min),
+            ngram_max: pick!(ngram_max),
+            ngram_max_proposal_tokens: pick!(ngram_max_proposal_tokens),
+            ngram_proposer: pick!(ngram_proposer),
+            extension_max_tokens: pick!(extension_max_tokens),
+            native_mtp_reject_cooldown_tokens: pick!(native_mtp_reject_cooldown_tokens),
+            native_mtp_suppress_cooldown_drafts: pick!(native_mtp_suppress_cooldown_drafts),
+            native_mtp_suppress_cooldown_draft_limit: pick!(
+                native_mtp_suppress_cooldown_draft_limit
+            ),
+            verify_window_min_tokens: pick!(verify_window_min_tokens),
+            verify_window_max_tokens: pick!(verify_window_max_tokens),
+            verify_window_pipeline_depth: pick!(verify_window_pipeline_depth),
+            spec_default: pick!(spec_default),
+            legacy_draft_model_path_used: overrides
+                .filter(|config| config.draft_model.is_some())
+                .or_else(|| model.filter(|config| config.draft_model.is_some()))
+                .or_else(|| defaults.filter(|config| config.draft_model.is_some()))
+                .is_some_and(|config| config.legacy_draft_model_path_used),
+        }
+    }
 }
 
 /// Raw deserialization helper that accepts both `draft_model` and the legacy
@@ -569,7 +668,7 @@ pub struct SpeculativeConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SpeculativeConfigRaw {
-    #[serde(default, deserialize_with = "deserialize_speculative_strategy")]
+    #[serde(default)]
     strategy: Option<String>,
     #[serde(default)]
     mode: Option<String>,
@@ -608,6 +707,24 @@ struct SpeculativeConfigRaw {
     #[serde(default)]
     ngram_max: Option<u32>,
     #[serde(default)]
+    ngram_max_proposal_tokens: Option<u32>,
+    #[serde(default)]
+    ngram_proposer: Option<String>,
+    #[serde(default)]
+    extension_max_tokens: Option<u32>,
+    #[serde(default)]
+    native_mtp_reject_cooldown_tokens: Option<u32>,
+    #[serde(default)]
+    native_mtp_suppress_cooldown_drafts: Option<bool>,
+    #[serde(default)]
+    native_mtp_suppress_cooldown_draft_limit: Option<u32>,
+    #[serde(default)]
+    verify_window_min_tokens: Option<u32>,
+    #[serde(default)]
+    verify_window_max_tokens: Option<u32>,
+    #[serde(default)]
+    verify_window_pipeline_depth: Option<u32>,
+    #[serde(default)]
     spec_default: Option<BoolOrAuto>,
 }
 
@@ -643,6 +760,15 @@ impl<'de> Deserialize<'de> for SpeculativeConfig {
             draft_cache_type_v: raw.draft_cache_type_v,
             ngram_min: raw.ngram_min,
             ngram_max: raw.ngram_max,
+            ngram_max_proposal_tokens: raw.ngram_max_proposal_tokens,
+            ngram_proposer: raw.ngram_proposer,
+            extension_max_tokens: raw.extension_max_tokens,
+            native_mtp_reject_cooldown_tokens: raw.native_mtp_reject_cooldown_tokens,
+            native_mtp_suppress_cooldown_drafts: raw.native_mtp_suppress_cooldown_drafts,
+            native_mtp_suppress_cooldown_draft_limit: raw.native_mtp_suppress_cooldown_draft_limit,
+            verify_window_min_tokens: raw.verify_window_min_tokens,
+            verify_window_max_tokens: raw.verify_window_max_tokens,
+            verify_window_pipeline_depth: raw.verify_window_pipeline_depth,
             spec_default: raw.spec_default,
             legacy_draft_model_path_used: legacy_used,
         })
@@ -656,7 +782,7 @@ impl Serialize for SpeculativeConfig {
     {
         use serde::ser::SerializeMap;
 
-        let mut map = serializer.serialize_map(Some(21))?;
+        let mut map = serializer.serialize_map(Some(32))?;
         map.serialize_entry("strategy", &self.strategy)?;
         map.serialize_entry("mode", &self.mode)?;
         if self.legacy_draft_model_path_used {
@@ -684,26 +810,30 @@ impl Serialize for SpeculativeConfig {
         map.serialize_entry("draft_cache_type_v", &self.draft_cache_type_v)?;
         map.serialize_entry("ngram_min", &self.ngram_min)?;
         map.serialize_entry("ngram_max", &self.ngram_max)?;
+        map.serialize_entry("ngram_max_proposal_tokens", &self.ngram_max_proposal_tokens)?;
+        map.serialize_entry("ngram_proposer", &self.ngram_proposer)?;
+        map.serialize_entry("extension_max_tokens", &self.extension_max_tokens)?;
+        map.serialize_entry(
+            "native_mtp_reject_cooldown_tokens",
+            &self.native_mtp_reject_cooldown_tokens,
+        )?;
+        map.serialize_entry(
+            "native_mtp_suppress_cooldown_drafts",
+            &self.native_mtp_suppress_cooldown_drafts,
+        )?;
+        map.serialize_entry(
+            "native_mtp_suppress_cooldown_draft_limit",
+            &self.native_mtp_suppress_cooldown_draft_limit,
+        )?;
+        map.serialize_entry("verify_window_min_tokens", &self.verify_window_min_tokens)?;
+        map.serialize_entry("verify_window_max_tokens", &self.verify_window_max_tokens)?;
+        map.serialize_entry(
+            "verify_window_pipeline_depth",
+            &self.verify_window_pipeline_depth,
+        )?;
         map.serialize_entry("spec_default", &self.spec_default)?;
         map.end()
     }
-}
-
-fn deserialize_speculative_strategy<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(
-        Option::<String>::deserialize(deserializer)?.map(|strategy| {
-            if strategy == "native-mtp-n1" {
-                "mtp".to_string()
-            } else {
-                strategy
-            }
-        }),
-    )
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -1238,6 +1368,8 @@ pub struct PluginConfigEntry {
     pub name: String,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_ui_enabled: Option<bool>,
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
@@ -1249,6 +1381,29 @@ pub struct PluginConfigEntry {
     pub settings: BTreeMap<String, toml::Value>,
     #[serde(default, skip_serializing_if = "PluginStartupConfig::is_default")]
     pub startup: PluginStartupConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginWebUiPreference {
+    None,
+    Enabled,
+    Disabled,
+}
+
+impl PluginWebUiPreference {
+    pub const fn resolve(web_ui_enabled: Option<bool>, declares_web_ui: bool) -> Self {
+        match (declares_web_ui, web_ui_enabled) {
+            (false, _) => Self::None,
+            (true, Some(false)) => Self::Disabled,
+            (true, Some(true) | None) => Self::Enabled,
+        }
+    }
+}
+
+impl PluginConfigEntry {
+    pub const fn web_ui_preference(&self, declares_web_ui: bool) -> PluginWebUiPreference {
+        PluginWebUiPreference::resolve(self.web_ui_enabled, declares_web_ui)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

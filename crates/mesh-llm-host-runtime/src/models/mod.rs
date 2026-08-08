@@ -25,7 +25,7 @@ use hf_hub::{HFClient, HFClientBuilder, HFClientSync};
 
 pub use capabilities::{
     CapabilityLevel, ModelCapabilities, RuntimeMediaCapabilityEvidence,
-    runtime_verified_model_capabilities,
+    runtime_media_capability_evidence, runtime_verified_model_capabilities,
 };
 pub use download_transfer::DownloadTransferStats;
 pub(crate) use external_inference::append_external_inference_models;
@@ -33,17 +33,18 @@ pub use inventory::{LocalModelInventorySnapshot, scan_local_inventory_snapshot_w
 pub use local::{
     find_mmproj_path, find_model_path, huggingface_hub_cache_dir, huggingface_identity_for_path,
     layered_package_layer_count_for_path, layered_package_total_bytes_for_path, mesh_llm_cache_dir,
-    model_ref_for_path, scan_installed_models, scan_local_models,
+    model_ref_for_path, scan_installed_models, scan_installed_models_in, scan_local_models,
 };
 pub use maintenance::{run_update, warn_about_updates_for_paths};
-pub(crate) use profile::{served_model_metadata_for_model, served_model_metadata_for_path};
+pub(crate) use profile::served_model_metadata_for_model;
 pub use resolve::{
     ModelDetails, ShowVariantsProgress, canonicalize_interest_model_ref,
     download_model_ref_with_progress_details, download_model_ref_with_progress_details_direct,
     find_loaded_remote_catalog_model_exact, find_remote_catalog_model_exact,
     installed_model_capabilities, installed_model_display_name, installed_model_huggingface_ref,
-    remote_catalog_model_draft_ref, remote_catalog_model_ref, resolve_model_spec,
-    resolve_model_spec_with_progress, show_exact_model, show_model_variants_with_progress,
+    loaded_remote_catalog_display_name, remote_catalog_model_draft_ref, remote_catalog_model_ref,
+    resolve_model_spec, resolve_model_spec_with_progress, show_exact_model,
+    show_model_variants_with_progress,
 };
 pub use search::{
     SearchArtifactFilter, SearchHit, SearchProgress, SearchSort, search_catalog_json_payload,
@@ -54,6 +55,8 @@ pub use usage::{
     ModelCleanupPlan, ModelCleanupResult, execute_model_cleanup, load_model_usage_record_for_path,
     model_usage_cache_dir, plan_model_cleanup, track_managed_model_usage, track_model_usage,
 };
+
+pub use model_hf::{PreparedDownloadDirectories, prepare_download_directories};
 
 pub(crate) fn build_hf_api(_progress: bool) -> Result<HFClientSync> {
     let mut builder = HFClientBuilder::new().cache_dir(huggingface_hub_cache_dir());

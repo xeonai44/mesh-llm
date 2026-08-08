@@ -6,13 +6,15 @@ use std::{
         mpsc as std_mpsc,
     },
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
 use skippy_runtime::{ActivationFrame, SamplingConfig};
 
-use crate::runtime_state::{RuntimeDecodeFrameBatchRequest, RuntimeState};
+use crate::runtime_state::{
+    RuntimeDecodeFrameBatchRequest, RuntimeSessionAlignStats, RuntimeState,
+};
 
 pub(crate) struct DecodeFrameBatcher {
     shared: Arc<DecodeFrameBatcherShared>,
@@ -23,6 +25,7 @@ struct DecodeFrameBatcherShared {
     state: Mutex<DecodeFrameBatcherState>,
     ready: Condvar,
     max_batch_size: usize,
+    collection_window: Duration,
     owner_count: AtomicUsize,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -35,6 +38,7 @@ struct DecodeFrameBatcherState {
 
 struct PendingDecodeFrame {
     session_id: String,
+    target_token_count: u64,
     token_id: i32,
     sampling: Option<SamplingConfig>,
     input: Option<ActivationFrame>,
@@ -49,6 +53,7 @@ pub(crate) struct DecodeFrameBatchOutcome {
     pub(crate) batch_wait_ms: f64,
     pub(crate) runtime_lock_wait_ms: f64,
     pub(crate) runtime_lock_hold_ms: f64,
+    pub(crate) session_alignment: Option<RuntimeSessionAlignStats>,
 }
 
 impl DecodeFrameBatcher {
@@ -58,6 +63,7 @@ impl DecodeFrameBatcher {
             state: Mutex::new(DecodeFrameBatcherState::default()),
             ready: Condvar::new(),
             max_batch_size: max_batch_size.max(1),
+            collection_window: crate::decode_batch_policy::collection_window(max_batch_size),
             owner_count: AtomicUsize::new(1),
             worker: Mutex::new(None),
         });
@@ -72,6 +78,7 @@ impl DecodeFrameBatcher {
     pub(crate) fn decode(
         &self,
         session_id: &str,
+        target_token_count: u64,
         token_id: i32,
         sampling: Option<&SamplingConfig>,
         input: Option<ActivationFrame>,
@@ -79,6 +86,7 @@ impl DecodeFrameBatcher {
         let (reply, receiver) = std_mpsc::sync_channel(1);
         self.shared.enqueue(PendingDecodeFrame {
             session_id: session_id.to_string(),
+            target_token_count,
             token_id,
             sampling: sampling.cloned(),
             input,
@@ -153,8 +161,33 @@ impl DecodeFrameBatcherShared {
         if state.pending.is_empty() && state.stopping {
             return None;
         }
+        state = self.collect_until_deadline(state);
         let batch_size = self.max_batch_size.min(state.pending.len());
         Some(state.pending.drain(..batch_size).collect())
+    }
+
+    fn collect_until_deadline<'a>(
+        &self,
+        mut state: std::sync::MutexGuard<'a, DecodeFrameBatcherState>,
+    ) -> std::sync::MutexGuard<'a, DecodeFrameBatcherState> {
+        if self.collection_window.is_zero() || state.pending.len() >= self.max_batch_size {
+            return state;
+        }
+        let deadline = Instant::now() + self.collection_window;
+        while !state.stopping && state.pending.len() < self.max_batch_size {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .expect("decode frame batcher lock poisoned");
+            state = next;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+        state
     }
 
     fn run_batch(&self, batch: Vec<PendingDecodeFrame>) {
@@ -171,6 +204,17 @@ impl DecodeFrameBatcherShared {
         let runtime_lock_wait_ms = elapsed_ms(lock_started);
         let result = runtime_result.and_then(|mut runtime| {
             let hold_started = Instant::now();
+            // Keep reconciliation and decode atomic. A caller-side alignment can race the
+            // batch worker and otherwise decode a correction on the rejected suffix.
+            let alignments = batch
+                .iter()
+                .map(|pending| {
+                    runtime.align_session_to_token_count_if_ahead(
+                        &pending.session_id,
+                        pending.target_token_count,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
             let requests = batch
                 .iter()
                 .map(|pending| RuntimeDecodeFrameBatchRequest {
@@ -181,7 +225,7 @@ impl DecodeFrameBatcherShared {
                 })
                 .collect::<Vec<_>>();
             let outputs = runtime.decode_frame_batch_sampled(&requests)?;
-            Ok((outputs, elapsed_ms(hold_started)))
+            Ok((outputs, alignments, elapsed_ms(hold_started)))
         });
         Self::send_batch_replies(
             batch,
@@ -197,11 +241,17 @@ impl DecodeFrameBatcherShared {
         batch_size: usize,
         batch_wait_ms: f64,
         runtime_lock_wait_ms: f64,
-        result: Result<(Vec<skippy_runtime::DecodeFrameBatchOutput>, f64)>,
+        result: Result<(
+            Vec<skippy_runtime::DecodeFrameBatchOutput>,
+            Vec<Option<RuntimeSessionAlignStats>>,
+            f64,
+        )>,
     ) {
         match result {
-            Ok((outputs, runtime_lock_hold_ms)) => {
-                for (pending, output) in batch.into_iter().zip(outputs) {
+            Ok((outputs, alignments, runtime_lock_hold_ms)) => {
+                for ((pending, output), session_alignment) in
+                    batch.into_iter().zip(outputs).zip(alignments)
+                {
                     let _ = pending.reply.send(Ok(DecodeFrameBatchOutcome {
                         predicted: output.predicted_token,
                         output: output.output,
@@ -209,6 +259,7 @@ impl DecodeFrameBatcherShared {
                         batch_wait_ms,
                         runtime_lock_wait_ms,
                         runtime_lock_hold_ms,
+                        session_alignment,
                     }));
                 }
             }

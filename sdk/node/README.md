@@ -7,6 +7,15 @@ The package uses a native N-API addon built from `crates/mesh-llm-nodejs`. It is
 not a mock wrapper around the CLI. Local serving uses the same embedded runtime
 path as the Swift and Kotlin SDKs.
 
+## Install
+
+```bash
+npm install @mesh-llm/sdk
+```
+
+Release packages include prebuilt addons for macOS arm64/x64, Linux arm64/x64,
+and Windows x64.
+
 ## Build From Source
 
 ```bash
@@ -26,7 +35,7 @@ packaged Node addon is renamed to `mesh_llm_nodejs.node`.
 ## Client Mode
 
 ```js
-const { Client, generateOwnerKeypairHex } = require('@meshllm/sdk')
+const { Client, generateOwnerKeypairHex } = require('@mesh-llm/sdk')
 
 const client = Client.create({
   ownerKeypairHex: generateOwnerKeypairHex(),
@@ -58,7 +67,7 @@ const {
   Node,
   generateOwnerKeypairHex,
   resolveNativeRuntime
-} = require('@meshllm/sdk')
+} = require('@mesh-llm/sdk')
 
 const runtime = await resolveNativeRuntime({
   artifactDir: process.env.MESHLLM_NATIVE_RUNTIME_ARTIFACT_DIR,

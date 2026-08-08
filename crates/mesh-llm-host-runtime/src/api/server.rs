@@ -1,5 +1,8 @@
 use super::{
     MeshApi,
+    access::{
+        is_trusted_local_request, request_host, request_origin, requires_trusted_local_access,
+    },
     assets::{respond_console_asset, respond_console_index},
     http::{http_body_text, respond_error},
     routes::dispatch_request,
@@ -29,6 +32,10 @@ pub(crate) async fn start_with_listener(
     let Some(listener) = bind_management_listener(port, listen_all, existing_listener).await else {
         return;
     };
+    {
+        let mut inner = state.inner.lock().await;
+        inner.listeners_ready = true;
+    }
     let management_url = management_url(&listener, port);
     tracing::info!("Management API on {management_url}");
 
@@ -170,10 +177,12 @@ pub(crate) fn is_console_index_route(path: &str) -> bool {
             | "/chat/"
             | "/configuration"
             | "/configuration/"
+            | "/plugins"
             | "/__playground"
             | "/__meshviz-perf"
     ) || path.starts_with("/chat/")
         || path.starts_with("/configuration/")
+        || path.starts_with("/plugins/")
 }
 
 pub(crate) fn is_console_asset_route(path: &str) -> bool {
@@ -214,6 +223,23 @@ pub(crate) async fn handle_request(mut stream: TcpStream, state: &MeshApi) -> an
     if method == "GET" && state.is_headless().await && is_ui_only_route(path_only) {
         respond_error(&mut stream, 404, "Not found").await?;
         return Ok(());
+    }
+
+    if requires_trusted_local_access(method, path_only) {
+        let trusted_local_request = match (request_origin(&request.raw), request_host(&request.raw))
+        {
+            (Ok(origin), Ok(host)) => is_trusted_local_request(source_addr, origin, host),
+            _ => false,
+        };
+        if !trusted_local_request {
+            respond_error(
+                &mut stream,
+                403,
+                "This management route requires a trusted local caller",
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     match (method, path_only) {

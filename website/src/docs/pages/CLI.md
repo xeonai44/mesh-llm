@@ -100,6 +100,64 @@ mesh-llm serve --model Qwen3-0.6B-Q4_K_M
 mesh-llm client --auto
 ```
 
+## Runtime lifecycle and modes
+
+Bare `mesh-llm serve` is valid. It starts the durable API, console, mesh,
+plugins, and owner-control surfaces even when no startup model is configured.
+
+Persisted `[runtime].mode` controls configured models:
+
+- `serve` (default) loads configured and explicit CLI models eagerly.
+- `on_demand` keeps configured models as candidate metadata but does not load
+  them eagerly. Explicit `--model` and `--gguf` remain eager.
+- `client` is routing-only and disables local loading. Persisted client mode
+  conflicts with explicit `serve` and local model/serving flags.
+
+`startup_failure_policy = "best_effort"` is the default and keeps durable
+surfaces running after an eager model failure. `fail_fast` exits instead.
+
+Local `mesh-llm load` and `mesh-llm unload` target the daemon on this machine.
+Remote `mesh-llm runtime load-model`, `ensure-model`, `unload-model`, and
+`drain-model` require an explicit same-owner endpoint and target exactly one
+remote node. They are not mesh-wide placement commands.
+
+Lifecycle changes may be asynchronous. Observe them with:
+
+```bash
+mesh-llm status
+curl -s localhost:3131/api/runtime/intents | jq .
+curl -s localhost:3131/api/status | jq '.runtime'
+curl -s localhost:9337/v1/models | jq '.data[].id'
+```
+
+See [Runtime Lifecycle](/docs/pages/runtime-lifecycle/) for the complete state,
+draining, activity, privacy, and compatibility model.
+
+### Native serving integrations
+
+`mesh-llm serve --local-model-only` can host one native serving integration for
+an embedded product component. Mesh owns model execution, tokenization,
+verification, and the OpenAI-compatible endpoint; the integration receives the
+authoritative generation lifecycle and may submit proposals before Mesh's
+configured hard deadline. It cannot delay normal decoding: late or unavailable
+work is ignored and generation continues normally.
+
+This is a versioned ABI for components compiled for the same Mesh release, not
+the general managed-plugin system. It requires all four explicit values below:
+
+```bash
+mesh-llm serve --local-model-only \
+  --native-serving-plugin /absolute/path/to/libintegration.dylib \
+  --native-serving-plugin-config /absolute/path/to/integration.json \
+  --native-serving-plugin-state /absolute/path/to/state \
+  --native-serving-plugin-deadline-ms 8
+```
+
+Mesh validates the ABI and the complete local-model contract before starting.
+The state directory belongs to the integration and must be durable. Use the
+ordinary `serve` command without these options when no native integration is
+needed.
+
 ### `setup`
 
 Use this to finish a fresh install after the executable is on your `PATH`.
@@ -183,10 +241,11 @@ Switches:
 
 - `--json`: machine-readable output.
 
-Runtime switches:
+### Common runtime options
 
 - `--join <TOKEN>`: join a specific mesh using an invite token (repeatable).
 - `--discover [NAME]`: discover a mesh via Nostr and join it. With a name, joins the mesh matching that name. Without a name, behaves like `--auto`.
+- `--mesh-discovery-mode <nostr|mdns>`: choose public Nostr or LAN mDNS discovery. mDNS is LAN-scoped and still requires an invite token for joining.
 - `--auto`: auto-join the best discovered mesh.
 - `--model <MODEL>`: model to serve (catalog id from `models recommended`, HF ref/URL, or path).
 - `--gguf <GGUF>`: serve a specific local GGUF file directly (repeatable).
@@ -207,6 +266,85 @@ Runtime switches:
 - `--trust-policy <TRUST_POLICY>`: override peer ownership trust policy.
 - `--trust-owner <TRUST_OWNER>`: add trusted owner IDs on top of the local trust store.
 
+### Locked split topology
+
+Automatic split planning chooses nodes and layer boundaries from the capacity
+currently advertised by the mesh. For controlled lab benchmarks, use a
+topology lock so every host runs the same node order and layer ranges across
+repeated runs, branches, and binaries.
+
+Copy the same versioned JSON file to every serving host:
+
+```json
+{
+  "version": 1,
+  "model": "hf://meshllm/example-layers@immutable-revision",
+  "manifest_sha256": "<sha256 of model-package.json>",
+  "stages": [
+    {
+      "node": "micstudio.local",
+      "layer_start": 0,
+      "layer_end": 31
+    },
+    {
+      "node": "studio54-3.local",
+      "layer_start": 31,
+      "layer_end": 47
+    }
+  ]
+}
+```
+
+Then pass the lock with `--split` on every host:
+
+```bash
+mesh-llm serve \
+  --model hf://meshllm/example-layers@immutable-revision \
+  --split \
+  --split-topology-lock /path/to/topology-lock.json
+```
+
+The runtime verifies the resolved package and manifest digest, resolves each
+node selector uniquely, requires contiguous ranges covering the full model,
+and applies the normal context, KV-cache, headroom, and VRAM checks to those
+exact assignments. A node selector may be a full iroh endpoint ID or an
+advertised hostname. Ranges are half-open: `layer_start` is inclusive and
+`layer_end` is exclusive.
+
+The lock is fail-closed, not a placement hint. If the requested topology cannot
+be reproduced, startup fails. If an assigned stage is later lost, mesh-llm
+withdraws the route after the normal grace period instead of replanning or
+falling back to a local model. This prevents benchmark results from silently
+mixing different execution topologies.
+
+### Speculative decoding overrides
+
+Advanced `serve` invocations can temporarily override a package or config-file
+speculative decoding plan. CLI values have highest precedence; fields you omit
+continue to come from the selected model, defaults, or model package.
+
+```bash
+mesh-llm serve meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M --split --no-draft \
+  --speculative-strategy mtp \
+  --speculative-ngram-min 2 \
+  --speculative-ngram-max 4 \
+  --speculative-ngram-max-proposal-tokens 32 \
+  --speculative-extension-initial-tokens 4 \
+  --speculative-extension-max-tokens 32 \
+  --speculative-verify-window-pipeline-depth 8
+```
+
+- `--speculative-strategy <STRATEGY>`: select `auto`, `disabled`, `mtp`, or a strategy declared by the model package. N-gram is a request-local extension of native MTP, not a standalone strategy.
+- `--speculative-ngram-min <N>` / `--speculative-ngram-max <N>`: set the request-local cache history match bounds used to extend native MTP.
+- `--speculative-ngram-max-proposal-tokens <N>`: cap the N-gram continuation proposed at once.
+- `--speculative-extension-initial-tokens <N>` / `--speculative-extension-max-tokens <N>`: set the adaptive N-gram tail bounds when extending native MTP.
+- `--speculative-extension-tail-backoff-proposals <N>`: pause extension attempts after a rejected N-gram tail.
+- `--speculative-native-mtp-reject-cooldown-tokens <N>`: set the generated-token cooldown after native MTP rejection.
+- `--speculative-native-mtp-suppress-cooldown-drafts`: suppress native drafts during cooldown; `--speculative-native-mtp-allow-cooldown-drafts` explicitly disables a configured suppression policy.
+- `--speculative-native-mtp-suppress-cooldown-draft-limit <N>`: cap the native drafts suppressed by one cooldown.
+- `--speculative-verify-window-min-tokens <N>` / `--speculative-verify-window-max-tokens <N>`: set adaptive verification window bounds.
+- `--speculative-verify-window-pipeline-depth <N>`: set the global maximum in-flight verification windows. Live request heads consume this capacity; optional N-gram windows are admitted with bounded, fair credits and fall back to native MTP when requests already fill the pipeline.
+
 ## Commands
 
 ### `models`
@@ -217,11 +355,15 @@ Subcommands:
 
 - `recommended`
 - `installed`
+- `cleanup`
+- `prune`
 - `search`
 - `show`
 - `download`
+- `package`
 - `certify`
 - `updates`
+- `delete`
 
 ### `models recommended`
 
@@ -238,6 +380,29 @@ Run this when you want to see what’s already on your machine.
 Switches:
 
 - `--json`: machine-readable output.
+
+### `models cleanup`
+
+Preview or remove stale managed model-cache entries:
+
+```bash
+mesh-llm models cleanup
+mesh-llm models cleanup --unused-since 30d --yes
+```
+
+Use `--json` for machine-readable output. The default is a preview; `--yes`
+applies the removal.
+
+### `models prune`
+
+Preview or remove stale derived Skippy stage artifacts:
+
+```bash
+mesh-llm models prune
+mesh-llm models prune --yes
+```
+
+The default is a preview and active or pinned stage artifacts are preserved.
 
 ### `models search`
 
@@ -291,6 +456,25 @@ Switches:
 - `--direct`: download the exact HuggingFace GGUF file directly, bypassing catalog layer-package resolution.
 - `--json`: machine-readable output.
 
+### `models package`
+
+Plan or submit a Hugging Face Job that splits a source GGUF into a Skippy
+layer-package repository. The default is a dry run; `--confirm` is required to
+submit a spend-bearing job.
+
+```bash
+mesh-llm models package unsloth/Qwen3-8B-GGUF:Q4_K_M --dry-run
+mesh-llm models package unsloth/Qwen3-8B-GGUF:Q4_K_M --confirm --follow
+mesh-llm models package --status <JOB_ID>
+```
+
+Pass `--experimental` to publish a public package marked experimental: the
+package README carries an experimental warning and the Hugging Face catalog PR
+is opened but left unmerged until the package is certified.
+
+Use `--help` for the full planning, status, logs, cancel, and publishing
+options.
+
 ### `models certify`
 
 Use this when you want a repeatable Skippy layer-package confidence report
@@ -336,6 +520,11 @@ Switches:
 - `--check`: check only; do not refresh cache.
 - `--json`: machine-readable output.
 
+### `models delete`
+
+Remove a managed model entry. Run `mesh-llm models delete --help` first to
+review the current confirmation and selection options.
+
 ### `download`
 
 Use this to quickly download by built-in catalog ID or shorthand.
@@ -361,6 +550,115 @@ Switches:
 - `--flavor <FLAVOR>`: install or switch to a specific release bundle flavor (`cpu`, `cuda`, `rocm`, `vulkan`, or `metal`).
 - `--detect-flavor`: re-detect the best host backend flavor before selecting the release bundle. Cannot be combined with `--flavor`.
 - `--auto-update`: available on most commands; when set, mesh-llm checks for a newer bundled release before proceeding.
+
+### `runtime`
+
+Inspect and manage installed native runtimes, or run supported owner-control
+operations against an explicitly targeted node:
+
+```bash
+mesh-llm runtime list
+mesh-llm runtime list --available
+mesh-llm runtime list --installed
+mesh-llm runtime install
+mesh-llm runtime install cuda13
+mesh-llm runtime remove <RUNTIME_ID>
+mesh-llm runtime prune --active-only
+mesh-llm runtime scan-refresh --endpoint '<control-endpoint>'
+mesh-llm runtime scan-refresh --endpoint '<control-endpoint>' --json
+mesh-llm runtime load-model --endpoint '<control-endpoint>' --model '<canonical-model-ref>'
+mesh-llm runtime unload-model --endpoint '<control-endpoint>' --model '<canonical-model-ref>'
+mesh-llm runtime ensure-model --endpoint '<control-endpoint>' --model '<canonical-model-ref>'
+mesh-llm runtime drain-model --endpoint '<control-endpoint>' --instance-id '<instance-id>'
+```
+
+Plain `mesh-llm runtime list` lists locally discoverable native runtimes. Use
+`mesh-llm runtime list --available` to list release-manifest or bundled
+runtimes instead. `--installed` is the explicit compatibility spelling for the
+default local-discovery behavior.
+
+Use `--json` for machine-readable output. Runtime selection is constrained by
+the running Mesh version, platform, backend, and Skippy ABI.
+
+#### `runtime scan-refresh`
+
+Use this to ask exactly one remote, owner-attested node to rescan its managed
+model inventory. It uses the private `mesh-llm-control/1` lane; it does not
+change public mesh join, gossip, routing, or inference behavior.
+
+The target node must expose owner-control and the requester must use an owner
+key for the same owner. On the target node, read the endpoint token locally:
+
+```bash
+mesh-llm runtime bootstrap --port 3131 --json
+```
+
+Transfer that token to the controlling node out of band, then run:
+
+```bash
+mesh-llm runtime scan-refresh \
+  --port 3131 \
+  --endpoint '<control-endpoint>'
+```
+
+Switches:
+
+- `--endpoint <TOKEN>`: required token that identifies and pins one target
+  node. Mesh does not infer it from a peer ID, public gossip, discovery, or
+  status output.
+- `--port <PORT>`: management API port on the controlling node (default
+  `3131`). The CLI sends the request through this local, loopback-only API.
+- `--json`: print the API response unchanged.
+
+Human output includes the execution disposition, target node, model count,
+total bytes, and sorted canonical model references. JSON output includes
+`target_node_id`, `disposition`, and `inventory`. A disposition of `executed`
+means this request ran the scan; `coalesced` means it joined an in-progress
+scan and received the same result.
+
+The older hidden `runtime refresh-inventory` spelling remains available for
+compatibility and returns its legacy snapshot-only shape. New clients also
+accept snapshot-only responses from older owner-control servers without
+claiming that detailed inventory metadata was returned.
+
+#### Owner-control model lifecycle
+
+Use the lifecycle subcommands to manage models on exactly one remote,
+owner-attested node:
+
+```bash
+mesh-llm runtime load-model \
+  --endpoint '<control-endpoint>' \
+  --model 'org/model:file.gguf'
+
+mesh-llm runtime ensure-model \
+  --endpoint '<control-endpoint>' \
+  --model 'org/model:file.gguf' \
+  --profile low-ctx
+
+mesh-llm runtime unload-model \
+  --endpoint '<control-endpoint>' \
+  --model 'org/model:file.gguf'
+
+mesh-llm runtime drain-model \
+  --endpoint '<control-endpoint>' \
+  --instance-id '<instance-id>'
+```
+
+`load-model` and `ensure-model` require a canonical model reference and accept
+an optional `--profile`. `unload-model` and `drain-model` require exactly one
+of `--model` or `--instance-id`. All four commands accept `--port <PORT>`
+(default `3131`) and `--json`.
+
+The endpoint token and ownership requirements are the same as for
+`runtime scan-refresh`. A successful response means the target accepted the
+lifecycle intent; use runtime status to observe the resulting instance state.
+`drain-model` stops new admission, waits for in-flight work within the target
+policy, and then unloads the selected model or instance.
+
+These intents last only for the target daemon session and never edit its
+configuration. Older targets return a typed unsupported result; the client
+does not retry over the public mesh plane.
 
 
 ### `gpus`
@@ -424,6 +722,9 @@ Switches:
 
 - `--port <PORT>`: target management/API port (default `3131`).
 
+The command targets the local runtime. Use `status`,
+`GET /api/runtime/intents`, and `/v1/models` to observe completion.
+
 ### `unload`
 
 Use this to unload a model from a running local runtime.
@@ -431,6 +732,9 @@ Use this to unload a model from a running local runtime.
 Switches:
 
 - `--port <PORT>`: target management/API port (default `3131`).
+
+The command targets the local runtime. Remote same-owner control uses
+`runtime unload-model`.
 
 ### `status`
 
@@ -492,13 +796,13 @@ Core tuning switches:
 
 Speculative decoding tuning switches:
 
-- `--speculative-types <TYPES>`: speculative decoding types to sweep (`auto`, `disabled`, `mtp`, `draft`, `ngram`; comma-separated). Conflicts with `--no-speculative-tune`.
+- `--speculative-types <TYPES>`: speculative decoding types to sweep (`auto`, `disabled`, `mtp`, `draft`, `mtp-ngram`; comma-separated). Conflicts with `--no-speculative-tune`.
 - `--no-speculative-tune`: disable speculative decoding sweeps and only benchmark the disabled baseline.
 - `--spec-draft-models <PATHS>`: candidate draft GGUF paths for speculative draft mode (comma-separated).
 - `--spec-draft-max-tokens <N>`: candidate maximum draft-token windows for MTP and draft speculation (comma-separated).
 - `--spec-draft-min-tokens <N>`: candidate minimum draft-token windows for MTP and draft speculation (comma-separated).
-- `--spec-ngram-min <N>`: candidate minimum ngram draft-token counts (comma-separated).
-- `--spec-ngram-max <N>`: candidate maximum ngram draft-token counts (comma-separated).
+- `--spec-ngram-min <N>`: candidate minimum cache match lengths for `mtp-ngram` (comma-separated).
+- `--spec-ngram-max <N>`: candidate maximum cache match lengths for `mtp-ngram` (comma-separated).
 
 Additional switches:
 
@@ -574,15 +878,15 @@ Use this to stop local `mesh-llm` instances tracked in the runtime root.
 
 ### `blackboard` (plugin)
 
-Shared mesh notes — post, search, and read notes across the mesh. Blackboard was moved from a built-in command to an [installable plugin](plugins.md#using-plugins):
+Shared mesh notes — post, search, and read notes across the mesh. Blackboard was moved from a built-in command to an [installable plugin](/docs/pages/plugins/#use-plugin-features):
 
 ```bash
 mesh-llm plugins install blackboard
 ```
 
-Once installed, it runs as a managed plugin process when mesh-llm starts. See the [plugins documentation](plugins.md#using-plugins) for configuration and usage.
+Once installed, it runs as a managed plugin process when mesh-llm starts. See the [plugins documentation](/docs/pages/plugins/#use-plugin-features) for configuration and usage.
 
-### `plugins` / `plugin`
+### `plugins` (alias: `plugin`)
 
 Use this to install, manage, and inspect plugins.
 
@@ -590,16 +894,27 @@ Both `mesh-llm plugins` and `mesh-llm plugin` work.
 
 Subcommands:
 
-- `plugins install <reference>`: install a plugin from the catalog by name or from a GitHub URL.
-- `plugins update <name>`: update an installed plugin.
-- `plugins enable <name>`: enable an installed plugin.
-- `plugins disable <name>`: disable an installed plugin.
-- `plugins delete <name>`: delete an installed plugin.
-- `plugins info <name>`: show plugin details.
+- `plugins install <reference>`: install from a catalog name, GitHub
+  `owner/repository`, or GitHub URL.
+- `plugins install --archive <PATH> --name <NAME> [--version <VERSION>]`:
+  install a local `.tar.gz` or `.zip` release archive. `--name` is required;
+  `--version` defaults to `dev`. These flags conflict with `<reference>`.
+- `plugins update <name>`: update an installed plugin to the latest compatible release.
+- `plugins enable <name>`: mark an installed plugin runnable by mesh-llm.
+- `plugins disable <name>`: keep the plugin on disk but prevent host startup from launching it.
+- `plugins delete <name>`: remove the extracted files and local metadata.
+- `plugins info <name>`: show source, version, target, path, and latest known status.
 - `plugins search [query]`: search the plugin catalog.
-- `plugins list`: list installed/configured plugins.
+- `plugins list`: list installed, auto-registered, and configured plugins.
 
-See [plugins documentation](plugins.md#using-plugins) for more detail.
+For plugins that declare a console projection, `web_ui_enabled` and the
+Configuration → Plugins toggle affect only that projection; they do not change
+the plugin process state.
+
+Local archives are for authoring and validation. Rebuild and reinstall them;
+`plugins update` remains a GitHub release workflow.
+
+See [plugins documentation](/docs/pages/plugins/#use-plugin-features) for more detail.
 
 
 ### `auth`
@@ -610,6 +925,20 @@ Subcommands:
 
 - `auth init`: generate/save owner keypair.
 - `auth status`: show identity/keystore status.
+- `auth sign-node`: sign the current node identity with the owner key.
+- `auth renew-node`: renew the local node ownership certificate.
+- `auth verify-node`: verify a node ownership certificate and trust policy.
+- `auth rotate-node`: rotate the local node identity key and optionally revoke
+  the previous certificate.
+- `auth revoke-owner`: revoke an owner in the local trust store.
+- `auth revoke-node`: revoke a node certificate or node ID in the local trust
+  store.
+- `auth rotate-owner`: rotate the owner keystore identity.
+- `auth trust add <OWNER_ID> [--label <LABEL>] [--trust-store <PATH>]`: add an
+  owner to the local trust allowlist.
+- `auth trust remove <OWNER_ID> [--trust-store <PATH>]`: remove an owner from
+  the local trust allowlist.
+- `auth trust list [--trust-store <PATH>]`: show the current trust store.
 
 `auth init` switches:
 
@@ -630,6 +959,12 @@ Subcommands:
 `auth rotate-owner` switches:
 
 - `--owner-key <OWNER_KEY>`: keystore path.
+
+`auth trust` switches:
+
+- `--trust-store <PATH>`: use a specific trust store instead of the default.
+- `auth trust add <OWNER_ID> --label <LABEL>`: attach a human-readable label to
+  a trusted owner.
 
 ## Model reference formats
 

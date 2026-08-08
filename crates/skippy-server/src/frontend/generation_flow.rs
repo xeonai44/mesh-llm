@@ -1,210 +1,46 @@
-use super::*;
+mod text_generation;
+
+use crate::binary_transport::forwarded_stage_message_timed;
+use crate::binary_transport::write_stage_message_conditioned;
+use crate::frontend::generation::GeneratedText;
+use crate::frontend::generation::GenerationCacheStats;
+use crate::frontend::generation::GenerationTokenLimit;
+use crate::frontend::generation::OpenAiBackendMode;
+use crate::frontend::generation::OpenAiGenerationIds;
+use crate::frontend::generation::PhaseTimer;
+use crate::frontend::generation::PreparedGenerationPrompt;
+use crate::frontend::generation::SplitMultimodalGeneration;
+use crate::frontend::generation::StageOpenAiBackend;
+use crate::frontend::generation::TextGenerationCollector;
+use crate::frontend::generation::TokenControl;
+use crate::frontend::generation::emulation_generation_active;
+use crate::frontend::generation_receipt::complete_generation_before_cleanup;
+use crate::frontend::local_generation::LocalGenerationReceiptFinalization;
+use crate::frontend::request::wire_sampling_config;
+use crate::frontend::util::generation_stop_values;
+use crate::frontend::util::openai_backend_error;
+use crate::frontend::util::openai_io_error;
+use crate::frontend::wire_messages::MultimodalPrefillArgs;
+use crate::frontend::wire_messages::ReusableDecodeMessage;
+use crate::frontend::wire_messages::ReusableDecodeMessageArgs;
+use crate::frontend::wire_messages::generation_config_message;
+use crate::frontend::wire_messages::multimodal_prefill_message;
+use crate::frontend::{GenerationCommit, GenerationStart};
+use crate::kv_integration::proactive_eviction_attrs;
+use crate::kv_integration::proactive_eviction_error_kind;
+use anyhow::anyhow;
+use openai_frontend::ChatCompletionRequest;
+use openai_frontend::OpenAiError;
+use openai_frontend::OpenAiResult;
+use serde_json::json;
+use skippy_protocol::binary::StageWireMessage;
+use skippy_protocol::binary::WireReplyKind;
+use skippy_protocol::binary::recv_reply;
+use skippy_protocol::binary::write_stage_message;
+use skippy_runtime::SamplingConfig;
+use std::sync::Arc;
 
 impl StageOpenAiBackend {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn generate_text(
-        &self,
-        prompt: PreparedGenerationPrompt,
-        max_tokens: GenerationTokenLimit,
-        stop: Option<&openai_frontend::StopSequence>,
-        sampling: SamplingConfig,
-        hook_request: Option<ChatCompletionRequest>,
-        hook_runtime: Option<tokio::runtime::Handle>,
-        cancellation: Option<&openai_frontend::CancellationToken>,
-        ids: OpenAiGenerationIds,
-        on_text_chunk: impl FnMut(&str) -> OpenAiResult<()>,
-    ) -> OpenAiResult<GeneratedText> {
-        let generation_timer = PhaseTimer::start();
-        if prompt.text.is_empty() {
-            return Err(OpenAiError::invalid_request(
-                "request prompt/messages produced no text",
-            ));
-        }
-        if prompt.has_media() {
-            return self.generate_multimodal_text(
-                prompt,
-                max_tokens,
-                stop,
-                sampling,
-                hook_request,
-                hook_runtime,
-                cancellation,
-                ids,
-                on_text_chunk,
-            );
-        }
-        let stop_value_storage =
-            generation_stop_values(stop, prompt.chat_parse_metadata.as_deref());
-        let stop_values = stop_value_storage
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let tokenize_timer = PhaseTimer::start();
-        let prompt_token_ids = self.tokenize(&prompt.text)?;
-        let mut tokenize_attrs = self.openai_attrs(&ids);
-        tokenize_attrs.insert(
-            "llama_stage.prompt_chars".to_string(),
-            json!(prompt.text.len()),
-        );
-        tokenize_attrs.insert(
-            "llama_stage.prompt_token_count".to_string(),
-            json!(prompt_token_ids.len()),
-        );
-        self.emit_openai_phase("stage.openai_tokenize", tokenize_timer, tokenize_attrs);
-        if prompt_token_ids.is_empty() {
-            return Err(OpenAiError::invalid_request("prompt produced no tokens"));
-        }
-        let max_tokens = max_tokens.resolve(prompt_token_ids.len(), self.ctx_size)?;
-        let _token_budget_reservation = if self.mode.reserves_local_kv_tokens() {
-            let token_admit_timer = PhaseTimer::start();
-            let reservation = self.generation_token_budget.reserve(
-                GenerationTokenBudgetRequest::new(prompt_token_ids.len(), max_tokens),
-                GENERATION_ADMISSION_TIMEOUT,
-            )?;
-            let mut token_admit_attrs = self.openai_attrs(&ids);
-            token_admit_attrs.insert(
-                "llama_stage.prompt_token_count".to_string(),
-                json!(prompt_token_ids.len()),
-            );
-            token_admit_attrs.insert("llama_stage.max_tokens".to_string(), json!(max_tokens));
-            token_admit_attrs.insert(
-                "llama_stage.kv_reserved_tokens".to_string(),
-                json!(reservation.tokens()),
-            );
-            token_admit_attrs.insert(
-                "llama_stage.kv_active_reserved_tokens".to_string(),
-                json!(reservation.active_tokens_after_reservation()),
-            );
-            token_admit_attrs.insert(
-                "llama_stage.kv_capacity_tokens".to_string(),
-                json!(self.generation_token_budget.capacity_tokens()),
-            );
-            self.emit_openai_phase(
-                "stage.openai_generation_token_admit",
-                token_admit_timer,
-                token_admit_attrs,
-            );
-            Some(reservation)
-        } else {
-            None
-        };
-        let chat_sampling_metadata = prompt.chat_parse_metadata.as_deref();
-
-        let emulation_active = emulation_generation_active(hook_request.as_ref(), &prompt);
-        let mut collector =
-            TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk)
-                .with_emulation_stop(emulation_active);
-        let cache_stats = match self.mode.clone() {
-            OpenAiBackendMode::LocalRuntime => self.generate_local_tokens(
-                LocalGeneration {
-                    prompt_token_ids: &prompt_token_ids,
-                    max_tokens,
-                    sampling: &sampling,
-                    chat_sampling_metadata,
-                    native_mtp_enabled: self.native_mtp_enabled,
-                    native_mtp_max_tokens: self.native_mtp_max_tokens,
-                    native_mtp_min_tokens: self.native_mtp_min_tokens,
-                    hook_request: hook_request.clone(),
-                    hook_runtime: hook_runtime.clone(),
-                    cancellation,
-                    ids: &ids,
-                },
-                |token| collector.push_token(token),
-            )?,
-            OpenAiBackendMode::EmbeddedStageZero {
-                config,
-                wire_dtype,
-                prefill_chunk_policy,
-                activation_width,
-                downstream_wire_condition,
-                prefill_reply_credit_limit,
-                lane_pool,
-                prediction_returns,
-                native_mtp_enabled,
-                native_mtp_max_tokens,
-                native_mtp_min_tokens,
-            } => self.generate_embedded_stage_zero_tokens(
-                EmbeddedStageZeroGeneration {
-                    config: &config,
-                    wire_dtype,
-                    prefill_chunk_policy: &prefill_chunk_policy,
-                    activation_width,
-                    downstream_wire_condition,
-                    prefill_reply_credit_limit,
-                    lane_pool,
-                    prediction_return: prediction_returns
-                        .as_ref()
-                        .map(|hub| hub.register(ids.request_id, ids.session_id))
-                        .transpose()
-                        .map_err(openai_backend_error)?,
-                    draft: self.draft.clone(),
-                    speculative_window: self.speculative_window,
-                    adaptive_speculative_window: self.adaptive_speculative_window,
-                    ngram_min: self.ngram_min,
-                    ngram_max: self.ngram_max,
-                    native_mtp_enabled,
-                    native_mtp_max_tokens,
-                    native_mtp_min_tokens,
-                    prompt_token_ids: &prompt_token_ids,
-                    max_tokens,
-                    sampling: &sampling,
-                    chat_sampling_metadata,
-                    hook_request,
-                    hook_runtime,
-                    cancellation,
-                    ids: &ids,
-                },
-                |token| collector.push_token(token),
-            )?,
-        };
-
-        let output = collector.finish(prompt_token_ids.len(), cache_stats)?;
-        let mut summary_attrs = self.openai_attrs(&ids);
-        summary_attrs.insert(
-            "llama_stage.prompt_token_count".to_string(),
-            json!(output.prompt_tokens),
-        );
-        summary_attrs.insert(
-            "llama_stage.completion_token_count".to_string(),
-            json!(output.completion_tokens),
-        );
-        summary_attrs.insert("skippy.kv.status".to_string(), json!(output.cache_status));
-        summary_attrs.insert(
-            "skippy.kv.cached_prompt_tokens".to_string(),
-            json!(output.cached_prompt_tokens),
-        );
-        summary_attrs.insert(
-            "skippy.kv.matched_prefix_tokens".to_string(),
-            json!(output.matched_prefix_tokens),
-        );
-        summary_attrs.insert(
-            "skippy.kv.suffix_prefill_tokens".to_string(),
-            json!(output.suffix_prefill_tokens),
-        );
-        summary_attrs.insert(
-            "skippy.kv.hit_kind".to_string(),
-            json!(output.cache_hit_kind.unwrap_or("none")),
-        );
-        summary_attrs.insert(
-            "llama_stage.detokenize_ms".to_string(),
-            json!(output.detokenize_ms),
-        );
-        summary_attrs.insert(
-            "llama_stage.text_emit_ms".to_string(),
-            json!(output.text_emit_ms),
-        );
-        summary_attrs.insert(
-            "llama_stage.eog_check_ms".to_string(),
-            json!(output.eog_check_ms),
-        );
-        self.emit_openai_summary(
-            "stage.openai_generation_summary",
-            generation_timer,
-            summary_attrs,
-        );
-        Ok(output)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn generate_multimodal_text(
         &self,
@@ -269,6 +105,14 @@ impl StageOpenAiBackend {
             }
         }
 
+        // Media embeddings do not have token IDs. The receipt binds the exact
+        // target-tokenized rendered prompt text that selects their positions.
+        let receipt_prompt_token_ids = self
+            .generation_receipt
+            .as_ref()
+            .map(|_| self.tokenize(&prompt.text))
+            .transpose()?
+            .map(Arc::<[i32]>::from);
         let stop_value_storage =
             generation_stop_values(stop, prompt.chat_parse_metadata.as_deref());
         let stop_values = stop_value_storage
@@ -340,6 +184,14 @@ impl StageOpenAiBackend {
             (prefill, token_signal, signal_window)
         };
         let max_tokens = max_tokens.resolve(prefill.position as usize, self.ctx_size)?;
+        let mut receipt_observation = self.generation_receipt.as_ref().map(|config| {
+            config.observation(
+                usize::try_from(max_tokens)
+                    .expect("supported targets represent u32 token budgets as usize"),
+            )
+        });
+        let mut receipt_cancelled = false;
+        let mut receipt_model_generation_elapsed = None;
 
         // Proactive eviction: free one native decode batch worth of resident
         // prefix KV cells for grammar-triggered retries during the coming
@@ -395,6 +247,18 @@ impl StageOpenAiBackend {
             return Err(openai_backend_error(error));
         }
 
+        if let (Some(config), Some(prompt_token_ids)) = (
+            self.generation_receipt.as_ref(),
+            receipt_prompt_token_ids.as_ref(),
+        ) {
+            config.begin(GenerationStart {
+                request_id: ids.request_id,
+                session_id: ids.session_id,
+                agent_session_id: ids.agent_session_id.clone(),
+                prompt_token_ids: Arc::clone(prompt_token_ids),
+            });
+        }
+
         let mut collector =
             TextGenerationCollector::new(self.runtime.clone(), stop_values, on_text_chunk)
                 .with_emulation_stop(emulation_active);
@@ -416,6 +280,7 @@ impl StageOpenAiBackend {
 
             while decoded_tokens < max_tokens as usize {
                 if cancellation.is_some_and(openai_frontend::CancellationToken::is_cancelled) {
+                    receipt_cancelled = true;
                     break;
                 }
                 if let Some(injected_current) = self.maybe_run_generation_hooks(
@@ -431,7 +296,21 @@ impl StageOpenAiBackend {
                     current = injected_current;
                     continue;
                 }
+                if let Some(observation) = receipt_observation.as_mut() {
+                    observation.record_token(current, ids.request_started_at.elapsed());
+                }
+                if let Some(config) = self.generation_receipt.as_ref() {
+                    config.committed(GenerationCommit {
+                        request_id: ids.request_id,
+                        session_id: ids.session_id,
+                        generated_token_count: decoded_tokens.saturating_add(1),
+                        token_ids: vec![current].into_boxed_slice(),
+                    });
+                }
                 if collector.push_token(current)? == TokenControl::Stop {
+                    if let Some(observation) = receipt_observation.as_mut() {
+                        observation.mark_callback_stop();
+                    }
                     decoded_tokens += 1;
                     break;
                 }
@@ -530,43 +409,30 @@ impl StageOpenAiBackend {
                     stats,
                 );
             }
+            receipt_model_generation_elapsed = Some(decode_timer.start_instant.elapsed());
             self.emit_openai_summary("stage.openai_decode", decode_timer, attrs);
             Ok(())
         })();
-        let lock_timer = PhaseTimer::start();
-        if let Ok(mut runtime) = self.runtime.lock() {
-            let runtime_lock_wait_ms = lock_timer.elapsed_ms();
-            if let Ok(drop_stats) = runtime.drop_session_timed(&session_id) {
-                let mut attrs = self.openai_attrs(&ids);
-                attrs.insert(
-                    "llama_stage.runtime_lock_wait_ms".to_string(),
-                    json!(runtime_lock_wait_ms),
-                );
-                attrs.insert(
-                    "llama_stage.session_reset_ms".to_string(),
-                    json!(drop_stats.reset_ms),
-                );
-                attrs.insert(
-                    "llama_stage.session_reset".to_string(),
-                    json!(drop_stats.reset_session),
-                );
-                attrs.insert(
-                    "llama_stage.lane_discarded".to_string(),
-                    json!(drop_stats.lane_discarded),
-                );
-                if let Some(reason) = drop_stats.lane_discard_reason.as_deref() {
-                    attrs.insert("llama_stage.lane_discard_reason".to_string(), json!(reason));
-                }
-                Self::insert_runtime_session_stats(
-                    &mut attrs,
-                    "llama_stage.runtime_sessions_after",
-                    &drop_stats.stats_after,
-                );
-                self.telemetry
-                    .emit_debug("stage.openai_session_stop", attrs);
-            }
-        }
-        result?;
+        let generation_succeeded = result.is_ok();
+        complete_generation_before_cleanup(
+            result,
+            || {
+                self.finalize_generation_receipt(
+                    LocalGenerationReceiptFinalization {
+                        session_label: &session_id,
+                        request_id: ids.request_id,
+                        session_id: ids.session_id,
+                        agent_session_id: ids.agent_session_id.as_deref(),
+                        prompt_token_ids: receipt_prompt_token_ids.unwrap_or_default(),
+                        observation: receipt_observation,
+                        cancelled: receipt_cancelled,
+                        model_generation_elapsed: receipt_model_generation_elapsed,
+                    },
+                    generation_succeeded,
+                )
+            },
+            || self.cleanup_local_generation_session(&session_id, &ids),
+        )?;
         collector.finish(prefill.token_count, GenerationCacheStats::default())
     }
 
@@ -588,9 +454,29 @@ impl StageOpenAiBackend {
         let session_id = request.ids.session_id;
         let request_id = request.ids.request_id;
         let session_key = session_id.to_string();
+        let receipt_prompt_token_ids = self
+            .generation_receipt
+            .as_ref()
+            .map(|_| self.tokenize(&request.prompt.text))
+            .transpose()?
+            .map(Arc::<[i32]>::from);
         let mut lane = request.lane_pool.checkout(&request.ids)?;
+        if let (Some(config), Some(prompt_token_ids)) = (
+            self.generation_receipt.as_ref(),
+            receipt_prompt_token_ids.as_ref(),
+        ) {
+            config.begin(GenerationStart {
+                request_id,
+                session_id,
+                agent_session_id: request.ids.agent_session_id.clone(),
+                prompt_token_ids: Arc::clone(prompt_token_ids),
+            });
+        }
 
         let mut prompt_tokens = 0usize;
+        let mut receipt_observation = None;
+        let mut receipt_cancelled = false;
+        let mut receipt_model_generation_elapsed = None;
         let result = (|| {
             let prefill_timer = PhaseTimer::start();
             let prefill = {
@@ -655,6 +541,12 @@ impl StageOpenAiBackend {
             let max_tokens = request
                 .max_tokens
                 .resolve(prefill.position as usize, self.ctx_size)?;
+            receipt_observation = self.generation_receipt.as_ref().map(|config| {
+                config.observation(
+                    usize::try_from(max_tokens)
+                        .expect("supported targets represent u32 token budgets as usize"),
+                )
+            });
 
             let message = generation_config_message(
                 request.wire_dtype,
@@ -703,6 +595,7 @@ impl StageOpenAiBackend {
                         prompt_token_count: prefill.token_count,
                         pos_start: prefill_pos_start,
                         token_count: chunk.token_count,
+                        tokens: chunk.tokens.clone(),
                         positions: chunk.positions.clone(),
                         sampling: is_final_chunk.then_some(wire_sampling.clone()).flatten(),
                         final_chunk: is_final_chunk,
@@ -806,9 +699,24 @@ impl StageOpenAiBackend {
                     .cancellation
                     .is_some_and(openai_frontend::CancellationToken::is_cancelled)
                 {
+                    receipt_cancelled = true;
                     break;
                 }
+                if let Some(observation) = receipt_observation.as_mut() {
+                    observation.record_token(current, request.ids.request_started_at.elapsed());
+                }
+                if let Some(config) = self.generation_receipt.as_ref() {
+                    config.committed(GenerationCommit {
+                        request_id,
+                        session_id,
+                        generated_token_count: decoded_tokens.saturating_add(1),
+                        token_ids: vec![current].into_boxed_slice(),
+                    });
+                }
                 if collector.push_token(current)? == TokenControl::Stop {
+                    if let Some(observation) = receipt_observation.as_mut() {
+                        observation.mark_callback_stop();
+                    }
                     decoded_tokens += 1;
                     break;
                 }
@@ -823,8 +731,29 @@ impl StageOpenAiBackend {
                 let stage0_timer = PhaseTimer::start();
                 let batch_outcome = self
                     .decode_frame_batcher
-                    .decode(&session_key, current, Some(&request.sampling), None)
+                    .decode(
+                        &session_key,
+                        u64::try_from(message.pos_start).map_err(|_| {
+                            OpenAiError::backend("negative authoritative decode position")
+                        })?,
+                        current,
+                        request.sampling.enabled.then_some(&request.sampling),
+                        None,
+                    )
                     .map_err(openai_backend_error)?;
+                if let Some(alignment) = batch_outcome.session_alignment {
+                    let mut attrs = self.openai_attrs(&request.ids);
+                    attrs.insert(
+                        "llama_stage.session_auto_align_before_tokens".to_string(),
+                        json!(alignment.before_token_count),
+                    );
+                    attrs.insert(
+                        "llama_stage.session_auto_align_after_tokens".to_string(),
+                        json!(alignment.after_token_count),
+                    );
+                    self.telemetry
+                        .emit_debug("stage.openai_session_auto_align", attrs);
+                }
                 decode_runtime_lock_wait_ms += batch_outcome.runtime_lock_wait_ms;
                 decode_runtime_lock_hold_ms += batch_outcome.runtime_lock_hold_ms;
                 decode_runtime_lock_acquires += 1;
@@ -941,9 +870,25 @@ impl StageOpenAiBackend {
                 "llama_stage.forward_activation_bytes".to_string(),
                 json!(decode_forward_activation_bytes),
             );
+            receipt_model_generation_elapsed = Some(decode_timer.start_instant.elapsed());
             self.emit_openai_summary("stage.openai_decode", decode_timer, decode_attrs);
             Ok(())
         })();
+
+        let generation_succeeded = result.is_ok();
+        let receipt_result = self.finalize_generation_receipt(
+            LocalGenerationReceiptFinalization {
+                session_label: &session_key,
+                request_id,
+                session_id,
+                agent_session_id: request.ids.agent_session_id.as_deref(),
+                prompt_token_ids: receipt_prompt_token_ids.unwrap_or_default(),
+                observation: receipt_observation,
+                cancelled: receipt_cancelled,
+                model_generation_elapsed: receipt_model_generation_elapsed,
+            },
+            generation_succeeded,
+        );
 
         let stop_result = write_stage_message(
             &mut lane.stream,
@@ -1001,6 +946,7 @@ impl StageOpenAiBackend {
             _ => request.lane_pool.replace_lane(lane_id),
         }
         if result.is_ok() {
+            receipt_result?;
             stop_result?;
         }
         result?;

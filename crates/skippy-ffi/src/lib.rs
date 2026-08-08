@@ -1,9 +1,14 @@
 pub const ABI_VERSION_MAJOR: u32 = 0;
 pub const ABI_VERSION_MINOR: u32 = 1;
-pub const ABI_VERSION_PATCH: u32 = 30;
+pub const ABI_VERSION_PATCH: u32 = 35;
 pub const FEATURE_BACKEND_DEVICES: u64 = 1 << 23;
 pub const FEATURE_RUNTIME_EVENTS: u64 = 1 << 24;
 pub const FEATURE_NATIVE_MTP_N1: u64 = 1 << 25;
+pub const FEATURE_NGRAM_CACHE_DRAFT: u64 = 1 << 26;
+pub const FEATURE_INKLING_MTP_MM: u64 = 1 << 27;
+
+#[cfg(feature = "dynamic-runtime")]
+mod dynamic_library;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,19 +19,20 @@ pub struct AbiVersion {
 }
 
 /// Whether a native runtime reporting `version` can back this binary's ABI
-/// bindings. Required symbol signatures may change between patches (for
-/// example `skippy_apply_chat_template_json` gained an argument in 0.1.28),
-/// so older runtimes must be rejected at load time.
+/// bindings. Required symbol signatures and by-value struct layouts may change
+/// between patches, so the loader requires an exact ABI match.
 pub const fn runtime_abi_supported(version: AbiVersion) -> bool {
     version.major == ABI_VERSION_MAJOR
         && version.minor == ABI_VERSION_MINOR
-        && version.patch >= ABI_VERSION_PATCH
+        && version.patch == ABI_VERSION_PATCH
 }
 
 use std::ffi::{c_char, c_int, c_void};
 
 pub type LlamaLogCallback =
     Option<unsafe extern "C" fn(level: c_int, text: *const c_char, user_data: *mut c_void)>;
+pub type MtmdProgressCallback =
+    Option<unsafe extern "C" fn(progress: f32, user_data: *mut c_void) -> bool>;
 pub type SkippyRuntimeEventCallback =
     Option<unsafe extern "C" fn(event: *const SkippyRuntimeEventV1, user_data: *mut c_void)>;
 
@@ -215,10 +221,18 @@ pub struct RuntimeConfig {
     pub flash_attn_type: i32,
     pub load_mode: LoadMode,
     pub disable_repack: bool,
+    pub use_mmap_prefetch: bool,
+    pub use_mmap_buffer: bool,
     pub filter_tensors_on_load: bool,
     pub include_embeddings: bool,
     pub include_output: bool,
     pub selected_backend_device: *const c_char,
+    pub glm_dsa_policy_profile: i32,
+    pub glm_dsa_policy_flags: u32,
+    pub glm_dsa_short_prefill_max_tokens: i32,
+    pub glm_dsa_direct_sparse_decode_max_top_k: i32,
+    pub glm_dsa_dense_sparse_mask_max_bytes: u64,
+    pub glm_dsa_compact_flash_min_kv: i32,
 }
 
 #[repr(C)]
@@ -236,6 +250,11 @@ pub struct BackendDevice {
 
 #[repr(C)]
 pub struct Model {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct NgramCache {
     _private: [u8; 0],
 }
 
@@ -332,6 +351,9 @@ pub struct MtmdContextParams {
     pub image_max_tokens: c_int,
     pub cb_eval: *mut c_void,
     pub cb_eval_user_data: *mut c_void,
+    pub batch_max_tokens: c_int,
+    pub progress_callback: MtmdProgressCallback,
+    pub progress_callback_user_data: *mut c_void,
 }
 
 #[repr(C)]
@@ -359,6 +381,8 @@ pub struct ActivationDesc {
     pub payload_bytes: u64,
     pub flags: u64,
 }
+
+pub const ACTIVATION_FLAG_INKLING_MTP_EMBD: u64 = 1 << 2;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -405,6 +429,7 @@ pub enum LlamaFileType {
     MostlyMxfp4Moe = 38,
     MostlyNvfp4 = 39,
     MostlyQ1_0 = 40,
+    MostlyQ2_0 = 41,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,7 +469,8 @@ pub enum GgmlType {
     Mxfp4 = 39,
     Nvfp4 = 40,
     Q1_0 = 41,
-    Count = 42,
+    Q2_0 = 42,
+    Count = 43,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,7 +771,7 @@ mod dynamic {
                     let mut libraries = Vec::with_capacity(paths.len());
                     for path in paths {
                         libraries.push(
-                            unsafe { Library::new(path.as_ref()) }
+                            unsafe { crate::dynamic_library::load(path.as_ref()) }
                                 .map_err(|err| NativeRuntimeLoadError::Load(err.to_string()))?,
                         );
                     }
@@ -791,6 +817,11 @@ mod dynamic {
         llama_model_quantize_default_params() -> LlamaModelQuantizeParams;
         llama_model_quantize(fname_inp: *const c_char, fname_out: *const c_char, params: *const LlamaModelQuantizeParams) -> u32;
         skippy_error_free(error: *mut Error);
+        skippy_ngram_cache_create(ngram_min: u16, ngram_max: u16, out_cache: *mut *mut NgramCache, out_error: *mut *mut Error) -> Status;
+        skippy_ngram_cache_free(cache: *mut NgramCache);
+        skippy_ngram_cache_reset(cache: *mut NgramCache, token_ids: *const i32, token_count: usize, out_error: *mut *mut Error) -> Status;
+        skippy_ngram_cache_append(cache: *mut NgramCache, token_ids: *const i32, token_count: usize, out_error: *mut *mut Error) -> Status;
+        skippy_ngram_cache_draft(cache: *mut NgramCache, continuation_prefix: *const i32, continuation_prefix_count: usize, max_draft_tokens: u16, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_backend_device_count(out_count: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_backend_device_at(index: usize, out_device: *mut BackendDevice, out_error: *mut *mut Error) -> Status;
         skippy_model_open(path: *const c_char, config: *const RuntimeConfig, out_model: *mut *mut Model, out_error: *mut *mut Error) -> Status;
@@ -808,8 +839,6 @@ mod dynamic {
         skippy_session_sample_current(session: *mut Session, sampling: *const SamplingConfig, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
         skippy_session_configure_chat_sampling(session: *mut Session, sampling: *const SamplingConfig, metadata_json: *const c_char, prompt_token_count: u64, out_error: *mut *mut Error) -> Status;
         skippy_session_reset(session: *mut Session, out_error: *mut *mut Error) -> Status;
-        skippy_checkpoint_session(session: *mut Session, out_token_count: *mut u64, out_error: *mut *mut Error) -> Status;
-        skippy_restore_session_checkpoint(session: *mut Session, token_count: u64, out_error: *mut *mut Error) -> Status;
         skippy_session_free(session: *mut Session, out_error: *mut *mut Error) -> Status;
         skippy_prefill_chunk(session: *mut Session, token_ids: *const i32, token_count: usize, input_activations: *const c_void, input_activation_bytes: usize, output_activations: *mut c_void, output_activation_capacity: usize, out_output_activation_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_verify_tokens(session: *mut Session, token_ids: *const i32, token_count: usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
@@ -822,11 +851,12 @@ mod dynamic {
         skippy_decode_step_frame_sampled(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, out_error: *mut *mut Error) -> Status;
         skippy_decode_step_frame_sampled_mtp(session: *mut Session, token_id: i32, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_predicted_token: *mut i32, max_draft_tokens: usize, out_mtp_draft: *mut NativeMtpDraft, out_error: *mut *mut Error) -> Status;
         skippy_decode_step_frame_batch_sampled(sessions: *const *mut Session, token_ids: *const i32, sampling: *const *const SamplingConfig, input_descs: *const *const ActivationDesc, input_payloads: *const *const c_void, output_descs: *mut ActivationDesc, output_payloads: *const *mut c_void, output_payload_capacities: *const usize, out_output_payload_bytes: *mut usize, out_predicted_tokens: *mut i32, predicted_token_capacity: usize, request_count: usize, out_error: *mut *mut Error) -> Status;
-        skippy_verify_tokens_frame_sampled(session: *mut Session, token_ids: *const i32, token_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, out_error: *mut *mut Error) -> Status;
+        skippy_verify_tokens_frame_sampled(session: *mut Session, token_ids: *const i32, token_count: usize, sampling: *const SamplingConfig, input_desc: *const ActivationDesc, input_payload: *const c_void, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, output_tokens: *mut i32, output_token_capacity: usize, out_token_count: *mut usize, max_draft_tokens: usize, out_mtp_draft: *mut NativeMtpDraft, out_error: *mut *mut Error) -> Status;
         skippy_session_copy_output_activation_frame(session: *mut Session, token_count: usize, output_desc: *mut ActivationDesc, output_payload: *mut c_void, output_payload_capacity: usize, out_output_payload_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_session_last_token_signal(session: *mut Session, out_signal: *mut TokenSignal, out_error: *mut *mut Error) -> Status;
         skippy_session_signal_window(session: *mut Session, window_tokens: u32, out_window: *mut GenerationSignalWindow, out_error: *mut *mut Error) -> Status;
         skippy_trim_session(session: *mut Session, token_count: u64, out_error: *mut *mut Error) -> Status;
+        skippy_retire_verify_checkpoint(session: *mut Session, token_start: u64, token_count: u64, out_error: *mut *mut Error) -> Status;
         skippy_export_state(session: *mut Session, layer_start: i32, layer_end: i32, output: *mut c_void, output_capacity: usize, out_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
         skippy_import_state(session: *mut Session, layer_start: i32, layer_end: i32, input: *const c_void, input_bytes: usize, out_error: *mut *mut Error) -> Status;
         skippy_export_full_state(session: *mut Session, layer_start: i32, layer_end: i32, output: *mut c_void, output_capacity: usize, out_bytes: *mut usize, out_error: *mut *mut Error) -> Status;
@@ -867,6 +897,7 @@ mod dynamic {
         mtmd_decode_use_mrope(ctx: *const MtmdContext) -> bool;
         mtmd_input_chunk_get_type(chunk: *const Opaque) -> MtmdInputChunkType;
         mtmd_input_chunk_get_n_tokens(chunk: *const Opaque) -> usize;
+        mtmd_input_chunk_get_tokens_text(chunk: *const Opaque, out_count: *mut usize) -> *const i32;
         mtmd_input_chunk_get_tokens_image(chunk: *const Opaque) -> *const Opaque;
         mtmd_helper_image_get_decoder_pos(image: *const Opaque, pos_0: i32, out_pos: *mut MtmdDecoderPos);
         mtmd_helper_eval_chunks(ctx: *mut MtmdContext, lctx: *mut Opaque, chunks: *const MtmdInputChunks, n_past: i32, seq_id: i32, n_batch: i32, logits_last: bool, new_n_past: *mut i32) -> c_int;
@@ -1152,9 +1183,36 @@ pub use dynamic::*;
 /// Returns the skippy ABI feature bitmask.
 /// Requires the native runtime to be loaded first (checked by caller).
 pub fn skippy_abi_features() -> u64 {
-    let fns = dynamic::skippy_abi_features_optional()
-        .expect("skippy_abi_features not available in loaded runtime");
-    unsafe { fns() }
+    try_abi_features().expect("skippy_abi_features not available in loaded runtime")
+}
+
+/// Returns the Skippy ABI feature bitmask when the loaded dynamic runtime
+/// exports feature probing.
+#[cfg(feature = "dynamic-runtime")]
+pub fn try_abi_features() -> Option<u64> {
+    dynamic::skippy_abi_features_optional().map(|features| unsafe { features() })
+}
+
+/// Returns the active Skippy ABI feature bitmask through a safe Rust wrapper.
+#[cfg(feature = "dynamic-runtime")]
+pub fn abi_features() -> u64 {
+    skippy_abi_features()
+}
+
+/// Returns the statically linked Skippy ABI feature bitmask.
+#[cfg(not(feature = "dynamic-runtime"))]
+pub fn try_abi_features() -> Option<u64> {
+    // SAFETY: the statically linked ABI exposes this nullary query with no
+    // caller-owned pointers or lifetime requirements.
+    Some(unsafe { skippy_abi_features() })
+}
+
+/// Returns the statically linked Skippy ABI feature bitmask.
+#[cfg(not(feature = "dynamic-runtime"))]
+pub fn abi_features() -> u64 {
+    // SAFETY: the statically linked ABI exposes this nullary query with no
+    // caller-owned pointers or lifetime requirements.
+    unsafe { skippy_abi_features() }
 }
 
 #[cfg(not(feature = "dynamic-runtime"))]
@@ -1174,6 +1232,40 @@ unsafe extern "C" {
     pub fn skippy_abi_features() -> u64;
 
     pub fn skippy_error_free(error: *mut Error);
+
+    pub fn skippy_ngram_cache_create(
+        ngram_min: u16,
+        ngram_max: u16,
+        out_cache: *mut *mut NgramCache,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_ngram_cache_free(cache: *mut NgramCache);
+
+    pub fn skippy_ngram_cache_reset(
+        cache: *mut NgramCache,
+        token_ids: *const i32,
+        token_count: usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_ngram_cache_append(
+        cache: *mut NgramCache,
+        token_ids: *const i32,
+        token_count: usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_ngram_cache_draft(
+        cache: *mut NgramCache,
+        continuation_prefix: *const i32,
+        continuation_prefix_count: usize,
+        max_draft_tokens: u16,
+        output_tokens: *mut i32,
+        output_token_capacity: usize,
+        out_token_count: *mut usize,
+        out_error: *mut *mut Error,
+    ) -> Status;
 
     pub fn skippy_backend_device_count(out_count: *mut usize, out_error: *mut *mut Error)
     -> Status;
@@ -1263,18 +1355,6 @@ unsafe extern "C" {
     ) -> Status;
 
     pub fn skippy_session_reset(session: *mut Session, out_error: *mut *mut Error) -> Status;
-
-    pub fn skippy_checkpoint_session(
-        session: *mut Session,
-        out_token_count: *mut u64,
-        out_error: *mut *mut Error,
-    ) -> Status;
-
-    pub fn skippy_restore_session_checkpoint(
-        session: *mut Session,
-        token_count: u64,
-        out_error: *mut *mut Error,
-    ) -> Status;
 
     pub fn skippy_session_free(session: *mut Session, out_error: *mut *mut Error) -> Status;
 
@@ -1407,6 +1487,8 @@ unsafe extern "C" {
         output_tokens: *mut i32,
         output_token_capacity: usize,
         out_token_count: *mut usize,
+        max_draft_tokens: usize,
+        out_mtp_draft: *mut NativeMtpDraft,
         out_error: *mut *mut Error,
     ) -> Status;
 
@@ -1481,6 +1563,13 @@ unsafe extern "C" {
 
     pub fn skippy_trim_session(
         session: *mut Session,
+        token_count: u64,
+        out_error: *mut *mut Error,
+    ) -> Status;
+
+    pub fn skippy_retire_verify_checkpoint(
+        session: *mut Session,
+        token_start: u64,
         token_count: u64,
         out_error: *mut *mut Error,
     ) -> Status;
@@ -1751,6 +1840,11 @@ unsafe extern "C" {
 
     pub fn mtmd_input_chunk_get_n_tokens(chunk: *const Opaque) -> usize;
 
+    pub fn mtmd_input_chunk_get_tokens_text(
+        chunk: *const Opaque,
+        out_count: *mut usize,
+    ) -> *const i32;
+
     pub fn mtmd_input_chunk_get_tokens_image(chunk: *const Opaque) -> *const Opaque;
 
     pub fn mtmd_helper_image_get_decoder_pos(
@@ -1797,6 +1891,7 @@ pub type Opaque = c_void;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::{offset_of, size_of};
 
     const fn version(major: u32, minor: u32, patch: u32) -> AbiVersion {
         AbiVersion {
@@ -1807,21 +1902,21 @@ mod tests {
     }
 
     #[test]
-    fn accepts_current_and_newer_patch_runtimes() {
+    fn accepts_current_patch_runtime() {
         assert!(runtime_abi_supported(version(
             ABI_VERSION_MAJOR,
             ABI_VERSION_MINOR,
             ABI_VERSION_PATCH,
         )));
-        assert!(runtime_abi_supported(version(
+    }
+
+    #[test]
+    fn rejects_other_patch_runtimes() {
+        assert!(!runtime_abi_supported(version(
             ABI_VERSION_MAJOR,
             ABI_VERSION_MINOR,
             ABI_VERSION_PATCH + 1,
         )));
-    }
-
-    #[test]
-    fn rejects_older_patch_runtimes() {
         assert!(!runtime_abi_supported(version(
             ABI_VERSION_MAJOR,
             ABI_VERSION_MINOR,
@@ -1841,5 +1936,27 @@ mod tests {
             ABI_VERSION_MINOR + 1,
             ABI_VERSION_PATCH,
         )));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn mtmd_context_params_matches_native_layout() {
+        assert_eq!(size_of::<MtmdContextParams>(), 80);
+        assert_eq!(offset_of!(MtmdContextParams, batch_max_tokens), 56);
+        assert_eq!(offset_of!(MtmdContextParams, progress_callback), 64);
+        assert_eq!(
+            offset_of!(MtmdContextParams, progress_callback_user_data),
+            72
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "dynamic-runtime"))]
+    fn native_mtmd_defaults_cross_the_ffi_boundary() {
+        let params = unsafe { mtmd_context_params_default() };
+
+        assert_eq!(params.batch_max_tokens, 1024);
+        assert!(params.progress_callback.is_none());
+        assert!(params.progress_callback_user_data.is_null());
     }
 }

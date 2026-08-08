@@ -233,7 +233,11 @@ run_cargo_publish_once() {
     fi
 
     echo "cargo ${args[*]}"
-    if output="$(cargo "${args[@]}" 2>&1)"; then
+    # Registry verification runs from the isolated package tarball, where the
+    # repository-only patched llama.cpp build inputs are intentionally absent.
+    # Verify the Rust package surface through skippy-ffi's dynamic link mode;
+    # this does not change the uploaded crate contents or feature defaults.
+    if output="$(LLAMA_STAGE_LINK_MODE=dynamic cargo "${args[@]}" 2>&1)"; then
         last_publish_output="$output"
         print_publish_output "$output"
         return 0
@@ -345,6 +349,9 @@ unpublished_registry_deps() {
             printf '%s\n' \
                 mesh-llm-build-info \
                 mesh-llm-gpu-bench \
+                mesh-llm-native-runtime \
+                mesh-llm-release-footer \
+                mesh-llm-runtime-install \
                 skippy-runtime
             ;;
         mesh-llm-config)
@@ -386,6 +393,11 @@ unpublished_registry_deps() {
                 skippy-protocol \
                 skippy-runtime
             ;;
+        mesh-native-serving-plugin-host)
+            printf '%s\n' \
+                mesh-native-serving-plugin-api \
+                skippy-server
+            ;;
         mesh-llm-host-runtime)
             printf '%s\n' \
                 mesh-llm-api-server \
@@ -406,6 +418,7 @@ unpublished_registry_deps() {
                 mesh-llm-types \
                 mesh-llm-ui \
                 mesh-mixture-of-agents \
+                mesh-native-serving-plugin-host \
                 model-artifact \
                 model-hf \
                 model-package \
@@ -465,6 +478,7 @@ publish_crates=(
     mesh-llm-types
     mesh-llm-guardrails
     mesh-llm-plugin
+    mesh-native-serving-plugin-api
     mesh-llm-skills
     mesh-llm-gpu-bench
     skippy-ffi
@@ -480,6 +494,7 @@ publish_crates=(
     mesh-llm-api-client
     mesh-llm-events
     mesh-llm-build-info
+    mesh-llm-release-footer
     mesh-llm-config
     mesh-llm-ui
     mesh-llm-console-server
@@ -494,10 +509,11 @@ publish_crates=(
     skippy-runtime
     openai-frontend
     skippy-server
+    mesh-native-serving-plugin-host
     mesh-llm-plugin-manager
     mesh-mixture-of-agents
-    mesh-llm-system
     mesh-llm-runtime-install
+    mesh-llm-system
     mesh-llm-host-runtime
     mesh-llm-embedded-runtime
     mesh-llm-sdk

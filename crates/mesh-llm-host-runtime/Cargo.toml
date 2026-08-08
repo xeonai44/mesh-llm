@@ -9,14 +9,11 @@ homepage = "https://github.com/Mesh-LLM/mesh-llm"
 readme = "README.md"
 
 [features]
-default = ["web-ui"]
+default = ["web-ui", "dynamic-native-runtime"]
 # Embed the React web console into the binary. Default on; turn off for
 # lib-style / headless consumers that don't need the console assets.
 # Propagates to `mesh-llm-ui/embed-assets`.
 web-ui = ["mesh-llm-ui/embed-assets"]
-gpu-bench-cuda = ["mesh-llm-system/gpu-bench-cuda"]
-gpu-bench-hip = ["mesh-llm-system/gpu-bench-hip"]
-gpu-bench-intel = ["mesh-llm-system/gpu-bench-intel"]
 dynamic-native-runtime = [
     "mesh-llm-system/dynamic-native-runtime",
     "skippy-runtime/dynamic-native-runtime",
@@ -36,6 +33,7 @@ mesh-llm-plugin = { path = "../mesh-llm-plugin", version = "0.72.1"  }
 mesh-llm-plugin-manager = { path = "../mesh-llm-plugin-manager", version = "0.72.1"  }
 mesh-llm-identity = { path = "../mesh-llm-identity", version = "0.72.1", features = ["host-io"]  }
 mesh-llm-native-runtime = { path = "../mesh-llm-native-runtime", version = "0.72.1"  }
+mesh-native-serving-plugin-host = { path = "../mesh-native-serving-plugin-host", version = "0.72.1" }
 mesh-llm-runtime-install = { path = "../mesh-llm-runtime-install", version = "0.72.1"  }
 mesh-llm-guardrails = { path = "../mesh-llm-guardrails", version = "0.72.1"  }
 mesh-llm-protocol = { path = "../mesh-llm-protocol", version = "0.72.1"  }
@@ -55,9 +53,10 @@ openai-frontend = { path = "../openai-frontend", version = "0.72.1"  }
 skippy-protocol = { path = "../skippy-protocol", version = "0.72.1"  }
 skippy-coordinator = { path = "../skippy-coordinator", version = "0.72.1"  }
 skippy-runtime = { path = "../skippy-runtime", version = "0.72.1"  }
+skippy-ffi = { path = "../skippy-ffi", version = "0.72.1", default-features = false }
 skippy-server = { path = "../skippy-server", version = "0.72.1"  }
 skippy-topology = { path = "../skippy-topology", version = "0.72.1"  }
-iroh = "1.0.0"
+iroh = { version = "1.0.0", default-features = false, features = ["metrics", "fast-apple-datapath", "portmapper", "tls-aws-lc-rs"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -66,7 +65,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 socket2 = { version = "0.6", features = ["all"] }
-if-addrs = "0.15"
 anyhow = "1"
 async-trait = "0.1"
 rand = "0.10"
@@ -104,13 +102,13 @@ urlencoding = "2"
 libc = "0.2.183"
 mdns-sd = "0.19"
 regex-lite = "0.1"
-rmcp = { version = "1.2", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+rmcp = { version = "1.8", features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 axum = "0.8"
 schemars = "1"
 prost = "0.14"
 toml = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-hf_hub = { package = "hf-hub", version = "1.0.0-rc.1", default-features = false, features = ["blocking"] }
+hf_hub = { package = "mesh-llm-hf-hub", version = "1.0.2", default-features = false, features = ["blocking"] }
 tabwriter = "1"
 tempfile = "3"
 

@@ -1,4 +1,24 @@
-use super::*;
+use crate::frontend::EmbeddedOpenAiRequestDefaults;
+use crate::frontend::EmbeddedReasoningBudget;
+use crate::frontend::EmbeddedReasoningEnabled;
+use crate::frontend::EmbeddedReasoningFormat;
+use base64::Engine;
+use openai_frontend::ChatCompletionRequest;
+use openai_frontend::CompletionRequest;
+use openai_frontend::MessageContent;
+use openai_frontend::MessageContentPart;
+use openai_frontend::OpenAiError;
+use openai_frontend::OpenAiResult;
+use serde_json::Value;
+use skippy_protocol::binary::MAX_STAGE_LOGIT_BIAS;
+use skippy_protocol::binary::StageLogitBias as WireLogitBias;
+use skippy_protocol::binary::StageSamplingConfig as WireSamplingConfig;
+use skippy_runtime::ChatReasoningFormat;
+use skippy_runtime::ChatTemplateOptions;
+use skippy_runtime::LogitBias as RuntimeLogitBias;
+use skippy_runtime::MAX_LOGIT_BIAS;
+use skippy_runtime::MediaInput;
+use skippy_runtime::SamplingConfig;
 
 struct SharedRequestFields<'a> {
     presence_penalty: &'a mut Option<f32>,
@@ -257,13 +277,42 @@ pub(super) fn completion_sampling_config(
 }
 
 pub(super) fn chat_template_options(
-    _request: &ChatCompletionRequest,
+    request: &ChatCompletionRequest,
     defaults: &EmbeddedOpenAiRequestDefaults,
 ) -> OpenAiResult<ChatTemplateOptions> {
+    let reasoning = openai_frontend::normalize_reasoning_template_options(
+        request.reasoning.as_ref(),
+        request.reasoning_effort,
+        &request.extra,
+    )?;
     Ok(ChatTemplateOptions {
         reasoning_format: Some(chat_reasoning_format(defaults.reasoning_format)),
+        enable_thinking: reasoning
+            .enable_thinking
+            .or_else(|| default_reasoning_enabled(defaults.reasoning_enabled))
+            .or_else(|| default_reasoning_budget_enabled(defaults.reasoning_budget)),
         ..ChatTemplateOptions::default()
     })
+}
+
+fn default_reasoning_enabled(value: Option<EmbeddedReasoningEnabled>) -> Option<bool> {
+    match value {
+        Some(EmbeddedReasoningEnabled::Disabled) => Some(false),
+        Some(EmbeddedReasoningEnabled::Enabled) => Some(true),
+        Some(EmbeddedReasoningEnabled::Auto) | None => None,
+    }
+}
+
+fn default_reasoning_budget_enabled(value: Option<EmbeddedReasoningBudget>) -> Option<bool> {
+    match value {
+        Some(EmbeddedReasoningBudget::Tokens(0)) => Some(false),
+        Some(EmbeddedReasoningBudget::Tokens(_)) => Some(true),
+        Some(EmbeddedReasoningBudget::Effort(openai_frontend::ReasoningEffort::None)) => {
+            Some(false)
+        }
+        Some(EmbeddedReasoningBudget::Effort(_)) => Some(true),
+        Some(EmbeddedReasoningBudget::Auto) | None => None,
+    }
 }
 
 fn chat_reasoning_format(value: Option<EmbeddedReasoningFormat>) -> ChatReasoningFormat {
@@ -284,15 +333,6 @@ pub(super) fn ensure_chat_runtime_features_supported(
             "chat logprobs are parsed by openai-frontend but not yet implemented by skippy runtime",
         ));
     }
-    if request
-        .response_format
-        .as_ref()
-        .is_some_and(requires_structured_output)
-    {
-        return Err(OpenAiError::unsupported(
-            "structured output is parsed by openai-frontend but not yet implemented by skippy runtime",
-        ));
-    }
     Ok(())
 }
 
@@ -309,14 +349,6 @@ pub(super) fn ensure_completion_runtime_features_supported(
 
 pub(super) fn has_requested_tools(value: &Value) -> bool {
     !matches!(value, Value::Array(items) if items.is_empty())
-}
-
-pub(super) fn requires_structured_output(value: &Value) -> bool {
-    value
-        .as_object()
-        .and_then(|object| object.get("type"))
-        .and_then(Value::as_str)
-        .is_some_and(|format_type| format_type != "text")
 }
 
 pub(super) fn ensure_extra_generation_fields_absent(

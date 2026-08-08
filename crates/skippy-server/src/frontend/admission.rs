@@ -1,5 +1,13 @@
-use super::*;
-use std::sync::{Arc, Condvar, Mutex};
+use crate::frontend::generation::GENERATION_RETRY_AFTER_SECS;
+use axum::http::StatusCode;
+use openai_frontend::OpenAiError;
+use openai_frontend::OpenAiErrorKind;
+use openai_frontend::OpenAiResult;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 const DECODE_BATCH_HEADROOM_TOKENS: usize = 512;
 
@@ -37,10 +45,20 @@ impl GenerationTokenBudget {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn reserve(
         self: &Arc<Self>,
         request: GenerationTokenBudgetRequest,
         admission_timeout: Duration,
+    ) -> OpenAiResult<GenerationTokenReservation> {
+        self.reserve_cancellable(request, admission_timeout, None)
+    }
+
+    pub(super) fn reserve_cancellable(
+        self: &Arc<Self>,
+        request: GenerationTokenBudgetRequest,
+        admission_timeout: Duration,
+        cancellation: Option<&openai_frontend::CancellationToken>,
     ) -> OpenAiResult<GenerationTokenReservation> {
         let tokens = request.reservation_tokens(self.capacity_tokens);
         let deadline = Instant::now() + admission_timeout;
@@ -49,6 +67,9 @@ impl GenerationTokenBudget {
             .lock()
             .map_err(|_| OpenAiError::backend("generation token budget lock poisoned"))?;
         loop {
+            if cancellation.is_some_and(openai_frontend::CancellationToken::is_cancelled) {
+                return Err(OpenAiError::backend("request cancelled"));
+            }
             if state.active_tokens.saturating_add(tokens) <= self.capacity_tokens {
                 state.active_tokens = state.active_tokens.saturating_add(tokens);
                 return Ok(GenerationTokenReservation {
@@ -68,13 +89,17 @@ impl GenerationTokenBudget {
                 ));
             }
 
-            let wait_for = deadline.saturating_duration_since(now);
+            let wait_for = deadline.saturating_duration_since(now).min(
+                cancellation
+                    .map(|_| Duration::from_millis(10))
+                    .unwrap_or(admission_timeout),
+            );
             let (next_state, wait_result) = self
                 .released
                 .wait_timeout(state, wait_for)
                 .map_err(|_| OpenAiError::backend("generation token budget lock poisoned"))?;
             state = next_state;
-            if wait_result.timed_out() {
+            if wait_result.timed_out() && Instant::now() >= deadline {
                 return Err(generation_token_budget_timeout_error(
                     admission_timeout,
                     tokens,

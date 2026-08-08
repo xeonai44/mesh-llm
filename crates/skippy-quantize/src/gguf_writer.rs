@@ -7,27 +7,33 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
 use crate::float_convert::{FloatDType, convert_float_chunk, target_dtype_for_tensor};
+pub(crate) use crate::gguf_metadata::GgufKv;
+use crate::gguf_metadata::write_kv;
+#[cfg(test)]
+use crate::gguf_metadata::{
+    GGUF_TYPE_ARRAY, GGUF_TYPE_BOOL, GGUF_TYPE_FLOAT32, GGUF_TYPE_INT32, GGUF_TYPE_STRING,
+    GGUF_TYPE_UINT16, GGUF_TYPE_UINT32, GGUF_TYPE_UINT64,
+};
 use crate::hf_checkpoint::{SafetensorFile, SafetensorTensorInfo, open_safetensor_files};
 use crate::tensor_map::{
-    TensorNameMap, hf_layer_id, is_mtp_source_tensor, is_shared_mtp_context_tensor,
+    TensorNameMap, hf_layer_id, inkling_mtp_depth, is_inkling_fused_w13, is_mtp_source_tensor,
+    is_shared_mtp_context_tensor,
 };
 use crate::types::ConvertOutputType;
+
+mod glm_dsa;
+
+use glm_dsa::{
+    GlmDsaKvBSplitMode, TensorTransform, enrich_glm_dsa_indexshare_metadata, glm_dsa_kv_b_layer,
+    glm_dsa_kv_b_split_mode, stream_transformed_segment,
+};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_VERSION: u32 = 3;
 const GGUF_ALIGNMENT: u64 = 32;
-const GGUF_TYPE_BOOL: u32 = 7;
-const GGUF_TYPE_UINT32: u32 = 4;
-const GGUF_TYPE_INT32: u32 = 5;
-const GGUF_TYPE_FLOAT32: u32 = 6;
-const GGUF_TYPE_STRING: u32 = 8;
-const GGUF_TYPE_ARRAY: u32 = 9;
-const GGUF_TYPE_UINT16: u32 = 2;
-const GGUF_TYPE_UINT64: u32 = 10;
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_BF16: u32 = 30;
-
 #[derive(Debug, Clone)]
 pub(crate) struct RawGgufWriteOptions {
     pub(crate) buffer_size: usize,
@@ -90,6 +96,58 @@ pub(crate) fn validate_raw_safetensors_gguf(
     })
 }
 
+pub(crate) fn recommended_raw_safetensors_gguf_split_count(
+    source: &Path,
+    mut options: RawGgufWriteOptions,
+    max_tensor_bytes: u64,
+) -> Result<u32> {
+    ensure!(
+        max_tensor_bytes > 0,
+        "split maximum tensor bytes must be greater than zero"
+    );
+    options.split = None;
+    let PreparedGgufWrite { tensors, .. } = prepare_raw_safetensors_gguf(source, &options)?;
+    let largest_tensor_bytes = tensors
+        .iter()
+        .map(|tensor| tensor.byte_len)
+        .max()
+        .unwrap_or_default();
+    ensure!(
+        largest_tensor_bytes <= max_tensor_bytes,
+        "largest selected tensor is {largest_tensor_bytes} bytes, exceeding split maximum {max_tensor_bytes} bytes"
+    );
+    let total_tensor_bytes = tensors
+        .iter()
+        .try_fold(0_u64, |total, tensor| total.checked_add(tensor.byte_len));
+    let total_tensor_bytes = total_tensor_bytes.context("selected tensor byte total overflow")?;
+    let minimum_count = total_tensor_bytes
+        .div_ceil(max_tensor_bytes)
+        .max(1)
+        .min(tensors.len() as u64);
+    let minimum_count = u32::try_from(minimum_count).context("split count does not fit u32")?;
+    let maximum_count = u32::try_from(tensors.len()).context("tensor count does not fit u32")?;
+
+    for split_count in minimum_count..=maximum_count {
+        let split = GgufSplit {
+            split_index: 1,
+            split_count,
+        };
+        let boundaries = byte_balanced_split_boundaries(&tensors, split)?;
+        let every_split_fits = boundaries.windows(2).all(|range| {
+            tensors[range[0]..range[1]]
+                .iter()
+                .map(|tensor| tensor.byte_len)
+                .sum::<u64>()
+                <= max_tensor_bytes
+        });
+        if every_split_fits {
+            return Ok(split_count);
+        }
+    }
+
+    anyhow::bail!("could not partition selected tensors within the split maximum")
+}
+
 struct PreparedGgufWrite {
     files: Vec<SafetensorFile>,
     tensors: Vec<TensorSource>,
@@ -119,11 +177,14 @@ fn prepare_raw_safetensors_gguf(
         "no safetensors files found under {}",
         source.display()
     );
+    let metadata_seed = options.metadata.clone();
+    let glm_dsa_kv_b_split = glm_dsa_kv_b_split_mode(metadata_seed.as_deref())?;
     let tensors = collect_tensor_sources(
         &files,
         options.tensor_name_map,
         options.output_type,
         options.tensor_selection,
+        glm_dsa_kv_b_split,
     )?;
     ensure!(
         !tensors.is_empty(),
@@ -131,12 +192,10 @@ fn prepare_raw_safetensors_gguf(
         source.display()
     );
     let total_tensor_count = tensors.len();
+    let mut metadata = metadata_seed.unwrap_or_else(|| raw_metadata(source, total_tensor_count));
+    enrich_glm_dsa_indexshare_metadata(&mut metadata, &tensors)?;
     let mut tensors = select_split_tensors(tensors, options.split)?;
     assign_gguf_offsets(&mut tensors)?;
-    let metadata = options
-        .metadata
-        .clone()
-        .unwrap_or_else(|| raw_metadata(source, total_tensor_count));
     let metadata = split_metadata(metadata, options.split, total_tensor_count)?;
     Ok(PreparedGgufWrite {
         files,
@@ -289,12 +348,22 @@ fn collect_tensor_sources(
     tensor_name_map: TensorNameMap,
     output_type: Option<ConvertOutputType>,
     tensor_selection: TensorSelection,
+    glm_dsa_kv_b_split: GlmDsaKvBSplitMode,
 ) -> Result<Vec<TensorSource>> {
     let mut tensors = Vec::new();
     let mut expert_groups = BTreeMap::<ExpertGroupKey, ExpertGroup>::new();
     for (file_index, file) in files.iter().enumerate() {
         for tensor in file.tensors().values() {
             if !tensor_selection.includes(tensor.name())? {
+                continue;
+            }
+            if is_inkling_fused_w13(tensor.name()) {
+                tensors.extend(inkling_w13_tensor_sources(
+                    file_index,
+                    tensor,
+                    tensor_name_map,
+                    output_type,
+                )?);
                 continue;
             }
             if matches!(
@@ -313,6 +382,27 @@ fn collect_tensor_sources(
                     }
                 }
                 continue;
+            }
+            if let Some(layer) = glm_dsa_kv_b_layer(tensor.name())? {
+                match glm_dsa_kv_b_split {
+                    GlmDsaKvBSplitMode::Config(split) => {
+                        tensors.extend(TensorSource::from_glm_dsa_kv_b_split(
+                            file_index,
+                            tensor,
+                            layer,
+                            split,
+                            output_type,
+                        )?);
+                        continue;
+                    }
+                    GlmDsaKvBSplitMode::MissingMetadata => {
+                        anyhow::bail!(
+                            "GLM-DSA tensor {} requires attention head/value/rope/kv_lora metadata for kv_b split",
+                            tensor.name()
+                        );
+                    }
+                    GlmDsaKvBSplitMode::Disabled => {}
+                }
             }
             tensors.push(TensorSource::from_safetensor(
                 file_index,
@@ -365,9 +455,11 @@ impl TensorSource {
         let source_dtype = FloatDType::from_safetensor(tensor.dtype()).with_context(|| {
             format!("unsupported dtype {} for {}", tensor.dtype(), tensor.name())
         })?;
-        let target_dtype = target_dtype_for_tensor(source_dtype, output_type, tensor.shape())?;
         let name = tensor_name_map.map_tensor_name(tensor.name())?;
+        let target_dtype =
+            target_dtype_for_mapped_tensor(source_dtype, output_type, tensor.shape(), &name)?;
         let element_count = tensor_element_count(tensor)?;
+        let dims = mapped_tensor_dims(tensor.shape(), &name)?;
         Ok(Self {
             segments: vec![TensorSegment {
                 file_index,
@@ -377,14 +469,107 @@ impl TensorSource {
                 element_count,
                 source_byte_len: tensor.byte_len(),
                 target_byte_len: tensor_byte_len(element_count, target_dtype)?,
+                transform: TensorTransform::Identity,
             }],
             name,
-            dims: tensor.shape().iter().rev().copied().collect(),
+            dims,
             ggml_type: ggml_type_for_dtype(target_dtype),
             byte_len: tensor_byte_len(element_count, target_dtype)?,
             gguf_offset: 0,
         })
     }
+}
+
+fn target_dtype_for_mapped_tensor(
+    source_dtype: FloatDType,
+    output_type: Option<ConvertOutputType>,
+    shape: &[u64],
+    mapped_name: &str,
+) -> Result<FloatDType> {
+    if mapped_name.ends_with("attn_rel_proj.weight") || mapped_name.contains(".shortconv_") {
+        return Ok(FloatDType::F32);
+    }
+    target_dtype_for_tensor(source_dtype, output_type, shape)
+}
+
+fn mapped_tensor_dims(shape: &[u64], mapped_name: &str) -> Result<Vec<u64>> {
+    if mapped_name.contains(".shortconv_") {
+        ensure!(
+            shape.len() == 3 && shape[1] == 1,
+            "Inkling shortconv tensor {mapped_name} must have shape [channels, 1, kernel], got {shape:?}"
+        );
+        return Ok(vec![shape[2], shape[0]]);
+    }
+    Ok(shape.iter().rev().copied().collect())
+}
+
+fn inkling_w13_tensor_sources(
+    file_index: usize,
+    tensor: &SafetensorTensorInfo,
+    tensor_name_map: TensorNameMap,
+    output_type: Option<ConvertOutputType>,
+) -> Result<Vec<TensorSource>> {
+    let layer = if let Some(depth) = inkling_mtp_depth(tensor.name())? {
+        let TensorNameMap::HfToGgufWithMtp { layer_start } = tensor_name_map else {
+            anyhow::bail!("Inkling MTP conversion requires an MTP-aware tensor name map");
+        };
+        layer_start
+            .checked_add(depth)
+            .context("Inkling MTP layer id overflow")?
+    } else {
+        ensure!(
+            matches!(
+                tensor_name_map,
+                TensorNameMap::HfToGguf | TensorNameMap::HfToGgufWithMtp { .. }
+            ),
+            "Inkling fused w13 conversion requires an HF tensor name map"
+        );
+        hf_layer_id(tensor.name())?
+            .with_context(|| format!("missing Inkling layer id in {}", tensor.name()))?
+    };
+    ensure!(
+        tensor.shape().len() == 2,
+        "Inkling MTP fused w13 tensor {} must be rank 2, got {:?}",
+        tensor.name(),
+        tensor.shape()
+    );
+    ensure!(
+        tensor.shape()[0].is_multiple_of(2),
+        "Inkling MTP fused w13 tensor {} must have an even row count",
+        tensor.name()
+    );
+    let source_dtype = FloatDType::from_safetensor(tensor.dtype())
+        .with_context(|| format!("unsupported dtype {} for {}", tensor.dtype(), tensor.name()))?;
+    let output_shape = [tensor.shape()[0] / 2, tensor.shape()[1]];
+    let target_dtype = target_dtype_for_tensor(source_dtype, output_type, &output_shape)?;
+    let element_count = output_shape[0]
+        .checked_mul(output_shape[1])
+        .context("Inkling MTP w13 output element count overflow")?;
+    let target_byte_len = tensor_byte_len(element_count, target_dtype)?;
+    let dims = output_shape.iter().rev().copied().collect::<Vec<_>>();
+    Ok([("ffn_gate", 0_u64), ("ffn_up", 1_u64)]
+        .into_iter()
+        .map(|(projection, parity)| TensorSource {
+            segments: vec![TensorSegment {
+                file_index,
+                source_name: tensor.name().to_string(),
+                source_dtype,
+                target_dtype,
+                element_count,
+                source_byte_len: tensor.byte_len(),
+                target_byte_len,
+                transform: TensorTransform::AlternatingRows {
+                    parity,
+                    row_elements: tensor.shape()[1],
+                },
+            }],
+            name: format!("blk.{layer}.{projection}.weight"),
+            dims: dims.clone(),
+            ggml_type: ggml_type_for_dtype(target_dtype),
+            byte_len: target_byte_len,
+            gguf_offset: 0,
+        })
+        .collect())
 }
 
 struct TensorSegment {
@@ -395,6 +580,7 @@ struct TensorSegment {
     element_count: u64,
     source_byte_len: u64,
     target_byte_len: u64,
+    transform: TensorTransform,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -538,6 +724,7 @@ impl ExpertGroup {
                 element_count,
                 source_byte_len: tensor.byte_len(),
                 target_byte_len: tensor_byte_len(element_count, self.target_dtype)?,
+                transform: TensorTransform::Identity,
             },
         );
         ensure!(
@@ -621,92 +808,6 @@ fn raw_metadata(source: &Path, tensor_count: usize) -> Vec<GgufKv> {
     ]
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum GgufKv {
-    ArrayF32 { key: String, value: Vec<f32> },
-    ArrayI32 { key: String, value: Vec<i32> },
-    ArrayString { key: String, value: Vec<String> },
-    Bool { key: String, value: bool },
-    F32 { key: String, value: f32 },
-    I32 { key: String, value: i32 },
-    String { key: String, value: String },
-    U16 { key: String, value: u16 },
-    U32 { key: String, value: u32 },
-    U64 { key: String, value: u64 },
-}
-
-impl GgufKv {
-    pub(crate) fn array_f32(key: &str, value: Vec<f32>) -> Self {
-        Self::ArrayF32 {
-            key: key.to_string(),
-            value,
-        }
-    }
-
-    pub(crate) fn array_i32(key: &str, value: Vec<i32>) -> Self {
-        Self::ArrayI32 {
-            key: key.to_string(),
-            value,
-        }
-    }
-
-    pub(crate) fn array_string(key: &str, value: Vec<String>) -> Self {
-        Self::ArrayString {
-            key: key.to_string(),
-            value,
-        }
-    }
-
-    pub(crate) fn bool(key: &str, value: bool) -> Self {
-        Self::Bool {
-            key: key.to_string(),
-            value,
-        }
-    }
-
-    pub(crate) fn f32(key: &str, value: f32) -> Self {
-        Self::F32 {
-            key: key.to_string(),
-            value,
-        }
-    }
-
-    pub(crate) fn i32(key: &str, value: i32) -> Self {
-        Self::I32 {
-            key: key.to_string(),
-            value,
-        }
-    }
-
-    pub(crate) fn string(key: &str, value: &str) -> Self {
-        Self::String {
-            key: key.to_string(),
-            value: value.to_string(),
-        }
-    }
-
-    pub(crate) fn u16(key: &str, value: u16) -> Self {
-        Self::U16 {
-            key: key.to_string(),
-            value,
-        }
-    }
-
-    pub(crate) fn u32(key: &str, value: u32) -> Self {
-        Self::U32 {
-            key: key.to_string(),
-            value,
-        }
-    }
-
-    pub(crate) fn u64(key: &str, value: u64) -> Self {
-        Self::U64 {
-            key: key.to_string(),
-            value,
-        }
-    }
-}
-
 fn write_header_and_tensor_table<W: Write>(
     writer: &mut W,
     metadata: &[GgufKv],
@@ -729,82 +830,6 @@ fn write_header_and_tensor_table<W: Write>(
         write_u64(writer, tensor.gguf_offset)?;
     }
     Ok(())
-}
-
-fn write_kv<W: Write>(writer: &mut W, kv: &GgufKv) -> Result<()> {
-    match kv {
-        GgufKv::ArrayF32 { key, value } => {
-            write_array_header(writer, key, GGUF_TYPE_FLOAT32, value.len())?;
-            for item in value {
-                writer.write_all(&item.to_le_bytes())?;
-            }
-        }
-        GgufKv::ArrayI32 { key, value } => {
-            write_array_header(writer, key, GGUF_TYPE_INT32, value.len())?;
-            for item in value {
-                writer.write_all(&item.to_le_bytes())?;
-            }
-        }
-        GgufKv::ArrayString { key, value } => {
-            write_array_header(writer, key, GGUF_TYPE_STRING, value.len())?;
-            for item in value {
-                write_string(writer, item)?;
-            }
-        }
-        GgufKv::Bool { key, value } => {
-            write_string(writer, key)?;
-            write_u32(writer, GGUF_TYPE_BOOL)?;
-            writer.write_all(&[*value as u8])?;
-        }
-        GgufKv::F32 { key, value } => {
-            write_string(writer, key)?;
-            write_u32(writer, GGUF_TYPE_FLOAT32)?;
-            writer.write_all(&value.to_le_bytes())?;
-        }
-        GgufKv::I32 { key, value } => {
-            write_string(writer, key)?;
-            write_u32(writer, GGUF_TYPE_INT32)?;
-            writer.write_all(&value.to_le_bytes())?;
-        }
-        GgufKv::String { key, value } => {
-            write_string(writer, key)?;
-            write_u32(writer, GGUF_TYPE_STRING)?;
-            write_string(writer, value)?;
-        }
-        GgufKv::U16 { key, value } => {
-            write_string(writer, key)?;
-            write_u32(writer, GGUF_TYPE_UINT16)?;
-            writer.write_all(&value.to_le_bytes())?;
-        }
-        GgufKv::U32 { key, value } => {
-            write_string(writer, key)?;
-            write_u32(writer, GGUF_TYPE_UINT32)?;
-            write_u32(writer, *value)?;
-        }
-        GgufKv::U64 { key, value } => {
-            write_string(writer, key)?;
-            write_u32(writer, GGUF_TYPE_UINT64)?;
-            write_u64(writer, *value)?;
-        }
-    }
-    Ok(())
-}
-
-fn write_array_header<W: Write>(
-    writer: &mut W,
-    key: &str,
-    element_type: u32,
-    len: usize,
-) -> Result<()> {
-    ensure!(!key.is_empty(), "GGUF metadata key cannot be empty");
-    ensure!(
-        len > 0,
-        "GGUF array metadata {key:?} cannot be empty because llama.cpp rejects empty arrays"
-    );
-    write_string(writer, key)?;
-    write_u32(writer, GGUF_TYPE_ARRAY)?;
-    write_u32(writer, element_type)?;
-    write_u64(writer, len as u64)
 }
 
 fn stream_tensor_data(
@@ -848,6 +873,17 @@ fn stream_segment(
     segment: &TensorSegment,
     buffer_size: usize,
 ) -> Result<u64> {
+    if let TensorTransform::AlternatingRows {
+        parity,
+        row_elements,
+    } = segment.transform
+    {
+        return stream_alternating_rows(writer, file, segment, buffer_size, parity, row_elements);
+    }
+    if let Some(written) = stream_transformed_segment(writer, file, segment, buffer_size)? {
+        return Ok(written);
+    }
+
     if segment.source_dtype == segment.target_dtype {
         let copied = file.stream_tensor(&segment.source_name, writer, buffer_size)?;
         ensure!(
@@ -887,6 +923,59 @@ fn stream_segment(
         source_bytes / segment.source_dtype.byte_size() == segment.element_count,
         "read element count mismatch for {}",
         segment.source_name
+    );
+    Ok(output_bytes)
+}
+
+/// Deinterleave alternating rows of a fused SwiGLU tensor (Inkling MTP fused
+/// w13): parity 0 keeps even rows (gate), parity 1 keeps odd rows (up).
+fn stream_alternating_rows(
+    writer: &mut File,
+    file: &SafetensorFile,
+    segment: &TensorSegment,
+    buffer_size: usize,
+    parity: u64,
+    row_elements: u64,
+) -> Result<u64> {
+    ensure!(parity < 2, "alternating-row parity must be zero or one");
+    ensure!(row_elements > 0, "alternating-row width must be non-zero");
+    let row_bytes = row_elements
+        .checked_mul(segment.source_dtype.byte_size())
+        .context("alternating-row byte length overflow")?;
+    let row_bytes = usize::try_from(row_bytes).context("row byte length does not fit usize")?;
+    let chunk_size = aligned_chunk_size(buffer_size, row_bytes);
+    let mut source_bytes = 0_u64;
+    let mut output_bytes = 0_u64;
+    let mut row_index = 0_u64;
+    file.stream_tensor_chunks(&segment.source_name, chunk_size, |chunk| {
+        ensure!(
+            chunk.len() % row_bytes == 0,
+            "chunk for {} split a fused SwiGLU row",
+            segment.source_name
+        );
+        source_bytes += chunk.len() as u64;
+        for row in chunk.chunks_exact(row_bytes) {
+            if row_index % 2 == parity {
+                output_bytes +=
+                    convert_float_chunk(row, segment.source_dtype, segment.target_dtype, writer)?;
+            }
+            row_index += 1;
+        }
+        Ok(())
+    })?;
+    ensure!(
+        source_bytes == segment.source_byte_len,
+        "read {} bytes for {}, expected {}",
+        source_bytes,
+        segment.source_name,
+        segment.source_byte_len
+    );
+    ensure!(
+        output_bytes == segment.target_byte_len,
+        "deinterleaved {} bytes for {}, expected {}",
+        output_bytes,
+        segment.source_name,
+        segment.target_byte_len
     );
     Ok(output_bytes)
 }

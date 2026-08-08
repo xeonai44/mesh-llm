@@ -2,7 +2,9 @@ param(
     [string]$Backend = "",
     [string]$CudaArch = "",
     [string]$RocmArch = "",
-    [string]$BuildProfile = ""
+    [string]$BuildProfile = "",
+    [switch]$DynamicHost,
+    [switch]$HostOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,8 +60,39 @@ function Prepare-Llama {
         Invoke-NativeCommand "git" @("clean", "-fdx", "-e", "build/")
 
         $patches = Get-ChildItem -Path $patchDir -Filter "*.patch" | Sort-Object Name
-        foreach ($patch in $patches) {
-            Invoke-NativeCommand "git" @("am", "--3way", $patch.FullName)
+        $gitIdentityVariables = @(
+            "GIT_AUTHOR_DATE",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_NAME",
+            "GIT_COMMITTER_DATE",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_COMMITTER_NAME"
+        )
+        $savedGitIdentity = @{}
+        foreach ($variable in $gitIdentityVariables) {
+            if (Test-Path "Env:$variable") {
+                $savedGitIdentity[$variable] = (Get-Item "Env:$variable").Value
+            }
+            Remove-Item "Env:$variable" -ErrorAction SilentlyContinue
+        }
+        try {
+            foreach ($patch in $patches) {
+                Invoke-NativeCommand "git" @(
+                    "am",
+                    "--3way",
+                    "--committer-date-is-author-date",
+                    "--no-gpg-sign",
+                    "--no-verify",
+                    $patch.FullName
+                )
+            }
+        } finally {
+            foreach ($variable in $gitIdentityVariables) {
+                Remove-Item "Env:$variable" -ErrorAction SilentlyContinue
+            }
+            foreach ($entry in $savedGitIdentity.GetEnumerator()) {
+                Set-Item "Env:$($entry.Key)" $entry.Value
+            }
         }
 
         $patchedSha = (& git rev-parse HEAD).Trim()
@@ -1001,6 +1034,39 @@ if ((Test-Sccache) -and -not $env:RUSTC_WRAPPER) {
     Write-Host "Using sccache for Rust compilation: $env:RUSTC_WRAPPER"
 }
 
+if ($DynamicHost) {
+    Write-Host "-DynamicHost is retained as a compatibility switch; Windows hosts are always dynamic."
+}
+
+if ($HostOnly) {
+    Invoke-InRepo {
+        if ($env:MESH_LLM_SKIP_UI -ne "1" -and (Test-Path $meshUiDir) -and (Test-UiBuildRequired -UiDirectory $meshUiDir)) {
+            Write-Host "Building mesh-llm UI for the backend-neutral host..."
+            Push-Location $meshUiDir
+            try {
+                if (Test-PnpmInstallRequired -UiDirectory $meshUiDir) {
+                    Invoke-NativeCommand "pnpm" @("install", "--frozen-lockfile")
+                }
+                Invoke-NativeCommand "pnpm" @("run", "build")
+                Set-Content -Path (Join-Path (Join-Path $meshUiDir "dist") ".mesh-llm-ui-build-env") -Value (Get-UiBuildEnvStampContent)
+            } finally {
+                Pop-Location
+            }
+        }
+        Set-BuildVersionStamp
+        $hostArgs = @("build")
+        $hostOutputProfile = "debug"
+        if ($buildProfile -eq "release") {
+            $hostArgs += "--release"
+            $hostOutputProfile = "release"
+        }
+        $hostArgs += @("--locked", "-p", "mesh-llm", "--bin", "mesh-llm", "--no-default-features", "--features", "web-ui,dynamic-native-runtime")
+        Invoke-NativeCommand "cargo" $hostArgs
+        Write-Host "Mesh backend-neutral host: target\\$hostOutputProfile\\mesh-llm.exe"
+    }
+    return
+}
+
 switch ($backendName) {
     "cuda" {
         Ensure-CudaToolchain
@@ -1056,11 +1122,14 @@ Invoke-InRepo {
         "-DGGML_AVX2=ON",
         "-DGGML_AVX512=OFF",
         "-DGGML_BMI2=OFF",
-        "-DBUILD_SHARED_LIBS=OFF",
+        "-DBUILD_SHARED_LIBS=ON",
         "-DLLAMA_CURL=OFF",
         "-DLLAMA_BUILD_EXAMPLES=OFF",
         "-DLLAMA_BUILD_TESTS=OFF",
-        "-DGGML_BUILD_TESTS=OFF"
+        "-DGGML_BUILD_TESTS=OFF",
+        # mtmd video pulls in the ffmpeg subprocess path (sheredom/subprocess.h)
+        # that mesh-llm does not use; keep it off to match build-llama.sh.
+        "-DMTMD_VIDEO=OFF"
     )
 
     $rcPath = Resolve-CommandPath "rc"
@@ -1130,6 +1199,25 @@ Invoke-InRepo {
     Show-SccacheStats
     Assert-RequiredSccacheUsage $backendName $sccacheStats
 
+    $env:LLAMA_STAGE_BUILD_DIR = $buildDir
+    if ($CudaArch) {
+        $env:LLAMA_STAGE_CUDA_ARCHITECTURES = $CudaArch
+    }
+    if ($RocmArch) {
+        $env:LLAMA_STAGE_AMDGPU_TARGETS = $RocmArch
+    }
+    $profileDir = if ($buildProfile -eq "release") { "release" } else { "debug" }
+    # Invoke-InRepo makes this shell-relative path portable across Git Bash and
+    # WSL. Passing a native `D:\...` path to GNU tar makes it parse `D:` as a
+    # remote host and fail after the expensive ABI build has already completed.
+    $runtimeOut = "target/$profileDir/native-runtimes"
+    Invoke-NativeCommand "bash" @(
+        (Join-Path $scriptDir "package-native-runtime.sh"),
+        "--backend", $backendName,
+        "--target", "x86_64-pc-windows-msvc",
+        "--out", $runtimeOut
+    )
+
     if ($env:MESH_LLM_SKIP_UI -eq "1") {
         Write-Host "Skipping mesh-llm UI build because MESH_LLM_SKIP_UI=1."
     } elseif (Test-Path $meshUiDir) {
@@ -1152,11 +1240,7 @@ Invoke-InRepo {
 
     Write-Host "Building mesh-llm..."
     $env:LLAMA_STAGE_BUILD_DIR = $buildDir
-    $cargoFeatureArgs = @()
-    switch ($backendName) {
-        "cuda" { $cargoFeatureArgs = @("--features", "gpu-bench-cuda") }
-        "rocm" { $cargoFeatureArgs = @("--features", "gpu-bench-hip") }
-    }
+    $cargoFeatureArgs = @("--no-default-features", "--features", "web-ui,dynamic-native-runtime")
     Set-BuildVersionStamp
     switch ($buildProfile) {
         "dev" {

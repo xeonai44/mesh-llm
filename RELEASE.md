@@ -7,9 +7,15 @@ Releases are normally cut by running the **Release** workflow
 `workflow_dispatch` with the version input (for example `v0.31.0`). The
 dispatched workflow bumps versions, generates and patches the SwiftPM
 manifest, packages SDK console assets, creates and pushes the release tag,
-builds all platform bundles, and publishes the GitHub release. Dispatch inputs
+builds all platform bundles, and publishes the GitHub release. After a complete
+stable, non-canary release with the full GPU matrix succeeds, it dispatches
+`Mesh-LLM/mesh-packaging` to package the verified release archives, publish the
+native package release assets, publish the supported GHCR image matrix, and
+assemble and publish the Node SDK to npm. Prereleases publish their immutable
+GitHub Release inputs without invoking downstream publication. Dispatch inputs
 include `skip_gpu_bundles` and `canary` (dry-run: build and smoke everything
-without publishing).
+without publishing). Releases that intentionally skip GPU bundles do not
+dispatch the full packaging matrix.
 
 The sections below document the underlying steps. They matter when releasing
 manually via a tag push, debugging the workflow, or validating bundles
@@ -22,6 +28,11 @@ locally.
 - `cmake` and a native compiler installed
 - Node/npm installed for the UI build
 - `gh` CLI authenticated if publishing manually
+- `MESH_AGENT_IMAGES_DISPATCH_TOKEN` configured as a fine-grained repository
+  token or GitHub App token with Contents write access to
+  `Mesh-LLM/mesh-packaging`, which is the permission required to create a
+  repository dispatch event. The legacy secret name is retained so existing
+  release environments do not require a coordinated secret rename.
 
 ## Release Attestation Signing Keys
 
@@ -79,12 +90,15 @@ means a footer was present, but signature verification failed.
 just build
 ```
 
-`just build` prepares the pinned upstream `llama.cpp` checkout, applies the
-Mesh-LLM ABI patch queue from `third_party/llama.cpp/patches`, builds the
-patched static ABI libraries, builds the UI, and builds the `mesh-llm` binary.
+`just build` builds a backend-neutral dynamic host, the UI, and one adjacent
+locally packaged native runtime. It uses the same host/runtime boundary as a
+release product. Static llama.cpp compilation is confined to the runtime
+packaging primitive, never the host executable.
 
-The release bundle is now a single `mesh-llm` runtime binary. External
-`llama-server`, `rpc-server`, and `llama-moe-*` binaries are not packaged.
+The release build graph has three layers: one backend-neutral dynamic host per
+OS/architecture, one manifested native runtime per backend lane, and a composed
+product bundle. External `llama-server`, `rpc-server`, and `llama-moe-*`
+binaries are not packaged.
 
 ## Bundle
 
@@ -92,9 +106,11 @@ The release bundle is now a single `mesh-llm` runtime binary. External
 just bundle
 ```
 
-This creates `/tmp/mesh-llm-bundle.tar.gz` containing the packaged `mesh-llm`
-executable for local deployment. Platform release archives are named by target,
-such as `mesh-llm-aarch64-apple-darwin.tar.gz`.
+This creates `/tmp/mesh-llm-bundle.tar.gz` for local deployment. Platform
+release archives contain `mesh-llm`, `host-imports.json`,
+`product-manifest.json`, and exactly one
+`native-runtimes/<runtime-id>` directory. Backend-flavored archive names select
+different runtimes while retaining byte-identical host input for an OS/arch.
 
 Verify the packaged executable with `cargo run -p xtask -- release-attestation inspect --binary /tmp/test-bundle/mesh-llm --public-key-file /tmp/mesh-release-key.pub`.
 `valid` means the packaged binary matches a trusted release signer, `missing`
@@ -112,6 +128,14 @@ just release-build
 just release-bundle v0.X.Y
 ```
 
+For an explicit backend, build the neutral host and selected runtime through
+the compatibility recipes, then compose:
+
+```bash
+just release-build-cuda
+just release-bundle-cuda v0.X.Y
+```
+
 Before manually cutting a tag that should be consumable through SwiftPM,
 prepare the Swift binary target manifest on macOS and commit the resulting
 `Package.swift` change:
@@ -122,17 +146,41 @@ git add Package.swift sdk/swift/Sources/MeshLLM/Generated/mesh_ffi.swift
 git commit -m "v0.X.Y: prepare Swift package artifact"
 ```
 
-The release workflow rebuilds `MeshLLMFFI.xcframework.zip`, verifies the macOS
-framework layout, runs a zipped-artifact SwiftPM consumer smoke, and checks that
-the tagged `Package.swift` already points at the exact release URL and checksum.
-If `Package.swift` still contains placeholders on a tag push, or if the
-checksum does not match the artifact built in release CI, the release fails
-before publishing.
+The release workflow invokes the shared typed Swift SDK producer in exhaustive
+`full` mode to build `MeshLLMFFI.xcframework.zip`. That same producer is used
+in `host-only` mode for PR iteration and `full` mode on main. It verifies the
+exact platform and architecture slices plus the macOS framework layout, runs a
+zipped-artifact SwiftPM consumer smoke, and checks that the tagged
+`Package.swift` already points at the exact release URL and checksum. The
+producer also uploads the generated `mesh_ffi.swift` as a separate immutable
+companion artifact. Main and tag builds fail when that generated binding drifts
+from the tracked source. If `Package.swift` still contains placeholders on a
+tag push, if the generated binding is stale, or if the checksum does not match
+the artifact built in release CI, the release fails before publishing.
+Producer and smoke use the pinned `macos-15` image and an explicit native/Xcode
+cache epoch. Downstream Swift smoke consumes both verified producer artifacts
+and never compiles an XCFramework replacement.
+
+Native SDK release archives use the same typed `native-sdk-artifact.yml`
+producer as PR and main Kotlin validation. Callers select an explicit target,
+backend, Cargo profile, and bounded runner size; they cannot provide a runner
+label or Depot-cache permission. Each Linux release invocation first nests the
+shared `static-abi-artifact.yml` producer on the matching native architecture,
+then restores its checksummed/stamped CPU ABI into the normal native-SDK
+`--build` path so only the Rust FFI compilation remains. Both reusable
+producers derive architecture-specific hosted/Depot placement and cache
+authority from the protected workflow's repository/event/ref policy. Release
+enables native runtime crate staging on the same verified archive path. The
+producer keeps each
+`release-native-sdk-<platform>-<backend>` artifact flat with exactly one
+archive, its checksum sidecar, and its target-specific `.crate`, preserving the
+published asset names while Kotlin smoke remains a no-build consumer.
 
 For `workflow_dispatch` releases, the release workflow computes the SwiftPM
-checksum from the XCFramework artifact it just built, patches `Package.swift`
-in the workflow workspace, and creates the requested release tag at a
-manifest-only commit before publishing.
+checksum from the XCFramework artifact it just built, carries both the patched
+`Package.swift` and the producer's exact generated `mesh_ffi.swift` into the
+release workspace, and creates the requested release tag at that prepared
+source commit before publishing.
 
 The current GitHub Actions release workflow publishes macOS aarch64, Linux
 x86_64 CPU, Linux ARM64 CPU, Linux ARM64 CUDA, Linux CUDA, Linux CUDA
@@ -167,7 +215,13 @@ Verify:
 
 ## Publish
 
-Push a `v*` tag to run `.github/workflows/release.yml`.
+Push a `v*` tag to run `.github/workflows/release.yml`. The upstream release
+workflow owns release archive production, but it does not publish OCI images.
+`Mesh-LLM/mesh-packaging` is the canonical package, GHCR, and npm producer. It
+starts only after a stable GitHub release and its complete CPU/GPU archive set
+have published successfully. Prereleases never dispatch it. The upstream
+`docker.yml` workflow performs Dockerfile validation only and is not a
+distribution channel.
 
 On non-prerelease tags, the release workflow also publishes the Rust SDK crate
 chain to crates.io in dependency order:

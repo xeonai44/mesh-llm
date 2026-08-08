@@ -10,11 +10,14 @@ use skippy_runtime::{
     ActivationFrame, DecodeBatchRequest, DecodeFrameBatchOutput, DecodeFrameBatchRequest,
     FlashAttentionType as RuntimeFlashAttentionType, GenerationSignalWindow, MediaInput,
     MediaPrefill, MediaPrefillFrame, NativeMtpDraft, RuntimeConfig, RuntimeKvPage,
-    RuntimeKvPageDesc, RuntimeLoadMode, SamplingConfig, StageModel, StageSession,
-    StageSessionCheckpoint, TokenSignal, parse_cache_type,
+    RuntimeKvPageDesc, RuntimeLoadMode, SamplingConfig, StageModel, StageSession, TokenSignal,
+    parse_cache_type,
 };
 
 use crate::package::select_package_parts;
+
+mod frame_operations;
+mod lane_lifecycle;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeLaunchOverrides {
@@ -45,7 +48,6 @@ pub struct RuntimeState {
     sessions: BTreeMap<String, RuntimeLaneSession>,
     idle_sessions: Vec<RuntimeLaneSession>,
     session_token_counts: BTreeMap<String, u64>,
-    session_checkpoints: BTreeMap<String, StageSessionCheckpoint>,
     session_resident_prefixes: BTreeMap<String, ResidentLanePrefix>,
 }
 
@@ -72,7 +74,6 @@ pub struct RuntimeSessionStats {
     pub tracked_token_counts: usize,
     pub max_session_tokens: u64,
     pub total_session_tokens: u64,
-    pub checkpoints: usize,
     pub lanes: Vec<RuntimeSessionLaneStats>,
 }
 
@@ -117,1035 +118,28 @@ struct ResidentLanePrefix {
 }
 
 impl RuntimeState {
-    pub fn prefill(&mut self, session_id: &str, token_ids: &[i32]) -> Result<()> {
-        let session = self.session(session_id)?;
-        session.prefill_chunked(token_ids)?;
-        self.add_session_tokens(session_id, token_ids.len() as u64);
-        Ok(())
-    }
-
-    pub fn media_marker(&self) -> String {
-        self.model.media_marker()
-    }
-
-    pub fn has_media_projector(&self) -> bool {
-        self.model.has_media_projector()
-    }
-
-    pub fn prefill_media(
-        &mut self,
-        session_id: &str,
-        prompt: &str,
-        media: &[MediaInput],
-        sampling: Option<&SamplingConfig>,
-    ) -> Result<MediaPrefill> {
-        let model = &self.model as *const StageModel;
-        let session = self.session(session_id)?;
-        // `session()` mutably borrows the session map, while the projector lives
-        // on the same RuntimeState. RuntimeState serializes access behind one
-        // outer mutex, so this split borrow only aliases immutable model state.
-        let prefill = unsafe { (&*model).prefill_media(session, prompt, media, sampling) }?;
-        self.session_token_counts
-            .insert(session_id.to_string(), prefill.position);
-        Ok(prefill)
-    }
-
-    pub fn prefill_media_frame(
-        &mut self,
-        session_id: &str,
-        prompt: &str,
-        media: &[MediaInput],
-    ) -> Result<MediaPrefillFrame> {
-        let model = &self.model as *const StageModel;
-        let session = self.session(session_id)?;
-        // `session()` mutably borrows the session map, while the projector lives
-        // on the same RuntimeState. RuntimeState serializes access behind one
-        // outer mutex, so this split borrow only aliases immutable model state.
-        let prefill = unsafe { (&*model).prefill_media_frame(session, prompt, media) }?;
-        self.session_token_counts
-            .insert(session_id.to_string(), prefill.position);
-        Ok(prefill)
-    }
-
-    pub fn decode(&mut self, session_id: &str, token_id: i32) -> Result<i32> {
-        self.decode_sampled(session_id, token_id, None)
-    }
-
-    pub fn decode_sampled(
-        &mut self,
-        session_id: &str,
-        token_id: i32,
-        sampling: Option<&SamplingConfig>,
-    ) -> Result<i32> {
-        let session = self.session(session_id)?;
-        let token = session.decode_step_sampled(token_id, sampling)?;
-        self.add_session_tokens(session_id, 1);
-        Ok(token)
-    }
-
-    pub fn decode_batch_sampled(
-        &mut self,
-        requests: &[RuntimeDecodeBatchRequest<'_>],
-    ) -> Result<Vec<i32>> {
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        Self::ensure_unique_batch_sessions(requests)?;
-        for request in requests {
-            self.session(request.session_id)?;
-        }
-
-        let mut lane_sessions = Vec::with_capacity(requests.len());
-        for request in requests {
-            let lane_session = self.sessions.remove(request.session_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "session {} was not active after admission",
-                    request.session_id
-                )
-            })?;
-            lane_sessions.push((request.session_id.to_string(), lane_session));
-        }
-
-        let result = {
-            let mut decode_requests = lane_sessions
-                .iter_mut()
-                .zip(requests.iter())
-                .map(|((_, lane_session), request)| DecodeBatchRequest {
-                    session: &mut lane_session.session,
-                    token_id: request.token_id,
-                    sampling: request.sampling,
-                })
-                .collect::<Vec<_>>();
-            StageSession::decode_batch_sampled(&mut decode_requests)
-        };
-
-        for (session_id, lane_session) in lane_sessions {
-            self.sessions.insert(session_id, lane_session);
-        }
-        if result.is_ok() {
-            for request in requests {
-                self.add_session_tokens(request.session_id, 1);
-            }
-        }
-        result
-    }
-
-    pub fn session_batch_size(&mut self, session_id: &str) -> Result<usize> {
-        self.active_session(session_id)?.batch_size()
-    }
-
-    pub fn ensure_session_active(&mut self, session_id: &str) -> Result<()> {
-        self.session(session_id).map(|_| ())
-    }
-
-    pub fn configure_chat_sampling(
-        &mut self,
-        session_id: &str,
-        metadata_json: &str,
-        prompt_token_count: u64,
-        sampling: Option<&SamplingConfig>,
-    ) -> Result<()> {
-        self.session(session_id)?.configure_chat_sampling(
-            metadata_json,
-            prompt_token_count,
-            sampling,
-        )
-    }
-
-    pub fn last_token_signal(&mut self, session_id: &str) -> Result<TokenSignal> {
-        self.session(session_id)?.last_token_signal()
-    }
-
-    pub fn signal_window(
-        &mut self,
-        session_id: &str,
-        window_tokens: u32,
-    ) -> Result<GenerationSignalWindow> {
-        self.session(session_id)?.signal_window(window_tokens)
-    }
-
-    pub fn prefill_frame(
-        &mut self,
-        session_id: &str,
-        token_ids: &[i32],
-        input: Option<&ActivationFrame>,
-    ) -> Result<ActivationFrame> {
-        self.prefill_frame_with_positions(session_id, token_ids, &[], input)
-    }
-
-    pub fn prefill_frame_with_positions(
-        &mut self,
-        session_id: &str,
-        token_ids: &[i32],
-        positions: &[i32],
-        input: Option<&ActivationFrame>,
-    ) -> Result<ActivationFrame> {
-        let session = self.session(session_id)?;
-        let frame = session.prefill_chunk_frame_with_positions(token_ids, positions, input, 0)?;
-        self.add_session_tokens(session_id, token_ids.len() as u64);
-        Ok(frame)
-    }
-
-    pub fn prefill_final_frame_sampled(
-        &mut self,
-        session_id: &str,
-        token_ids: &[i32],
-        positions: &[i32],
-        sampling: Option<&SamplingConfig>,
-        input: Option<&ActivationFrame>,
-    ) -> Result<(i32, ActivationFrame)> {
-        let session = self.session(session_id)?;
-        let (predicted, frame) = session
-            .prefill_chunk_frame_sampled_with_positions(token_ids, positions, sampling, input, 0)?;
-        self.add_session_tokens(session_id, token_ids.len() as u64);
-        Ok((predicted, frame))
-    }
-
-    #[allow(dead_code)]
-    pub fn decode_frame(
-        &mut self,
-        session_id: &str,
-        token_id: i32,
-        input: Option<&ActivationFrame>,
-    ) -> Result<(i32, ActivationFrame)> {
-        self.decode_frame_sampled(session_id, token_id, None, input, 0)
-    }
-
-    pub fn decode_frame_sampled(
-        &mut self,
-        session_id: &str,
-        token_id: i32,
-        sampling: Option<&SamplingConfig>,
-        input: Option<&ActivationFrame>,
-        output_capacity: usize,
-    ) -> Result<(i32, ActivationFrame)> {
-        let session = self.session(session_id)?;
-        let output =
-            session.decode_step_frame_sampled(token_id, sampling, input, output_capacity)?;
-        self.add_session_tokens(session_id, 1);
-        Ok(output)
-    }
-
-    pub fn decode_frame_sampled_mtp(
-        &mut self,
-        session_id: &str,
-        token_id: i32,
-        sampling: Option<&SamplingConfig>,
-        input: Option<&ActivationFrame>,
-        output_capacity: usize,
-        max_draft_tokens: usize,
-    ) -> Result<(i32, Option<NativeMtpDraft>, ActivationFrame)> {
-        let session = self.session(session_id)?;
-        let output = session.decode_step_frame_sampled_mtp(
-            token_id,
-            sampling,
-            input,
-            output_capacity,
-            max_draft_tokens,
-        )?;
-        self.add_session_tokens(session_id, 1);
-        Ok(output)
-    }
-
-    pub fn decode_sampled_mtp(
-        &mut self,
-        session_id: &str,
-        token_id: i32,
-        sampling: Option<&SamplingConfig>,
-        max_draft_tokens: usize,
-    ) -> Result<(i32, Option<NativeMtpDraft>)> {
-        let session = self.session(session_id)?;
-        let output = session.decode_step_sampled_mtp(token_id, sampling, max_draft_tokens)?;
-        self.add_session_tokens(session_id, 1);
-        Ok(output)
-    }
-
-    pub fn decode_frame_batch_sampled(
-        &mut self,
-        requests: &[RuntimeDecodeFrameBatchRequest<'_>],
-    ) -> Result<Vec<DecodeFrameBatchOutput>> {
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        Self::ensure_unique_frame_batch_sessions(requests)?;
-        for request in requests {
-            self.session(request.session_id)?;
-        }
-
-        let mut lane_sessions = Vec::with_capacity(requests.len());
-        for request in requests {
-            let lane_session = self.sessions.remove(request.session_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "session {} was not active after admission",
-                    request.session_id
-                )
-            })?;
-            lane_sessions.push((request.session_id.to_string(), lane_session));
-        }
-
-        let result = {
-            let mut decode_requests = lane_sessions
-                .iter_mut()
-                .zip(requests.iter())
-                .map(|((_, lane_session), request)| DecodeFrameBatchRequest {
-                    session: &mut lane_session.session,
-                    token_id: request.token_id,
-                    sampling: request.sampling,
-                    input: request.input,
-                })
-                .collect::<Vec<_>>();
-            StageSession::decode_step_frame_batch_sampled(&mut decode_requests)
-        };
-
-        for (session_id, lane_session) in lane_sessions {
-            self.sessions.insert(session_id, lane_session);
-        }
-        if result.is_ok() {
-            for request in requests {
-                self.add_session_tokens(request.session_id, 1);
-            }
-        }
-        result
-    }
-
-    pub fn verify_frame(
-        &mut self,
-        session_id: &str,
-        token_ids: &[i32],
-        input: Option<&ActivationFrame>,
-        output_capacity: usize,
-    ) -> Result<(Vec<i32>, ActivationFrame)> {
-        self.verify_frame_sampled(session_id, token_ids, None, input, output_capacity)
-    }
-
-    pub fn verify_frame_sampled(
-        &mut self,
-        session_id: &str,
-        token_ids: &[i32],
-        sampling: Option<&SamplingConfig>,
-        input: Option<&ActivationFrame>,
-        output_capacity: usize,
-    ) -> Result<(Vec<i32>, ActivationFrame)> {
-        let session = self.session(session_id)?;
-        let output =
-            session.verify_tokens_frame_sampled(token_ids, sampling, input, output_capacity)?;
-        self.add_session_tokens(session_id, token_ids.len() as u64);
-        Ok(output)
-    }
-
-    pub fn verify_frame_sampled_serial(
-        &mut self,
-        session_id: &str,
-        token_ids: &[i32],
-        sampling: Option<&SamplingConfig>,
-        input: Option<&ActivationFrame>,
-        output_capacity: usize,
-    ) -> Result<(Vec<i32>, ActivationFrame)> {
-        if token_ids.is_empty() {
-            bail!("serial verify_frame requires at least one token");
-        }
-        let input_frames = split_activation_frame(input, token_ids.len())?;
-        let mut predicted_tokens = Vec::with_capacity(token_ids.len() + 2);
-        let mut output_frames = Vec::with_capacity(token_ids.len());
-        let mut last_draft = None;
-        for (index, token_id) in token_ids.iter().copied().enumerate() {
-            let input_frame = input_frames.as_ref().map(|frames| &frames[index]);
-            let (predicted, native_mtp, output) = self.decode_frame_sampled_mtp(
-                session_id,
-                token_id,
-                sampling,
-                input_frame,
-                output_capacity,
-                1,
-            )?;
-            if predicted >= 0 {
-                predicted_tokens.push(predicted);
-            }
-            last_draft = native_mtp;
-            output_frames.push(output);
-        }
-        if let Some(draft) = last_draft {
-            predicted_tokens.push(i32::try_from(draft.token_ids.len()).unwrap_or(i32::MAX));
-            predicted_tokens.extend(draft.token_ids);
-            predicted_tokens
-                .push(i32::try_from(draft.proposal_compute_us.max(0)).unwrap_or(i32::MAX));
-        }
-        Ok((predicted_tokens, combine_activation_frames(&output_frames)?))
-    }
-
-    pub fn checkpoint_session(&mut self, session_id: &str) -> Result<()> {
-        let checkpoint = self.session(session_id)?.checkpoint()?;
-        self.session_checkpoints
-            .insert(session_id.to_string(), checkpoint);
-        Ok(())
-    }
-
-    pub fn restore_session(&mut self, session_id: &str) -> Result<()> {
-        let checkpoint = self
-            .session_checkpoints
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing checkpoint for session {session_id}"))?;
-        let token_count = {
-            let session = self.session(session_id)?;
-            session.restore_checkpoint(&checkpoint)?;
-            session.token_count()
-        };
-        self.session_token_counts
-            .insert(session_id.to_string(), token_count);
-        Ok(())
-    }
-
-    pub fn trim_session(&mut self, session_id: &str, token_count: u64) -> Result<()> {
-        let session = self.session(session_id)?;
-        session.trim_session(token_count)?;
-        self.session_token_counts
-            .insert(session_id.to_string(), token_count);
-        Ok(())
-    }
-
-    pub fn align_session_to_token_count_if_ahead(
-        &mut self,
-        session_id: &str,
-        token_count: u64,
-    ) -> Result<Option<RuntimeSessionAlignStats>> {
-        let Some(current) = self.session_token_counts.get(session_id).copied() else {
-            return Ok(None);
-        };
-        if current <= token_count {
-            return Ok(None);
-        }
-        self.trim_session(session_id, token_count)?;
-        Ok(Some(RuntimeSessionAlignStats {
-            before_token_count: current,
-            after_token_count: token_count,
-        }))
-    }
-
-    fn session(&mut self, session_id: &str) -> Result<&mut StageSession> {
-        if !self.sessions.contains_key(session_id) {
-            let lane_session = self.take_idle_session().map(Ok).unwrap_or_else(|| {
-                if self.sessions.len() >= self.lane_count as usize {
-                    bail!("all execution lanes are busy");
-                }
-                self.create_lane_session()
-            })?;
-            self.sessions.insert(session_id.to_string(), lane_session);
-        }
-        Ok(&mut self
-            .sessions
-            .get_mut(session_id)
-            .expect("session inserted above")
-            .session)
-    }
-
-    fn ensure_unique_batch_sessions(requests: &[RuntimeDecodeBatchRequest<'_>]) -> Result<()> {
-        let mut seen = BTreeSet::new();
-        for request in requests {
-            if !seen.insert(request.session_id) {
-                bail!("duplicate session {} in decode batch", request.session_id);
-            }
-        }
-        Ok(())
-    }
-
-    fn ensure_unique_frame_batch_sessions(
-        requests: &[RuntimeDecodeFrameBatchRequest<'_>],
-    ) -> Result<()> {
-        let mut seen = BTreeSet::new();
-        for request in requests {
-            if !seen.insert(request.session_id) {
-                bail!(
-                    "duplicate session {} in decode frame batch",
-                    request.session_id
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn active_session(&mut self, session_id: &str) -> Result<&mut StageSession> {
-        self.sessions
-            .get_mut(session_id)
-            .map(|lane_session| &mut lane_session.session)
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} is not active"))
-    }
-
-    pub fn prewarm_idle_sessions(
-        &mut self,
-        target_idle_sessions: usize,
-    ) -> Result<RuntimeSessionStats> {
-        while self.idle_sessions.len() < target_idle_sessions {
-            if self.sessions.len() + self.idle_sessions.len() >= self.lane_count as usize {
-                break;
-            }
-            let lane_session = self.create_lane_session()?;
-            self.idle_sessions.push(lane_session);
-        }
-        Ok(self.session_stats())
-    }
-
-    /// Release the session slot identified by `session_id`.
+    /// A runtime with no model behind it, for tests that exercise code paths
+    /// which never touch the model.
     ///
-    /// This is the cleanup path called at the end of every chat
-    /// completion (success, cancellation, or backend error). It must
-    /// leave [`Self`] in a self-consistent state regardless of whether
-    /// the underlying StageSession can be reset cleanly:
-    ///
-    ///  - The lane is either returned to `idle_sessions` (reset OK) or
-    ///    dropped entirely (reset failed). Dropping the lane triggers
-    ///    `StageSession::drop`, which calls `skippy_session_free` on
-    ///    the C side — the authoritative path for releasing native KV
-    ///    cells held by that sequence id.
-    ///  - `session_token_counts`, `session_checkpoints`, and
-    ///    `session_resident_prefixes` for `session_id` are always
-    ///    removed.
-    ///  - The function always returns `Ok` so per-request cleanup at
-    ///    callsites never propagates a reset failure as a request
-    ///    error. The outcome is reported via [`RuntimeSessionDropStats`]
-    ///    fields (`lane_discarded`, `lane_discard_reason`) for
-    ///    telemetry.
-    ///
-    /// Previously a reset error propagated `?` through this function,
-    /// which left `session_token_counts` and `session_checkpoints`
-    /// holding stale entries and dropped the lane on the floor without
-    /// any record. That accumulated bookkeeping drift over time and
-    /// could leave the native KV cache reporting "all slots in use"
-    /// long after the owning sessions were gone, producing
-    /// `failed to find a memory slot` errors on subsequent admissions.
-    pub fn drop_session_timed(&mut self, session_id: &str) -> Result<RuntimeSessionDropStats> {
-        let reset_started = Instant::now();
-        let mut reset_session = false;
-        let preserved_resident_prefix = false;
-        let mut lane_discarded = false;
-        let mut lane_discard_reason: Option<String> = None;
-
-        if let Some(mut lane_session) = self.sessions.remove(session_id) {
-            let lane_index = lane_session.index;
-            // Always release the lane's native KV cells back to the
-            // unified pool. The trim+preserve path kept the lane's cells
-            // pinned to a specific (`page_id`, `token_count`) pair so a
-            // future request whose content prefix hashed to the *exact*
-            // same `page_id` AND same `token_count` could acquire the
-            // warm lane via `acquire_resident_prefix_lane`. Real chat /
-            // agent workloads vary the conversation tail every turn, so
-            // both the hash and the length change request-to-request and
-            // that exact-match acquisition almost never fires. Meanwhile
-            // the pinned cells remain claimed in the unified pool, in
-            // parallel with the cells the cache layer itself pins, and
-            // the pool runs out of contiguous space — producing
-            // `decode: failed to find a memory slot` under repeated
-            // tool-using agent traffic (#652). Cross-request prefix
-            // reuse is still done by the cache layer (by `page_id`); we
-            // just stop double-claiming cells on the lane side.
-            self.session_resident_prefixes.remove(session_id);
-            reset_session = true;
-            match lane_session.session.reset() {
-                Ok(()) => {
-                    lane_session.resident_prefix = None;
-                    self.idle_sessions.push(lane_session);
-                }
-                Err(reset_err) => {
-                    lane_discarded = true;
-                    let reason = format!("reset() failed ({reset_err:#})");
-                    eprintln!(
-                        "skippy::runtime_state: drop_session_timed: discarding lane {lane_index} for session {session_id}: {reason}"
-                    );
-                    lane_discard_reason = Some(reason);
-                    drop(lane_session);
-                    self.free_lane_indices.push(lane_index);
-                }
-            }
-        }
-
-        // Always clear per-session bookkeeping. The previous version
-        // skipped these when reset returned Err, which leaked entries.
-        //
-        // session_resident_prefixes is also cleared here defensively:
-        // it's already removed above on the active-session path, but
-        // calling drop_session_timed for an id that's no longer in
-        // `sessions` (idempotent cleanup, stale callers) must still
-        // clear any stray resident-prefix entry under that id.
-        self.session_token_counts.remove(session_id);
-        self.session_checkpoints.remove(session_id);
-        self.session_resident_prefixes.remove(session_id);
-
-        Ok(RuntimeSessionDropStats {
-            reset_session,
-            reset_ms: reset_started.elapsed().as_secs_f64() * 1000.0,
-            preserved_resident_prefix,
-            lane_discarded,
-            lane_discard_reason,
-            stats_after: self.session_stats(),
-        })
-    }
-
-    pub fn session_stats(&self) -> RuntimeSessionStats {
-        let mut max_session_tokens = 0u64;
-        let mut total_session_tokens = 0u64;
-        let mut lanes = (0..self.lane_count as usize)
-            .map(|index| RuntimeSessionLaneStats {
-                index,
-                active: false,
-                session_id: None,
-                token_count: None,
-            })
-            .collect::<Vec<_>>();
-
-        for (session_id, lane_session) in &self.sessions {
-            if let Some(token_count) = self.session_token_counts.get(session_id).copied() {
-                max_session_tokens = max_session_tokens.max(token_count);
-                total_session_tokens = total_session_tokens.saturating_add(token_count);
-            }
-            if let Some(lane) = lanes.get_mut(lane_session.index) {
-                lane.active = true;
-                lane.session_id = Some(session_id.clone());
-                lane.token_count = self.session_token_counts.get(session_id).copied();
-            }
-        }
-
-        RuntimeSessionStats {
-            lane_count: self.lane_count as usize,
-            active_sessions: self.sessions.len(),
-            idle_sessions: self.idle_sessions.len(),
-            idle_resident_prefixes: self
-                .idle_sessions
-                .iter()
-                .filter(|idle| idle.resident_prefix.is_some())
-                .count(),
-            tracked_token_counts: self.session_token_counts.len(),
-            max_session_tokens,
-            total_session_tokens,
-            checkpoints: self.session_checkpoints.len(),
-            lanes,
+    /// [`Self::session_stats`] is pure Rust over the lane bookkeeping below, so
+    /// status/observability behaviour can be tested without loading a GGUF.
+    /// Any call that reaches [`Self::model`] will dereference a null handle, so
+    /// this must not be used to drive inference.
+    #[cfg(test)]
+    pub(crate) fn new_modelless_for_test(lane_count: u32) -> Self {
+        Self {
+            model: StageModel::new_dummy(),
+            layer_start: 0,
+            layer_end: 1,
+            lane_count,
+            next_lane_index: 0,
+            free_lane_indices: Vec::new(),
+            sessions: BTreeMap::new(),
+            idle_sessions: Vec::new(),
+            session_token_counts: BTreeMap::new(),
+            session_resident_prefixes: BTreeMap::new(),
         }
     }
-
-    fn take_idle_session(&mut self) -> Option<RuntimeLaneSession> {
-        if let Some(index) = self
-            .idle_sessions
-            .iter()
-            .position(|idle| idle.resident_prefix.is_none())
-        {
-            return Some(self.idle_sessions.swap_remove(index));
-        }
-        self.idle_sessions.pop()
-    }
-
-    pub fn retain_resident_prefix_on_drop(
-        &mut self,
-        session_id: &str,
-        page_id: String,
-        token_count: u64,
-    ) -> Result<()> {
-        if !self.sessions.contains_key(session_id) {
-            bail!("session {session_id} does not exist");
-        }
-        if self
-            .session_resident_prefixes
-            .get(session_id)
-            .is_some_and(|current| current.token_count >= token_count)
-        {
-            return Ok(());
-        }
-        self.session_resident_prefixes.insert(
-            session_id.to_string(),
-            ResidentLanePrefix {
-                page_id,
-                token_count,
-            },
-        );
-        Ok(())
-    }
-
-    pub fn acquire_resident_prefix_lane(
-        &mut self,
-        session_id: &str,
-        page_id: &str,
-        token_count: u64,
-    ) -> Result<bool> {
-        if self.sessions.contains_key(session_id) {
-            bail!("session {session_id} already exists");
-        }
-        let Some(index) = self.idle_sessions.iter().position(|idle| {
-            idle.resident_prefix.as_ref().is_some_and(|prefix| {
-                prefix.page_id == page_id && prefix.token_count == token_count
-            })
-        }) else {
-            return Ok(false);
-        };
-        let mut idle = self.idle_sessions.swap_remove(index);
-        idle.resident_prefix = None;
-        self.sessions.insert(session_id.to_string(), idle);
-        self.session_token_counts
-            .insert(session_id.to_string(), token_count);
-        self.session_resident_prefixes.insert(
-            session_id.to_string(),
-            ResidentLanePrefix {
-                page_id: page_id.to_string(),
-                token_count,
-            },
-        );
-        Ok(true)
-    }
-
-    pub fn has_session_range(&self, session_id: &str, token_start: u64, token_count: u64) -> bool {
-        let Some(token_end) = token_start.checked_add(token_count) else {
-            return false;
-        };
-        self.session_token_counts
-            .get(session_id)
-            .copied()
-            .is_some_and(|known_tokens| token_end <= known_tokens)
-    }
-
-    #[allow(dead_code)]
-    pub fn export_kv_page(
-        &mut self,
-        session_id: &str,
-        token_start: u64,
-        token_count: u64,
-    ) -> Result<RuntimeKvPage> {
-        self.validate_export_range(session_id, token_start, token_count)?;
-        let layer_start = i32::try_from(self.model_layer_start())?;
-        let layer_end = i32::try_from(self.model_layer_end())?;
-        let session = self.session(session_id)?;
-        session.export_kv_page(layer_start, layer_end, token_start, token_count)
-    }
-
-    #[allow(dead_code)]
-    pub fn probe_kv_page(
-        &mut self,
-        session_id: &str,
-        token_start: u64,
-        token_count: u64,
-    ) -> Result<RuntimeKvPageDesc> {
-        self.validate_export_range(session_id, token_start, token_count)?;
-        let layer_start = i32::try_from(self.model_layer_start())?;
-        let layer_end = i32::try_from(self.model_layer_end())?;
-        let session = self.session(session_id)?;
-        let page = session.export_kv_page(layer_start, layer_end, token_start, token_count)?;
-        Ok(page.desc)
-    }
-
-    pub fn import_kv_page(
-        &mut self,
-        session_id: &str,
-        desc: &RuntimeKvPageDesc,
-        bytes: &[u8],
-    ) -> Result<()> {
-        let session = self.session(session_id)?;
-        session.import_kv_page(desc, bytes)?;
-        let token_end = desc
-            .token_start
-            .checked_add(desc.token_count)
-            .ok_or_else(|| anyhow::anyhow!("KV page token range overflows"))?;
-        self.session_token_counts
-            .entry(session_id.to_string())
-            .and_modify(|current| *current = (*current).max(token_end))
-            .or_insert(token_end);
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn export_state(&mut self, session_id: &str) -> Result<Vec<u8>> {
-        let layer_start = i32::try_from(self.model_layer_start())?;
-        let layer_end = i32::try_from(self.model_layer_end())?;
-        let session = self.session(session_id)?;
-        session.export_state(layer_start, layer_end)
-    }
-
-    pub fn import_state(&mut self, session_id: &str, bytes: &[u8]) -> Result<()> {
-        let layer_start = i32::try_from(self.model_layer_start())?;
-        let layer_end = i32::try_from(self.model_layer_end())?;
-        let session = self.session(session_id)?;
-        session.import_state(layer_start, layer_end, bytes)
-    }
-
-    pub fn import_state_for_token_count(
-        &mut self,
-        session_id: &str,
-        bytes: &[u8],
-        token_count: u64,
-    ) -> Result<()> {
-        let layer_start = i32::try_from(self.model_layer_start())?;
-        let layer_end = i32::try_from(self.model_layer_end())?;
-        let session = self.session(session_id)?;
-        session.import_state_for_token_count(layer_start, layer_end, bytes, token_count)?;
-        self.session_token_counts
-            .entry(session_id.to_string())
-            .and_modify(|current| *current = (*current).max(token_count))
-            .or_insert(token_count);
-        Ok(())
-    }
-
-    pub fn export_full_state(&mut self, session_id: &str) -> Result<Vec<u8>> {
-        let layer_start = i32::try_from(self.model_layer_start())?;
-        let layer_end = i32::try_from(self.model_layer_end())?;
-        let session = self.session(session_id)?;
-        session.export_full_state(layer_start, layer_end)
-    }
-
-    pub fn import_full_state(&mut self, session_id: &str, bytes: &[u8]) -> Result<()> {
-        let layer_start = i32::try_from(self.model_layer_start())?;
-        let layer_end = i32::try_from(self.model_layer_end())?;
-        let session = self.session(session_id)?;
-        session.import_full_state(layer_start, layer_end, bytes)
-    }
-
-    pub fn import_full_state_for_token_count(
-        &mut self,
-        session_id: &str,
-        bytes: &[u8],
-        token_count: u64,
-    ) -> Result<()> {
-        let layer_start = i32::try_from(self.model_layer_start())?;
-        let layer_end = i32::try_from(self.model_layer_end())?;
-        let session = self.session(session_id)?;
-        session.import_full_state_for_token_count(layer_start, layer_end, bytes, token_count)?;
-        self.session_token_counts
-            .entry(session_id.to_string())
-            .and_modify(|current| *current = (*current).max(token_count))
-            .or_insert(token_count);
-        Ok(())
-    }
-
-    pub fn export_recurrent_state(&mut self, session_id: &str) -> Result<Vec<u8>> {
-        self.session(session_id)?.export_recurrent_state()
-    }
-
-    pub fn import_recurrent_state_for_token_count(
-        &mut self,
-        session_id: &str,
-        bytes: &[u8],
-        token_count: u64,
-    ) -> Result<()> {
-        self.session(session_id)?
-            .import_recurrent_state_for_token_count(bytes, token_count)?;
-        self.session_token_counts
-            .entry(session_id.to_string())
-            .and_modify(|current| *current = (*current).max(token_count))
-            .or_insert(token_count);
-        Ok(())
-    }
-
-    pub fn save_resident_prefix(
-        &mut self,
-        session_id: &str,
-        cache_seq_id: i32,
-        token_count: u64,
-    ) -> Result<()> {
-        self.session(session_id)?
-            .save_prefix(cache_seq_id, token_count)
-    }
-
-    pub fn restore_resident_prefix(
-        &mut self,
-        session_id: &str,
-        cache_seq_id: i32,
-        token_ids: &[i32],
-    ) -> Result<()> {
-        let session = self.session(session_id)?;
-        session.restore_prefix(cache_seq_id, token_ids)?;
-        self.session_token_counts
-            .insert(session_id.to_string(), token_ids.len() as u64);
-        Ok(())
-    }
-
-    pub fn borrow_resident_prefix_session(
-        &mut self,
-        session_id: &str,
-        cache_seq_id: i32,
-        token_ids: &[i32],
-    ) -> Result<()> {
-        if self.sessions.contains_key(session_id) {
-            bail!("session {session_id} already exists");
-        }
-        let model = &self.model;
-        let (index, session) = create_indexed_lane_resource(
-            &mut self.next_lane_index,
-            &mut self.free_lane_indices,
-            self.lane_count,
-            || model.create_session_from_resident_prefix(cache_seq_id, token_ids),
-        )?;
-        let lane_session = RuntimeLaneSession {
-            index,
-            session,
-            resident_prefix: None,
-        };
-        self.sessions.insert(session_id.to_string(), lane_session);
-        self.session_token_counts
-            .insert(session_id.to_string(), token_ids.len() as u64);
-        Ok(())
-    }
-
-    pub fn drop_resident_prefix_sequence(
-        &mut self,
-        session_id: &str,
-        cache_seq_id: i32,
-    ) -> Result<()> {
-        self.active_session(session_id)?.drop_sequence(cache_seq_id)
-    }
-
-    fn add_session_tokens(&mut self, session_id: &str, count: u64) {
-        self.session_token_counts
-            .entry(session_id.to_string())
-            .and_modify(|current| *current = current.saturating_add(count))
-            .or_insert(count);
-    }
-
-    fn validate_export_range(
-        &self,
-        session_id: &str,
-        token_start: u64,
-        token_count: u64,
-    ) -> Result<()> {
-        let token_end = token_start
-            .checked_add(token_count)
-            .ok_or_else(|| anyhow::anyhow!("KV page token range overflows"))?;
-        let known_tokens = self
-            .session_token_counts
-            .get(session_id)
-            .copied()
-            .unwrap_or_default();
-        if token_end > known_tokens {
-            bail!(
-                "cannot export KV page [{token_start}, {token_end}) from session with {known_tokens} known tokens"
-            );
-        }
-        Ok(())
-    }
-
-    fn model_layer_start(&self) -> u32 {
-        self.layer_start
-    }
-
-    fn model_layer_end(&self) -> u32 {
-        self.layer_end
-    }
-
-    fn create_lane_session(&mut self) -> Result<RuntimeLaneSession> {
-        let model = &self.model;
-        let (index, session) = create_indexed_lane_resource(
-            &mut self.next_lane_index,
-            &mut self.free_lane_indices,
-            self.lane_count,
-            || model.create_session(),
-        )?;
-        Ok(RuntimeLaneSession {
-            index,
-            session,
-            resident_prefix: None,
-        })
-    }
-}
-
-fn split_activation_frame(
-    input: Option<&ActivationFrame>,
-    token_count: usize,
-) -> Result<Option<Vec<ActivationFrame>>> {
-    let Some(input) = input else {
-        return Ok(None);
-    };
-    if token_count == 0 {
-        bail!("cannot split activation frame for zero tokens");
-    }
-    if input.desc.token_count as usize != token_count {
-        bail!(
-            "activation token count mismatch: frame={} tokens={}",
-            input.desc.token_count,
-            token_count
-        );
-    }
-    if input.payload.len() % token_count != 0 {
-        bail!(
-            "activation payload is not divisible by token count: payload={} tokens={}",
-            input.payload.len(),
-            token_count
-        );
-    }
-    let row_bytes = input.payload.len() / token_count;
-    let frames = input
-        .payload
-        .chunks(row_bytes)
-        .map(|row| {
-            let mut desc = input.desc;
-            desc.token_count = 1;
-            desc.sequence_count = 1;
-            desc.payload_bytes = row.len() as u64;
-            ActivationFrame {
-                desc,
-                payload: row.to_vec(),
-            }
-        })
-        .collect();
-    Ok(Some(frames))
-}
-
-fn combine_activation_frames(frames: &[ActivationFrame]) -> Result<ActivationFrame> {
-    let Some(first) = frames.first() else {
-        bail!("cannot combine empty activation frames");
-    };
-    let mut desc = first.desc;
-    let mut payload = Vec::new();
-    let mut token_count = 0u32;
-    for frame in frames {
-        if frame.desc.dtype != desc.dtype
-            || frame.desc.layout != desc.layout
-            || frame.desc.producer_stage_index != desc.producer_stage_index
-            || frame.desc.layer_start != desc.layer_start
-            || frame.desc.layer_end != desc.layer_end
-            || frame.desc.sequence_count != desc.sequence_count
-            || frame.desc.flags != desc.flags
-        {
-            bail!("cannot combine incompatible activation frames");
-        }
-        token_count = token_count
-            .checked_add(frame.desc.token_count)
-            .context("combined activation token count overflow")?;
-        payload.extend_from_slice(&frame.payload);
-    }
-    desc.token_count = token_count;
-    desc.payload_bytes = payload.len() as u64;
-    Ok(ActivationFrame { desc, payload })
-}
-
-/// Allocate the next lane slot.
-///
-/// Prefers indices in `free_lane_indices` (lanes previously discarded
-/// via [`RuntimeState::drop_session_timed`]) so they can be reused
-/// without growing `next_lane_index` past `lane_count`. If the free
-/// list is empty, falls through to bumping `next_lane_index`. If both
-/// are exhausted, returns "all execution lanes are busy".
-///
-/// If `create()` fails after popping from the free list, the index is
-/// pushed back so a retry can reuse it. The high-water counter is only
-/// bumped on success, matching the prior behavior.
-fn create_indexed_lane_resource<T>(
-    next_lane_index: &mut usize,
-    free_lane_indices: &mut Vec<usize>,
-    lane_count: u32,
-    create: impl FnOnce() -> Result<T>,
-) -> Result<(usize, T)> {
-    if let Some(index) = free_lane_indices.pop() {
-        let resource = match create() {
-            Ok(resource) => resource,
-            Err(err) => {
-                // Return the freed index so the next allocation can
-                // still reuse it.
-                free_lane_indices.push(index);
-                return Err(err);
-            }
-        };
-        return Ok((index, resource));
-    }
-    if *next_lane_index >= lane_count as usize {
-        bail!("all execution lanes are busy");
-    }
-    let index = *next_lane_index;
-    let resource = create()?;
-    *next_lane_index = index + 1;
-    Ok((index, resource))
 }
 
 impl Drop for RuntimeState {
@@ -1198,7 +192,6 @@ pub fn load_runtime_with_overrides(
         sessions: BTreeMap::new(),
         idle_sessions: Vec::new(),
         session_token_counts: BTreeMap::new(),
-        session_checkpoints: BTreeMap::new(),
         session_resident_prefixes: BTreeMap::new(),
     }))))
 }
@@ -1247,7 +240,6 @@ pub fn load_runtime_with_overrides_and_open_events(
         sessions: BTreeMap::new(),
         idle_sessions: Vec::new(),
         session_token_counts: BTreeMap::new(),
-        session_checkpoints: BTreeMap::new(),
         session_resident_prefixes: BTreeMap::new(),
     }))))
 }
@@ -1304,7 +296,8 @@ fn runtime_config_from_stage_config(
             LoadMode::ArtifactSlice => RuntimeLoadMode::ArtifactSlice,
         },
         projector_path: config.projector_path.clone(),
-        include_embeddings: config.layer_start == 0,
+        include_embeddings: config.layer_start == 0
+            || (config.load_mode == LoadMode::LayerPackage && config.downstream.is_none()),
         include_output: config.downstream.is_none(),
         filter_tensors_on_load: config.filter_tensors_on_load,
     })
@@ -1347,132 +340,16 @@ fn open_stage_model_from_parts_with_events(
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{Result, bail};
     use skippy_protocol::{FlashAttentionType, LoadMode, PeerConfig, StageConfig, StageDevice};
-    use skippy_runtime::FlashAttentionType as RuntimeFlashAttentionType;
-
-    use super::{
-        RuntimeLaunchOverrides, create_indexed_lane_resource, runtime_config_from_stage_config,
-        should_attach_package_projector,
+    use skippy_runtime::{
+        ActivationDesc, ActivationFrame, FlashAttentionType as RuntimeFlashAttentionType,
+        RuntimeActivationDType, RuntimeActivationLayout, SamplingConfig,
     };
 
-    #[test]
-    fn create_indexed_lane_resource_keeps_index_available_when_creation_fails() {
-        let mut next_lane_index = 0;
-        let mut free_lane_indices: Vec<usize> = Vec::new();
-
-        let error = create_indexed_lane_resource(
-            &mut next_lane_index,
-            &mut free_lane_indices,
-            2,
-            || -> Result<()> { bail!("transient session creation failure") },
-        )
-        .expect_err("failed creation should propagate the original error");
-
-        assert_eq!(error.to_string(), "transient session creation failure");
-        assert_eq!(next_lane_index, 0);
-        assert!(free_lane_indices.is_empty());
-
-        let (index, resource) =
-            create_indexed_lane_resource(&mut next_lane_index, &mut free_lane_indices, 2, || {
-                Ok("lane")
-            })
-            .expect("successful retry should reuse the unconsumed lane index");
-
-        assert_eq!(index, 0);
-        assert_eq!(resource, "lane");
-        assert_eq!(next_lane_index, 1);
-    }
-
-    #[test]
-    fn create_indexed_lane_resource_reuses_freed_indices_before_growing() {
-        // Simulate the wedge scenario: all lanes allocated, one lane
-        // freed via the discard path, next allocation must reuse the
-        // freed index rather than bailing with "all execution lanes
-        // are busy".
-        let mut next_lane_index = 0;
-        let mut free_lane_indices: Vec<usize> = Vec::new();
-        let lane_count = 2;
-
-        // Allocate both lanes.
-        let (a_idx, _) = create_indexed_lane_resource(
-            &mut next_lane_index,
-            &mut free_lane_indices,
-            lane_count,
-            || Ok("a"),
-        )
-        .expect("first allocation should succeed");
-        let (b_idx, _) = create_indexed_lane_resource(
-            &mut next_lane_index,
-            &mut free_lane_indices,
-            lane_count,
-            || Ok("b"),
-        )
-        .expect("second allocation should succeed");
-        assert_eq!(a_idx, 0);
-        assert_eq!(b_idx, 1);
-        assert_eq!(next_lane_index, 2);
-
-        // Pool is full at the high-water mark. A third allocation must
-        // fail.
-        let error = create_indexed_lane_resource(
-            &mut next_lane_index,
-            &mut free_lane_indices,
-            lane_count,
-            || Ok("c"),
-        )
-        .expect_err("allocating past lane_count should fail when no slots are free");
-        assert!(error.to_string().contains("all execution lanes are busy"));
-
-        // Discard one lane: the caller pushes its freed index onto the
-        // free list (this is what drop_session_timed does on the
-        // discard branch).
-        free_lane_indices.push(a_idx);
-
-        // The next allocation MUST reuse the freed index instead of
-        // bailing. This is the wedge regression: previously
-        // next_lane_index stayed at lane_count and every allocation
-        // failed forever.
-        let (reused_idx, _) = create_indexed_lane_resource(
-            &mut next_lane_index,
-            &mut free_lane_indices,
-            lane_count,
-            || Ok("c"),
-        )
-        .expect("allocation must reuse a freed index, not stay wedged");
-        assert_eq!(reused_idx, 0);
-        assert_eq!(next_lane_index, 2);
-        assert!(free_lane_indices.is_empty());
-    }
-
-    #[test]
-    fn create_indexed_lane_resource_returns_freed_index_on_create_failure() {
-        // If create() fails while consuming a freed index, the index
-        // must go back onto the free list so a retry can use it.
-        let mut next_lane_index = 1;
-        let mut free_lane_indices: Vec<usize> = vec![0];
-
-        let error = create_indexed_lane_resource(
-            &mut next_lane_index,
-            &mut free_lane_indices,
-            2,
-            || -> Result<()> { bail!("create failed mid-reuse") },
-        )
-        .expect_err("failed creation should propagate");
-        assert_eq!(error.to_string(), "create failed mid-reuse");
-        assert_eq!(next_lane_index, 1);
-        assert_eq!(free_lane_indices, vec![0]);
-
-        // A retry should now succeed using the same freed index.
-        let (idx, _) =
-            create_indexed_lane_resource(&mut next_lane_index, &mut free_lane_indices, 2, || {
-                Ok("retry")
-            })
-            .expect("retry should succeed");
-        assert_eq!(idx, 0);
-        assert_eq!(next_lane_index, 1);
-        assert!(free_lane_indices.is_empty());
-    }
+    use super::{
+        RuntimeLaunchOverrides, load_runtime_with_overrides, runtime_config_from_stage_config,
+        should_attach_package_projector,
+    };
 
     #[test]
     fn runtime_config_preserves_selected_backend_device_and_thread_overrides() {
@@ -1543,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_config_omits_input_embeddings_for_final_non_first_stage() {
+    fn runtime_config_keeps_package_embeddings_for_final_non_first_stage() {
         let config = StageConfig {
             run_id: "run-a".to_string(),
             topology_id: "topology-a".to_string(),
@@ -1572,7 +449,12 @@ mod tests {
             cache_type_v: "f16".to_string(),
             flash_attn_type: FlashAttentionType::Auto,
             filter_tensors_on_load: true,
-            selected_device: None,
+            selected_device: Some(StageDevice {
+                backend_device: "CPU".into(),
+                stable_id: None,
+                index: None,
+                vram_bytes: None,
+            }),
             kv_cache: None,
             native_mtp_enabled: true,
             load_mode: LoadMode::LayerPackage,
@@ -1588,8 +470,102 @@ mod tests {
         let runtime_config =
             runtime_config_from_stage_config(&config, &RuntimeLaunchOverrides::default()).unwrap();
 
-        assert!(!runtime_config.include_embeddings);
+        assert!(runtime_config.include_embeddings);
         assert!(runtime_config.include_output);
+    }
+
+    #[test]
+    fn glm52_final_stage_package_executes_native_mtp_when_fixture_is_set() -> anyhow::Result<()> {
+        let Some(package_path) = std::env::var_os("SKIPPY_GLM52_MTP_PACKAGE") else {
+            eprintln!("skipping: SKIPPY_GLM52_MTP_PACKAGE is not set");
+            return Ok(());
+        };
+        let package_path = std::path::PathBuf::from(package_path);
+        if !package_path.join("model-package.json").is_file() {
+            eprintln!(
+                "skipping: {} does not look like a layer package",
+                package_path.display()
+            );
+            return Ok(());
+        }
+
+        let config = StageConfig {
+            run_id: "glm52-mtp-smoke".to_string(),
+            topology_id: "glm52-mtp-smoke-topology".to_string(),
+            model_id: "meshllm/GLM-5.2-Q2_K-MTP-Q8-layers".to_string(),
+            package_ref: Some(package_path.to_string_lossy().to_string()),
+            manifest_sha256: None,
+            source_model_path: None,
+            source_model_sha256: None,
+            source_model_bytes: None,
+            materialized_path: None,
+            materialized_pinned: false,
+            model_path: Some(package_path.to_string_lossy().to_string()),
+            projector_path: None,
+            stage_id: "stage-final".to_string(),
+            stage_index: 1,
+            layer_start: 78,
+            layer_end: 79,
+            ctx_size: 128,
+            lane_count: 1,
+            n_batch: Some(1),
+            n_ubatch: Some(1),
+            n_gpu_layers: 0,
+            mmap: Some(true),
+            mlock: false,
+            cache_type_k: "f16".to_string(),
+            cache_type_v: "f16".to_string(),
+            flash_attn_type: FlashAttentionType::Disabled,
+            filter_tensors_on_load: true,
+            selected_device: Some(StageDevice {
+                backend_device: "CPU".into(),
+                stable_id: None,
+                index: None,
+                vram_bytes: None,
+            }),
+            kv_cache: None,
+            native_mtp_enabled: true,
+            load_mode: LoadMode::LayerPackage,
+            bind_addr: "127.0.0.1:0".to_string(),
+            upstream: Some(PeerConfig {
+                stage_id: "stage-prev".to_string(),
+                stage_index: 0,
+                endpoint: "tcp://127.0.0.1:19000".to_string(),
+            }),
+            downstream: None,
+        };
+
+        let runtime = load_runtime_with_overrides(&config, &RuntimeLaunchOverrides::default())?
+            .expect("GLM final stage should load from the package");
+        let mut runtime = runtime.lock().expect("runtime mutex poisoned");
+        let hidden_bytes = 6144 * std::mem::size_of::<f32>();
+        let input = ActivationFrame {
+            desc: ActivationDesc {
+                version: 1,
+                dtype: RuntimeActivationDType::F32,
+                layout: RuntimeActivationLayout::TokenMajor,
+                producer_stage_index: 0,
+                layer_start: 0,
+                layer_end: 78,
+                token_count: 1,
+                sequence_count: 1,
+                payload_bytes: hidden_bytes as u64,
+                flags: 0,
+            },
+            payload: vec![0; hidden_bytes],
+        };
+        let sampling = SamplingConfig {
+            temperature: 0.0,
+            ..SamplingConfig::default()
+        };
+        let (predicted, draft, _output) =
+            runtime.decode_frame_sampled_mtp("smoke", 1, Some(&sampling), Some(&input), 0, 1)?;
+        let draft = draft.expect("GLM final stage should return a native MTP draft");
+
+        assert!(predicted >= 0);
+        assert_eq!(draft.token_ids.len(), 1);
+        assert!(draft.token_ids[0] >= 0);
+        Ok(())
     }
 
     #[test]

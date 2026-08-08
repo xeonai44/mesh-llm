@@ -4,6 +4,19 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 pub const DEFAULT_LOCAL_MODEL_ID: &str = "jc-builds/SmolLM2-135M-Instruct-Q4_K_M-GGUF:Q4_K_M";
 pub const DEFAULT_RUN_MAX_NEW_TOKENS: usize = 1;
+pub const MAX_VERIFY_WINDOW_WIDTH: usize = 16;
+
+fn parse_verify_window_width(value: &str) -> Result<usize, String> {
+    let width = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid verification width: {error}"))?;
+    if !(1..=MAX_VERIFY_WINDOW_WIDTH).contains(&width) {
+        return Err(format!(
+            "verification width must be between 1 and {MAX_VERIFY_WINDOW_WIDTH}"
+        ));
+    }
+    Ok(width)
+}
 
 #[derive(Parser)]
 #[command(about = "Llama stage benchmark launcher")]
@@ -20,15 +33,145 @@ pub enum CommandKind {
     LocalSplitBinary(LocalSplitBinaryArgs),
     LocalSplitCompare(LocalSplitCompareArgs),
     LocalSplitChainBinary(LocalSplitChainBinaryArgs),
-    #[command(name = "verify-span-local")]
-    VerifySpanLocal(VerifySpanLocalArgs),
+    #[command(name = "verify-window-local")]
+    VerifyWindowLocal(VerifyWindowLocalArgs),
     #[command(name = "chat-corpus")]
     ChatCorpus(ChatCorpusArgs),
     #[command(name = "token-lengths")]
     TokenLengths(TokenLengthsArgs),
     #[command(name = "focused-runtime")]
     FocusedRuntime(FocusedRuntimeArgs),
+    Eval(EvalArgs),
     Run(RunArgs),
+}
+
+#[derive(Parser)]
+pub struct EvalArgs {
+    #[command(subcommand)]
+    pub command: EvalCommandKind,
+}
+
+#[derive(Subcommand)]
+pub enum EvalCommandKind {
+    List(EvalListArgs),
+    Info(EvalInfoArgs),
+    Sync(EvalSyncArgs),
+    Install(EvalSyncArgs),
+    Doctor(EvalDoctorArgs),
+    Run(EvalRunArgs),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum EvalId {
+    SpeedBench,
+    TerminalBench,
+    SweBenchPro,
+    McpAtlas,
+}
+
+impl EvalId {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SpeedBench => "speed-bench",
+            Self::TerminalBench => "terminal-bench",
+            Self::SweBenchPro => "swe-bench-pro",
+            Self::McpAtlas => "mcp-atlas",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum FlashAttentionArg {
+    Auto,
+    Disabled,
+    Enabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum EvalPack {
+    Core,
+}
+
+#[derive(Parser)]
+pub struct EvalListArgs {
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser)]
+pub struct EvalInfoArgs {
+    pub eval: EvalId,
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser)]
+pub struct EvalSyncArgs {
+    #[arg(value_enum)]
+    pub evals: Vec<EvalId>,
+    #[arg(long, value_enum, default_value_t = EvalPack::Core)]
+    pub pack: EvalPack,
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Parser)]
+pub struct EvalDoctorArgs {
+    #[arg(value_enum)]
+    pub evals: Vec<EvalId>,
+    #[arg(long, value_enum, default_value_t = EvalPack::Core)]
+    pub pack: EvalPack,
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser)]
+pub struct EvalRunArgs {
+    pub eval: EvalId,
+    #[arg(long, default_value = "http://127.0.0.1:9337/v1")]
+    pub base_url: String,
+    #[arg(long, default_value = DEFAULT_LOCAL_MODEL_ID)]
+    pub model: String,
+    #[arg(long, default_value = "skippy-bench")]
+    pub api_key: String,
+    #[arg(long)]
+    pub cache_root: Option<PathBuf>,
+    #[arg(long)]
+    pub output_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 300)]
+    pub timeout_secs: u64,
+    #[arg(long)]
+    pub harness_timeout_secs: Option<u64>,
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Expected OpenAI endpoint generation concurrency; native harness request concurrency is kept equal to this value."
+    )]
+    pub endpoint_concurrency: usize,
+    #[arg(long)]
+    pub run_id: Option<String>,
+    #[arg(long, default_value = "http://127.0.0.1:18080")]
+    pub metrics_http: String,
+    #[arg(long)]
+    pub metrics_run_id: Option<String>,
+    #[arg(
+        long,
+        help = "Finalize metrics-server telemetry without downloading its full raw-span report"
+    )]
+    pub metrics_finalize_only: bool,
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -91,7 +234,7 @@ pub struct TokenLengthsArgs {
 }
 
 #[derive(Parser)]
-pub struct VerifySpanLocalArgs {
+pub struct VerifyWindowLocalArgs {
     #[arg(long)]
     pub model_path: PathBuf,
     #[arg(long, default_value_t = 48)]
@@ -114,6 +257,21 @@ pub struct VerifySpanLocalArgs {
     pub iterations: usize,
     #[arg(long, default_value_t = 8)]
     pub warmup: usize,
+    /// Verification widths checked for canonical parity (maximum 16).
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_parser = parse_verify_window_width,
+        default_value = "2"
+    )]
+    pub verify_widths: Vec<usize>,
+    /// Independent verification width used for timing samples (maximum 16).
+    #[arg(long, value_parser = parse_verify_window_width, default_value_t = 2)]
+    pub sample_width: usize,
+    #[arg(long, default_value_t = 1)]
+    pub continuation_steps: usize,
+    #[arg(long = "flash-attn", value_enum, default_value = "auto")]
+    pub flash_attn: FlashAttentionArg,
     #[arg(
         long,
         default_value = "Write a Rust function that parses a list of integers and returns the median."
@@ -147,6 +305,14 @@ pub struct ChatCorpusArgs {
     pub request_timeout_secs: u64,
     #[arg(long)]
     pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub metrics_report_output: Option<PathBuf>,
+    #[arg(long)]
+    pub run_id: Option<String>,
+    #[arg(long, default_value = "http://127.0.0.1:18080")]
+    pub metrics_http: String,
+    #[arg(long)]
+    pub metrics_run_id: Option<String>,
     #[arg(long, default_value = "chat-corpus-session")]
     pub session_prefix: String,
     #[arg(long)]
@@ -167,7 +333,7 @@ pub struct ChatCorpusArgs {
 pub struct RunArgs {
     #[arg(long, default_value = "target/debug/metrics-server")]
     pub metrics_server_bin: PathBuf,
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(
         long,
@@ -300,7 +466,7 @@ pub struct RunArgs {
 pub struct LocalSingleArgs {
     #[arg(long, default_value = "target/debug/metrics-server")]
     pub metrics_server_bin: PathBuf,
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
@@ -360,7 +526,7 @@ pub struct LocalSplitInprocessArgs {
 
 #[derive(Parser)]
 pub struct LocalSplitBinaryArgs {
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
@@ -388,7 +554,7 @@ pub struct LocalSplitBinaryArgs {
 
 #[derive(Parser)]
 pub struct LocalSplitCompareArgs {
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
@@ -418,7 +584,7 @@ pub struct LocalSplitCompareArgs {
 
 #[derive(Parser)]
 pub struct LocalSplitChainBinaryArgs {
-    #[arg(long, default_value = "target/debug/skippy-server")]
+    #[arg(long, default_value = "target/release/skippy-server")]
     pub stage_server_bin: PathBuf,
     #[arg(long)]
     pub model_path: PathBuf,
@@ -454,7 +620,27 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, CommandKind, FocusedRuntimeScenario};
+    use super::{Cli, CommandKind, EvalCommandKind, FlashAttentionArg, FocusedRuntimeScenario};
+
+    #[test]
+    fn parses_eval_run_metrics_finalize_only() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "eval",
+            "run",
+            "speed-bench",
+            "--metrics-finalize-only",
+        ])
+        .unwrap();
+
+        let CommandKind::Eval(eval) = cli.command else {
+            panic!("expected eval subcommand");
+        };
+        let EvalCommandKind::Run(args) = eval.command else {
+            panic!("expected eval run subcommand");
+        };
+        assert!(args.metrics_finalize_only);
+    }
 
     #[test]
     fn parses_focused_runtime_schema_smoke_command() {
@@ -510,10 +696,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_verify_span_local_command() {
+    fn parses_verify_window_local_command() {
         let cli = Cli::try_parse_from([
             "skippy-bench",
-            "verify-span-local",
+            "verify-window-local",
             "--model-path",
             "/tmp/model.gguf",
             "--layer-end",
@@ -527,8 +713,8 @@ mod tests {
         ])
         .unwrap();
 
-        let CommandKind::VerifySpanLocal(args) = cli.command else {
-            panic!("expected verify-span-local subcommand");
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
         };
 
         assert_eq!(args.model_path, PathBuf::from("/tmp/model.gguf"));
@@ -537,13 +723,17 @@ mod tests {
         assert_eq!(args.iterations, 3);
         assert_eq!(args.warmup, 1);
         assert_eq!(args.n_gpu_layers, -1);
+        assert_eq!(args.verify_widths, vec![2]);
+        assert_eq!(args.sample_width, 2);
+        assert_eq!(args.continuation_steps, 1);
+        assert_eq!(args.flash_attn, FlashAttentionArg::Auto);
     }
 
     #[test]
-    fn parses_verify_span_local_split_layer() {
+    fn parses_verify_window_local_split_layer() {
         let cli = Cli::try_parse_from([
             "skippy-bench",
-            "verify-span-local",
+            "verify-window-local",
             "--model-path",
             "/tmp/model.gguf",
             "--split-layer",
@@ -551,10 +741,112 @@ mod tests {
         ])
         .unwrap();
 
-        let CommandKind::VerifySpanLocal(args) = cli.command else {
-            panic!("expected verify-span-local subcommand");
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
         };
 
         assert_eq!(args.split_layer, Some(24));
+    }
+
+    #[test]
+    fn parses_verify_window_local_widths() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--verify-widths",
+            "1,2,4,9",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
+        };
+
+        assert_eq!(args.verify_widths, vec![1, 2, 4, 9]);
+    }
+
+    #[test]
+    fn parses_verify_window_local_sample_width() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--verify-widths",
+            "1,2,4,9",
+            "--sample-width",
+            "9",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
+        };
+
+        assert_eq!(args.verify_widths, vec![1, 2, 4, 9]);
+        assert_eq!(args.sample_width, 9);
+    }
+
+    #[test]
+    fn rejects_verify_window_local_widths_above_kernel_ceiling() {
+        let widths = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--verify-widths",
+            "1,17",
+        ]);
+        assert!(widths.is_err());
+
+        let sample = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--sample-width",
+            "17",
+        ]);
+        assert!(sample.is_err());
+    }
+
+    #[test]
+    fn parses_verify_window_local_continuation_steps() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--continuation-steps",
+            "256",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
+        };
+
+        assert_eq!(args.continuation_steps, 256);
+    }
+
+    #[test]
+    fn parses_verify_window_local_flash_attention() {
+        let cli = Cli::try_parse_from([
+            "skippy-bench",
+            "verify-window-local",
+            "--model-path",
+            "/tmp/model.gguf",
+            "--flash-attn",
+            "disabled",
+        ])
+        .unwrap();
+
+        let CommandKind::VerifyWindowLocal(args) = cli.command else {
+            panic!("expected verify-window-local subcommand");
+        };
+
+        assert_eq!(args.flash_attn, FlashAttentionArg::Disabled);
     }
 }

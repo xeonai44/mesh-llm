@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use crate::telemetry::TelemetryLevel;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(about = "Llama staged-runtime server")]
@@ -131,10 +131,16 @@ pub struct ServeBinaryArgs {
         help = "Override n_gpu_layers for the embedded OpenAI draft model. Defaults to the stage config n_gpu_layers."
     )]
     pub openai_draft_n_gpu_layers: Option<i32>,
-    #[arg(long, default_value_t = 0)]
-    pub openai_ngram_min: usize,
-    #[arg(long, default_value_t = 0)]
-    pub openai_ngram_max: usize,
+    #[arg(
+        long,
+        help = "Native MTP sidecar GGUF to attach to the stage-0 model. Unlike --openai-draft-model-path this is not opened as a standalone draft model; its MTP heads are attached to the served model."
+    )]
+    pub openai_native_mtp_draft_model_path: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "JSON file containing the complete resolved speculative decode plan."
+    )]
+    pub openai_speculative_config: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -150,6 +156,11 @@ pub struct ServeOpenAiArgs {
         help = "Served model id to advertise and accept, for example org/repo:Q4_K_M. Defaults to config model_id."
     )]
     pub model_id: Option<String>,
+    #[arg(
+        long,
+        help = "JSON file containing a complete resolved speculative decode plan."
+    )]
+    pub speculative_config: Option<PathBuf>,
     #[arg(long, default_value_t = 16)]
     pub default_max_tokens: u32,
     #[arg(
@@ -192,6 +203,20 @@ pub struct ServeOpenAiArgs {
     pub telemetry_queue_capacity: usize,
     #[arg(long, value_enum, default_value_t = TelemetryLevel::Summary)]
     pub telemetry_level: TelemetryLevel,
+    #[arg(
+        long = "openai-guardrails",
+        value_enum,
+        default_value_t = OpenAiGuardrailsCliMode::Metrics,
+        help = "OpenAI compatibility guardrail mode for standalone serving: disabled, metrics, or enforce."
+    )]
+    pub openai_guardrails: OpenAiGuardrailsCliMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OpenAiGuardrailsCliMode {
+    Disabled,
+    Metrics,
+    Enforce,
 }
 
 #[cfg(test)]
@@ -228,5 +253,63 @@ mod tests {
         assert_eq!(args.prefill_adaptive_start, 128);
         assert_eq!(args.prefill_adaptive_step, 128);
         assert_eq!(args.prefill_adaptive_max, 384);
+        assert_eq!(args.openai_guardrails, OpenAiGuardrailsCliMode::Metrics);
+    }
+
+    #[test]
+    fn serve_openai_accepts_explicit_guardrail_mode() {
+        let cli = Cli::try_parse_from([
+            "skippy-server",
+            "serve-openai",
+            "--config",
+            "stage.json",
+            "--openai-guardrails",
+            "enforce",
+        ])
+        .unwrap();
+
+        let Command::ServeOpenAi(args) = cli.command else {
+            panic!("expected serve-openai command");
+        };
+        assert_eq!(args.openai_guardrails, OpenAiGuardrailsCliMode::Enforce);
+    }
+
+    #[test]
+    fn standalone_commands_accept_resolved_speculative_config_files() {
+        let cli = Cli::try_parse_from([
+            "skippy-server",
+            "serve-binary",
+            "--config",
+            "stage.json",
+            "--activation-width",
+            "2048",
+            "--openai-speculative-config",
+            "decode-plan.json",
+        ])
+        .unwrap();
+        let Command::ServeBinary(args) = cli.command else {
+            panic!("expected serve-binary command");
+        };
+        assert_eq!(
+            args.openai_speculative_config,
+            Some(PathBuf::from("decode-plan.json"))
+        );
+
+        let cli = Cli::try_parse_from([
+            "skippy-server",
+            "serve-openai",
+            "--config",
+            "stage.json",
+            "--speculative-config",
+            "decode-plan.json",
+        ])
+        .unwrap();
+        let Command::ServeOpenAi(args) = cli.command else {
+            panic!("expected serve-openai command");
+        };
+        assert_eq!(
+            args.speculative_config,
+            Some(PathBuf::from("decode-plan.json"))
+        );
     }
 }

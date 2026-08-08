@@ -1,6 +1,10 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+mod kv_cache;
+
+pub use kv_cache::{GgufKvCacheQuant, GgufKvCacheType};
+
 const MAX_GGUF_STRING_BYTES: u64 = 1_000_000;
 const MAX_GGUF_ARRAY_ELEMENTS: u64 = 1_000_000;
 const MAX_GGUF_ARRAY_DEPTH: u32 = 64;
@@ -117,15 +121,20 @@ fn read_bounded_len(f: &mut std::fs::File, max: u64, label: &str) -> std::io::Re
 }
 
 fn read_gguf_string(f: &mut std::fs::File) -> std::io::Result<String> {
-    let len = read_bounded_len(f, MAX_GGUF_STRING_BYTES, "string")?;
-    let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf)?;
+    let buf = read_gguf_bytes(f, "string")?;
     String::from_utf8(buf).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid UTF-8 in GGUF string",
         )
     })
+}
+
+fn read_gguf_bytes(f: &mut std::fs::File, label: &str) -> std::io::Result<Vec<u8>> {
+    let len = read_bounded_len(f, MAX_GGUF_STRING_BYTES, label)?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 fn skip_gguf_value(f: &mut std::fs::File, typ: GgufType) -> std::io::Result<()> {
@@ -194,6 +203,29 @@ fn read_gguf_value_as_u32(f: &mut std::fs::File, typ: GgufType) -> std::io::Resu
     }
 }
 
+fn read_gguf_value_as_u32_list(
+    f: &mut std::fs::File,
+    typ: GgufType,
+) -> std::io::Result<Option<Vec<u32>>> {
+    if typ != GgufType::Array {
+        return Ok(read_gguf_value_as_u32(f, typ)?.map(|value| vec![value]));
+    }
+
+    let elem_type = GgufType::from_u32(read_u32(f)?)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad array type"))?;
+    let count = read_bounded_len(f, MAX_GGUF_ARRAY_ELEMENTS, "array")?;
+    let mut values = Vec::with_capacity(count);
+    let mut supported = true;
+    for _ in 0..count {
+        match read_gguf_value_as_u32(f, elem_type)? {
+            Some(value) if supported => values.push(value),
+            Some(_) => {}
+            None => supported = false,
+        }
+    }
+    Ok(supported.then_some(values))
+}
+
 fn read_gguf_value_as_f32(f: &mut std::fs::File, typ: GgufType) -> std::io::Result<Option<f32>> {
     match typ {
         GgufType::Float32 => {
@@ -206,6 +238,15 @@ fn read_gguf_value_as_f32(f: &mut std::fs::File, typ: GgufType) -> std::io::Resu
             Ok(None)
         }
     }
+}
+
+fn read_gguf_value_as_bool(f: &mut std::fs::File, typ: GgufType) -> std::io::Result<Option<bool>> {
+    if typ == GgufType::Bool {
+        let mut value = [0u8; 1];
+        f.read_exact(&mut value)?;
+        return Ok(Some(value[0] != 0));
+    }
+    Ok(read_gguf_value_as_u32(f, typ)?.map(|value| value != 0))
 }
 
 fn read_gguf_value_as_string_opt(
@@ -230,10 +271,12 @@ pub struct GgufCompactMeta {
     pub embedding_size: u32,
     pub head_count: u32,
     pub kv_head_count: u32,
+    pub kv_head_counts: Vec<u32>,
     pub layer_count: u32,
     pub feed_forward_length: u32,
     pub key_length: u32,
     pub value_length: u32,
+    pub kv_lora_rank: u32,
     pub tokenizer_model_name: String,
     pub rope_scale: f32,
     pub rope_freq_base: f32,
@@ -242,156 +285,26 @@ pub struct GgufCompactMeta {
     pub nextn_predict_layers: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GgufProjectorMeta {
+    pub has_vision_encoder: Option<bool>,
+    pub has_audio_encoder: Option<bool>,
+}
+
 impl GgufCompactMeta {
     pub fn effective_kv_head_count(&self) -> Option<u32> {
         if self.kv_head_count > 0 {
             Some(self.kv_head_count)
+        } else if let Some(kv_head_count) = self.kv_head_counts.iter().copied().max()
+            && kv_head_count > 0
+        {
+            Some(kv_head_count)
         } else if self.head_count > 0 {
             Some(self.head_count)
         } else {
             None
         }
     }
-
-    pub fn k_cache_bytes_per_token_f16(&self) -> Option<u64> {
-        GgufKvCacheQuant::f16().k_cache_bytes_per_token(self)
-    }
-
-    pub fn v_cache_bytes_per_token_f16(&self) -> Option<u64> {
-        GgufKvCacheQuant::f16().v_cache_bytes_per_token(self)
-    }
-
-    pub fn kv_cache_bytes_per_token_f16(&self) -> Option<u64> {
-        GgufKvCacheQuant::f16().kv_cache_bytes_per_token(self)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GgufKvCacheType {
-    F16,
-    Q8_0,
-    Q4_0,
-}
-
-impl GgufKvCacheType {
-    pub fn from_llama_arg(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
-            "f16" => Some(Self::F16),
-            "q8_0" => Some(Self::Q8_0),
-            "q4_0" => Some(Self::Q4_0),
-            _ => None,
-        }
-    }
-
-    pub const fn as_llama_arg(self) -> &'static str {
-        match self {
-            Self::F16 => "f16",
-            Self::Q8_0 => "q8_0",
-            Self::Q4_0 => "q4_0",
-        }
-    }
-
-    fn block_shape(self) -> (u64, u64) {
-        match self {
-            Self::F16 => (1, 2),
-            Self::Q8_0 => (32, 34),
-            Self::Q4_0 => (32, 18),
-        }
-    }
-
-    fn bytes_for_elements(self, elements: u64) -> Option<u64> {
-        let (block_elements, block_bytes) = self.block_shape();
-        let blocks = elements
-            .checked_add(block_elements.checked_sub(1)?)?
-            .checked_div(block_elements)?;
-        blocks.checked_mul(block_bytes)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct GgufKvCacheQuant {
-    pub k: GgufKvCacheType,
-    pub v: GgufKvCacheType,
-}
-
-impl GgufKvCacheQuant {
-    /// f16 K + f16 V — highest quality, largest KV cache.
-    pub const F16: Self = Self {
-        k: GgufKvCacheType::F16,
-        v: GgufKvCacheType::F16,
-    };
-
-    /// q8_0 K + q8_0 V — moderate compression.
-    pub const Q8_0: Self = Self {
-        k: GgufKvCacheType::Q8_0,
-        v: GgufKvCacheType::Q8_0,
-    };
-
-    /// q4_0 K + q4_0 V — most aggressive compression, smallest KV cache.
-    pub const Q4_0: Self = Self {
-        k: GgufKvCacheType::Q4_0,
-        v: GgufKvCacheType::Q4_0,
-    };
-
-    pub const fn new(k: GgufKvCacheType, v: GgufKvCacheType) -> Self {
-        Self { k, v }
-    }
-
-    pub const fn f16() -> Self {
-        Self::F16
-    }
-
-    /// Returns `true` if `self` uses more aggressive (smaller) quantisation
-    /// than `other`.
-    pub const fn is_more_aggressive_than(self, other: Self) -> bool {
-        Self::aggressiveness(self) > Self::aggressiveness(other)
-    }
-
-    const fn aggressiveness(q: Self) -> u8 {
-        Self::type_aggressiveness(q.k) + Self::type_aggressiveness(q.v)
-    }
-
-    const fn type_aggressiveness(t: GgufKvCacheType) -> u8 {
-        match t {
-            GgufKvCacheType::F16 => 0,
-            GgufKvCacheType::Q8_0 => 1,
-            GgufKvCacheType::Q4_0 => 2,
-        }
-    }
-
-    pub fn from_llama_args(cache_type_k: &str, cache_type_v: &str) -> Option<Self> {
-        Some(Self {
-            k: GgufKvCacheType::from_llama_arg(cache_type_k)?,
-            v: GgufKvCacheType::from_llama_arg(cache_type_v)?,
-        })
-    }
-
-    pub fn k_cache_bytes_per_token(self, meta: &GgufCompactMeta) -> Option<u64> {
-        cache_bytes_per_token(meta, meta.key_length, self.k)
-    }
-
-    pub fn v_cache_bytes_per_token(self, meta: &GgufCompactMeta) -> Option<u64> {
-        cache_bytes_per_token(meta, meta.value_length, self.v)
-    }
-
-    pub fn kv_cache_bytes_per_token(self, meta: &GgufCompactMeta) -> Option<u64> {
-        self.k_cache_bytes_per_token(meta)?
-            .checked_add(self.v_cache_bytes_per_token(meta)?)
-    }
-}
-
-fn cache_bytes_per_token(
-    meta: &GgufCompactMeta,
-    vector_length: u32,
-    cache_type: GgufKvCacheType,
-) -> Option<u64> {
-    let kv_heads = u64::from(meta.effective_kv_head_count()?);
-    let vector_length = u64::from((vector_length > 0).then_some(vector_length)?);
-    let layers = u64::from((meta.layer_count > 0).then_some(meta.layer_count)?);
-    let elements_per_layer = kv_heads.checked_mul(vector_length)?;
-    cache_type
-        .bytes_for_elements(elements_per_layer)?
-        .checked_mul(layers)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -402,6 +315,20 @@ pub struct GgufTensorByteProfile {
     pub base_resident_bytes: u64,
     pub expert_tensor_bytes: u64,
     pub file_overhead_bytes: u64,
+}
+
+/// The tokenizer vocabulary exposed by a source GGUF header. Non-control
+/// entries intentionally retain their raw bytes: many GGUF vocabularies are
+/// not valid UTF-8 and must never be round-tripped through text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GgufTokenizerInventory {
+    pub tokens: Vec<GgufTokenizerToken>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GgufTokenizerToken {
+    pub raw: Vec<u8>,
+    pub is_control: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -483,8 +410,12 @@ pub fn scan_gguf_compact_meta(path: &Path) -> Option<GgufCompactMeta> {
                 meta.head_count = v;
             }
         } else if key.ends_with(".attention.head_count_kv") {
-            if let Ok(Some(v)) = read_gguf_value_as_u32(&mut f, vtype) {
-                meta.kv_head_count = v;
+            if let Ok(Some(values)) = read_gguf_value_as_u32_list(&mut f, vtype) {
+                if values.len() == 1 {
+                    meta.kv_head_count = values[0];
+                } else {
+                    meta.kv_head_counts = values;
+                }
             }
         } else if key.ends_with(".block_count") {
             if let Ok(Some(v)) = read_gguf_value_as_u32(&mut f, vtype) {
@@ -501,6 +432,10 @@ pub fn scan_gguf_compact_meta(path: &Path) -> Option<GgufCompactMeta> {
         } else if key.ends_with(".attention.value_length") {
             if let Ok(Some(v)) = read_gguf_value_as_u32(&mut f, vtype) {
                 meta.value_length = v;
+            }
+        } else if key.ends_with(".attention.kv_lora_rank") {
+            if let Ok(Some(v)) = read_gguf_value_as_u32(&mut f, vtype) {
+                meta.kv_lora_rank = v;
             }
         } else if key.ends_with(".rope.scale") {
             if let Ok(Some(v)) = read_gguf_value_as_f32(&mut f, vtype) {
@@ -550,6 +485,124 @@ pub fn scan_gguf_compact_meta(path: &Path) -> Option<GgufCompactMeta> {
     Some(meta)
 }
 
+/// Scan the modality flags stored in a multimodal projector GGUF.
+pub fn scan_gguf_projector_meta(path: &Path) -> Option<GgufProjectorMeta> {
+    let GgufHeader {
+        file: mut f, n_kv, ..
+    } = open_gguf_header(path)?;
+    let mut meta = GgufProjectorMeta::default();
+    for _ in 0..n_kv {
+        let key = read_gguf_string(&mut f).ok()?;
+        let value_type = GgufType::from_u32(read_u32(&mut f).ok()?)?;
+        match key.as_str() {
+            "clip.has_vision_encoder" => {
+                meta.has_vision_encoder = read_gguf_value_as_bool(&mut f, value_type).ok()?;
+            }
+            "clip.has_audio_encoder" => {
+                meta.has_audio_encoder = read_gguf_value_as_bool(&mut f, value_type).ok()?;
+            }
+            _ => skip_gguf_value(&mut f, value_type).ok()?,
+        }
+    }
+    Some(meta)
+}
+
+fn read_string_array(f: &mut std::fs::File, typ: GgufType) -> std::io::Result<Vec<Vec<u8>>> {
+    if typ != GgufType::Array {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tokenizer tokens must be a GGUF array",
+        ));
+    }
+    if GgufType::from_u32(read_u32(f)?) != Some(GgufType::String) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tokenizer tokens must be an array of strings",
+        ));
+    }
+    let count = read_bounded_len(f, MAX_GGUF_ARRAY_ELEMENTS, "tokenizer token array")?;
+    let mut tokens = Vec::new();
+    tokens.try_reserve(count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tokenizer token array requires too much memory",
+        )
+    })?;
+    for _ in 0..count {
+        tokens.push(read_gguf_bytes(f, "tokenizer token")?);
+    }
+    Ok(tokens)
+}
+
+fn read_token_type_array(f: &mut std::fs::File, typ: GgufType) -> std::io::Result<Vec<u32>> {
+    if typ != GgufType::Array {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tokenizer token types must be a GGUF array",
+        ));
+    }
+    let element_type = GgufType::from_u32(read_u32(f)?).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "bad tokenizer token type")
+    })?;
+    let count = read_bounded_len(f, MAX_GGUF_ARRAY_ELEMENTS, "tokenizer token type array")?;
+    let mut types = Vec::new();
+    types.try_reserve(count).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tokenizer token type array requires too much memory",
+        )
+    })?;
+    for _ in 0..count {
+        let value = read_gguf_value_as_u32(f, element_type)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported tokenizer token type element",
+            )
+        })?;
+        types.push(value);
+    }
+    Ok(types)
+}
+
+/// Reads a source GGUF's tokenizer vocabulary and its control-token markers.
+/// This scans metadata only and rejects malformed or incomplete inventories.
+pub fn scan_gguf_tokenizer_inventory(path: &Path) -> Option<GgufTokenizerInventory> {
+    let GgufHeader {
+        file: mut f, n_kv, ..
+    } = open_gguf_header(path)?;
+    let mut raw_tokens = None;
+    let mut token_types = None;
+
+    for _ in 0..n_kv {
+        let key = read_gguf_string(&mut f).ok()?;
+        let typ = GgufType::from_u32(read_u32(&mut f).ok()?)?;
+        match key.as_str() {
+            "tokenizer.ggml.tokens" => raw_tokens = Some(read_string_array(&mut f, typ).ok()?),
+            "tokenizer.ggml.token_type" => {
+                token_types = Some(read_token_type_array(&mut f, typ).ok()?);
+            }
+            _ => skip_gguf_value(&mut f, typ).ok()?,
+        }
+    }
+
+    let raw_tokens = raw_tokens?;
+    let token_types = token_types.unwrap_or_else(|| vec![0; raw_tokens.len()]);
+    if raw_tokens.is_empty() || raw_tokens.len() != token_types.len() {
+        return None;
+    }
+    Some(GgufTokenizerInventory {
+        tokens: raw_tokens
+            .into_iter()
+            .zip(token_types)
+            // GGML's stable token type value for an explicit control boundary.
+            .map(|(raw, token_type)| GgufTokenizerToken {
+                raw,
+                is_control: token_type == 3,
+            })
+            .collect(),
+    })
+}
+
 fn align_offset(value: u64, alignment: u32) -> u64 {
     let alignment = u64::from(alignment.max(1));
     let remainder = value % alignment;
@@ -588,6 +641,43 @@ fn read_tensor_infos(
         tensors.push(GgufTensorInfo { name, offset });
     }
     Ok(tensors)
+}
+
+/// Sum the element counts of every tensor in a GGUF file → total stored
+/// parameter count. Reads only the header and tensor-info table (dimensions),
+/// never tensor data.
+///
+/// This is the authoritative model size: the exact number of stored weights,
+/// independent of the file name. Name parsing (`NNb` in the model id) is a
+/// brittle fallback — aliases and fine-tunes need not encode a size, names can
+/// carry unrelated digits, and an unparseable name must read as *unknown*, not
+/// as a guessed tier. Returns `None` on any parse failure (→ unknown).
+pub fn scan_gguf_total_parameters(path: &Path) -> Option<u64> {
+    let GgufHeader {
+        file: mut f,
+        n_tensors,
+        n_kv,
+    } = open_gguf_header(path)?;
+
+    skip_all_kv_pairs(&mut f, n_kv)?;
+
+    let mut total: u64 = 0;
+    for _ in 0..n_tensors {
+        let _name = read_gguf_string(&mut f).ok()?;
+        let n_dims = read_u32(&mut f).ok()?;
+        if n_dims > MAX_GGUF_TENSOR_DIMS {
+            return None;
+        }
+        let mut elements: u64 = 1;
+        for _ in 0..n_dims {
+            let dim = read_u64(&mut f).ok()?;
+            elements = elements.checked_mul(dim)?;
+        }
+        let _ggml_type = read_u32(&mut f).ok()?;
+        let _offset = read_u64(&mut f).ok()?;
+        total = total.checked_add(elements)?;
+    }
+    Some(total)
 }
 
 /// Scan GGUF tensor names and return whether any tensor matches the predicate.
@@ -759,10 +849,63 @@ mod tests {
         bytes.extend_from_slice(value.as_bytes());
     }
 
+    fn push_gguf_bytes(bytes: &mut Vec<u8>, value: &[u8]) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value);
+    }
+
     fn push_u32_kv(bytes: &mut Vec<u8>, key: &str, value: u32) {
         push_gguf_string(bytes, key);
         bytes.extend_from_slice(&(GgufType::Uint32 as u32).to_le_bytes());
         bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_bool_kv(bytes: &mut Vec<u8>, key: &str, value: bool) {
+        push_gguf_string(bytes, key);
+        bytes.extend_from_slice(&(GgufType::Bool as u32).to_le_bytes());
+        bytes.push(u8::from(value));
+    }
+
+    fn push_u32_array_kv(bytes: &mut Vec<u8>, key: &str, values: &[u32]) {
+        push_gguf_string(bytes, key);
+        bytes.extend_from_slice(&(GgufType::Array as u32).to_le_bytes());
+        push_array_header(bytes, GgufType::Uint32, values.len() as u64);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn push_tokenizer_inventory_kvs(bytes: &mut Vec<u8>) {
+        push_gguf_string(bytes, "tokenizer.ggml.tokens");
+        bytes.extend_from_slice(&(GgufType::Array as u32).to_le_bytes());
+        push_array_header(bytes, GgufType::String, 2);
+        push_gguf_bytes(bytes, b"hello");
+        push_gguf_bytes(bytes, b"<eos>");
+
+        push_gguf_string(bytes, "tokenizer.ggml.token_type");
+        bytes.extend_from_slice(&(GgufType::Array as u32).to_le_bytes());
+        push_array_header(bytes, GgufType::Uint32, 2);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+    }
+
+    #[test]
+    fn scan_gguf_tokenizer_inventory_preserves_bytes_and_controls() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&2i64.to_le_bytes());
+        push_tokenizer_inventory_kvs(&mut bytes);
+
+        let path = write_bytes("model-artifact-gguf-tokenizer", &bytes);
+        let inventory = scan_gguf_tokenizer_inventory(&path).expect("should parse tokenizer");
+        assert_eq!(inventory.tokens.len(), 2);
+        assert_eq!(inventory.tokens[0].raw, b"hello");
+        assert!(!inventory.tokens[0].is_control);
+        assert_eq!(inventory.tokens[1].raw, b"<eos>");
+        assert!(inventory.tokens[1].is_control);
+        let _ = std::fs::remove_file(path);
     }
 
     fn push_tensor_info(bytes: &mut Vec<u8>, name: &str, offset: u64) {
@@ -867,6 +1010,76 @@ mod tests {
     }
 
     #[test]
+    fn scan_gguf_compact_meta_preserves_kv_lora_rank() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&1i64.to_le_bytes());
+        push_u32_kv(&mut bytes, "glm-dsa.attention.kv_lora_rank", 512);
+
+        let path = write_bytes("model-artifact-gguf-kv-lora-rank", &bytes);
+        let meta = scan_gguf_compact_meta(&path).expect("should parse GGUF");
+        assert_eq!(meta.kv_lora_rank, 512);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_gguf_compact_meta_prices_per_layer_kv_head_counts() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&7i64.to_le_bytes());
+        push_gguf_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&(GgufType::String as u32).to_le_bytes());
+        push_gguf_string(&mut bytes, "inkling");
+        push_u32_kv(&mut bytes, "inkling.embedding_length", 6144);
+        push_u32_kv(&mut bytes, "inkling.attention.head_count", 64);
+        let kv_head_counts = (0..66)
+            .map(|layer| if layer % 6 == 5 { 8 } else { 16 })
+            .collect::<Vec<_>>();
+        push_u32_array_kv(
+            &mut bytes,
+            "inkling.attention.head_count_kv",
+            &kv_head_counts,
+        );
+        push_u32_kv(&mut bytes, "inkling.block_count", 66);
+        push_u32_kv(&mut bytes, "inkling.attention.key_length", 128);
+        push_u32_kv(&mut bytes, "inkling.attention.value_length", 128);
+
+        let path = write_bytes("model-artifact-gguf-inkling-kv-head-counts", &bytes);
+        let meta = scan_gguf_compact_meta(&path).expect("should parse GGUF");
+        assert_eq!(meta.kv_head_count, 0);
+        assert_eq!(meta.kv_head_counts, kv_head_counts);
+        assert_eq!(meta.effective_kv_head_count(), Some(16));
+        assert_eq!(meta.k_cache_bytes_per_token_f16(), Some(247_808));
+        assert_eq!(meta.v_cache_bytes_per_token_f16(), Some(247_808));
+        assert_eq!(meta.kv_cache_bytes_per_token_f16(), Some(495_616));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scan_gguf_projector_meta_preserves_vision_and_audio_flags() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&3i64.to_le_bytes());
+        push_gguf_string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&(GgufType::String as u32).to_le_bytes());
+        push_gguf_string(&mut bytes, "clip");
+        push_bool_kv(&mut bytes, "clip.has_vision_encoder", true);
+        push_bool_kv(&mut bytes, "clip.has_audio_encoder", true);
+
+        let path = write_bytes("model-artifact-gguf-inkling-projector", &bytes);
+        let meta = scan_gguf_projector_meta(&path).expect("should parse projector GGUF");
+        assert_eq!(meta.has_vision_encoder, Some(true));
+        assert_eq!(meta.has_audio_encoder, Some(true));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn scan_gguf_compact_meta_preserves_nextn_predict_layers() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
@@ -900,57 +1113,6 @@ mod tests {
             .expect("tensor scan should parse");
         assert!(has_nextn);
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn kv_cache_quant_prices_key_and_value_types_independently() {
-        let meta = GgufCompactMeta {
-            head_count: 32,
-            kv_head_count: 8,
-            layer_count: 24,
-            key_length: 128,
-            value_length: 128,
-            ..Default::default()
-        };
-        let quant = GgufKvCacheQuant::new(GgufKvCacheType::Q8_0, GgufKvCacheType::Q4_0);
-
-        assert_eq!(quant.k_cache_bytes_per_token(&meta), Some(26_112));
-        assert_eq!(quant.v_cache_bytes_per_token(&meta), Some(13_824));
-        assert_eq!(quant.kv_cache_bytes_per_token(&meta), Some(39_936));
-    }
-
-    #[test]
-    fn kv_cache_quant_prices_key_and_value_widths_independently() {
-        let meta = GgufCompactMeta {
-            head_count: 32,
-            kv_head_count: 8,
-            layer_count: 24,
-            key_length: 64,
-            value_length: 256,
-            ..Default::default()
-        };
-        let quant = GgufKvCacheQuant::new(GgufKvCacheType::Q8_0, GgufKvCacheType::Q4_0);
-
-        assert_eq!(quant.k_cache_bytes_per_token(&meta), Some(13_056));
-        assert_eq!(quant.v_cache_bytes_per_token(&meta), Some(27_648));
-        assert_eq!(quant.kv_cache_bytes_per_token(&meta), Some(40_704));
-    }
-
-    #[test]
-    fn kv_cache_bytes_per_token_returns_none_when_required_fields_are_missing() {
-        let meta = GgufCompactMeta {
-            head_count: 32,
-            layer_count: 24,
-            key_length: 128,
-            ..Default::default()
-        };
-
-        assert_eq!(meta.k_cache_bytes_per_token_f16(), Some(196_608));
-        assert_eq!(meta.v_cache_bytes_per_token_f16(), None);
-        assert_eq!(
-            GgufKvCacheQuant::f16().kv_cache_bytes_per_token(&meta),
-            None
-        );
     }
 
     #[test]

@@ -88,7 +88,7 @@ mesh-llm benchmark tune --model /models/qwen3-8b.gguf --mmap-values auto,true,fa
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --flash-attention on,off
 mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types auto
 mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types mtp --debug-telemetry --json
-mesh-llm benchmark tune --model /models/qwen3-8b.gguf --speculative-types draft,ngram,disabled --spec-draft-models /models/qwen3-draft.gguf --spec-draft-max-tokens 4,8,16
+mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types mtp,mtp-ngram,disabled --spec-draft-max-tokens 4,8,16
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --throughput-tolerance-pct 2.5
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply --replace-existing
@@ -96,7 +96,7 @@ mesh-llm benchmark tune --model /models/qwen3-8b.gguf --launch-args
 ```
 
 If `--mmap-values` is omitted, benchmark tune tries `auto`, `true`, and `false`. If `--mlock-values` is omitted, it tries `false` and only tries `true` when the current mlock limit can cover the evaluated budget. If `--flash-attention` is omitted, flash attention is not varied during the sweep; when supplied (e.g. `--flash-attention on,off`), trial count doubles and the recommendation applies the best flash attention setting.
-If `--speculative-types` is omitted, benchmark tune uses `auto`: native MTP is tried first for MTP-looking targets, locally discoverable draft models are tried when available, ngram candidates are tried as a model-free fallback, and a disabled baseline is included for comparison. Use `--speculative-types mtp,draft,ngram,disabled` to force an explicit speculative sweep, or `--no-speculative-tune` to reproduce the old disabled-baseline-only sweep.
+If `--speculative-types` is omitted, benchmark tune uses `auto`: native MTP and the bounded MTP + request-local N-gram cache composite are tried for MTP-looking targets, locally discoverable draft models are tried when available, and a disabled baseline is included for comparison. Use `--speculative-types mtp,mtp-ngram,draft,disabled` to force an explicit speculative sweep, or `--no-speculative-tune` to run only the disabled baseline.
 Use `--apply` to write the recommended settings into `~/.mesh-llm/config.toml`, and combine with `--replace-existing` to overwrite existing writable recommendation fields. `--launch-args` prints generated `mesh-llm serve` arguments for local launch without writing config.
 Use `--debug-telemetry` when proving speculative decoding behavior: each trial log includes Skippy debug telemetry, including `llama_stage.native_mtp.*` summary attributes for MTP drafted, accepted, rejected, and accept-rate counts.
 
@@ -147,6 +147,131 @@ mesh-llm serve --gguf ~/my-models/qwen3.5-4b.gguf --mmproj ~/my-models/mmproj-BF
 Use the persisted TOML for future starts or reloads. It does not rewrite active
 sessions in place, and request payload values still win over any request
 defaults from the file.
+
+## Runtime mode and daemon lifecycle
+
+The `[runtime]` section controls daemon-level behavior: operating mode, startup
+failure policy, drain timeouts, and opt-in host activity adaptation.
+
+```toml
+[runtime]
+mode = "serve"                        # "client" | "serve" (default) | "on_demand"
+startup_failure_policy = "best_effort" # "best_effort" (default) | "fail_fast"
+drain_timeout_secs = 30               # 1..=3600, default 30
+drain_timeout_max_secs = 300          # 1..=3600, default 300, must be >= drain_timeout_secs
+
+[runtime.activity]
+enabled = false                       # opt-in, default false
+idle_after_secs = 300                 # 30..=86400, default 300
+poll_interval_secs = 5                # 1..=60, default 5
+resume_debounce_secs = 30             # 0..=300, default 30
+response = "pause_remote"             # "pause_remote" (default) | "pause_all" | "reduce_priority"
+advertisement = "coarse_state"        # "none" | "availability_only" | "coarse_state" (default) | "private_coarse_state"
+```
+
+### Operating modes
+
+- **`serve`** (default, also when the field is absent): the daemon starts mesh
+  gossip, discovery, tunnels, management, owner-control, OpenAI ingress, and
+  plugins before resolving models. Configured and CLI models load eagerly as
+  startup intents.
+- **`client`**: read-only safety boundary. The node joins the mesh and routes
+  requests but never serves local models. Persisted `client` mode conflicts
+  with explicit `serve` or `--model`/`--gguf`/`--mmproj` flags and fails
+  **before** listeners start. Remediation: change the config mode to `serve`
+  or `on_demand`, or remove the model flags.
+- **`on_demand`**: the daemon starts worker-capable but idle. Configured models
+  are preference/candidate metadata, not eager intents. Models load only when
+  explicitly requested through local commands, owner-control lifecycle
+  commands, advisory mesh demand, or explicit CLI `--model`/`--gguf`
+  arguments. Explicit CLI models remain eager startup intents.
+
+### Startup failure policy
+
+- **`best_effort`** (default): continue starting if a configured model fails to
+  load. The daemon stays alive and degraded; the error is logged.
+- **`fail_fast`**: abort startup if any eager startup model fails to load.
+  Applies **only** to eager startup intents. The daemon waits for terminal
+  outcomes, then orderly closes listeners and metadata and exits nonzero with a
+  bounded summary. Owner and advisory failures never kill the daemon.
+
+### Drain timeout
+
+- `drain_timeout_secs` (default 30): seconds before forcibly unloading a
+  draining instance after new work is rejected.
+- `drain_timeout_max_secs` (default 300): maximum allowed drain timeout cap.
+  Per-command overrides are capped by this value.
+- Force drain uses deadline 0 (immediate unload).
+
+### Host activity policy
+
+Activity adaptation is **opt-in** (`enabled = false` by default). When enabled,
+the daemon detects host activity and adapts inference admission:
+
+- `idle_after_secs` (default 300): seconds of inactivity before transitioning
+  to idle.
+- `poll_interval_secs` (default 5): how often to poll the activity detector.
+- `resume_debounce_secs` (default 30): seconds to wait after activity resumes
+  before re-enabling admission.
+- `response`: what to do when activity is detected:
+  - `pause_remote` (default): reject new inbound QUIC HTTP and stage transport
+    work; local API/OpenAI/plugin work continues.
+  - `pause_all`: also reject local OpenAI/plugin model dispatch. Management,
+    owner-control, health, status, and unload/drain remain reachable.
+  - `reduce_priority`: keep admissions open and invoke the best-effort priority
+    controller. May surface degraded status on failure.
+- `advertisement`: how to advertise admission state to mesh peers:
+  - `none`: emit nothing.
+  - `availability_only`: publish hosted/serving availability as
+    explicitly-known-and-empty while non-admitting.
+  - `coarse_state` (default): emit the admission enum and also publish
+    known-empty availability for old peers.
+  - `private_coarse_state`: emit the enum only on private meshes; use
+    known-empty availability publicly.
+
+**Platform support**: unsupported or headless platforms report `Unknown` and
+never infer idle. Manual override (`Auto`/`Active`/`Idle`) is session-only and
+not persisted in config. `reduce_priority` is best-effort: it captures the
+original process state, applies only through a safe platform capability, and
+restores on idle/shutdown.
+
+**Privacy**: no raw owner payloads, input events, app/window names, usernames,
+idle durations, timestamps, or detector errors appear in gossip, public status,
+logs, or telemetry. Only the coarse admission enum and known-empty availability
+are advertised.
+
+### Daemon states
+
+`/api/status` includes an optional `runtime.daemon_state` field derived with
+this precedence:
+
+1. `stopping` — shutdown in progress
+2. `degraded` — terminal failure or priority restoration failure
+3. `ready_serving` — local model serving inference
+4. `ready_proxying` — healthy remote/plugin route, no local serving
+5. `ready_idle` — listeners ready, no models loaded
+6. `starting` — not yet ready
+
+Coexistence is represented by capability booleans (`worker_capable`,
+`local_serving`, `proxying`, `plugin_ingress`, `accepting_local`,
+`accepting_remote`), not extra enum combinations.
+
+### Runtime status and activity API routes
+
+- `GET /api/runtime/intents` — filtered intent list, capped at 256 entries.
+  Shows durable/configured and session intents, but never raw owner payloads or
+  detector details.
+- `GET /api/runtime/activity` — current activity policy status.
+- `PUT /api/runtime/activity/override` — set manual override (`auto`/`active`/`idle`).
+- `DELETE /api/runtime/activity/override` — restore auto.
+
+### Compatibility
+
+Additive defaulted TOML needs no config-version bump. Canonical config still
+travels as TOML. Public `/0` and `/1` ALPN remain unchanged. Owner-control ALPN
+remains unchanged. Old peers treat missing admission as eligible (legacy
+behavior). New lifecycle commands may return typed `CONTROL_UNSUPPORTED` on
+older hosts.
 
 The example below shows every configuration section with annotations. All
 sections and fields are optional unless noted.
@@ -320,8 +445,8 @@ lifecycle_health_interval_ms    = 5000      # health-check interval (ms)
 
 # --- Speculative decoding ------------------------------------------------
 [defaults.speculative]
-strategy                   = "auto"          # auto disabled mtp
-mode                       = "auto"          # auto off draft ngram lookahead
+strategy                   = "auto"          # auto disabled mtp or a package strategy id
+mode                       = "auto"          # external draft-model mode: auto disabled draft
 draft_selection_policy     = "auto"          # auto manual heuristic
 pairing_fault              = "warn_disable"  # warn_disable fail_open fail_closed
 draft_acceptance_threshold = 0.0             # 0.0 = use runtime default
@@ -345,9 +470,22 @@ spec_default               = "auto"          # bool or "auto"
 # draft_cache_type_k = "q8_0"
 # draft_cache_type_v = "q8_0"
 
-# N-gram speculative (when mode = "ngram")
-# ngram_min = 1
-# ngram_max = 5
+# N-gram proposer and MTP extension.
+# `cache` is request-local and requires ngram_max <= 4; `suffix` is a pure-Rust
+# longest-suffix (prompt-lookup) matcher allowing ngram_max <= 64.
+# ngram_proposer            = "cache"  # cache | suffix
+# ngram_min                 = 2
+# ngram_max                 = 4
+# ngram_max_proposal_tokens = 6        # output budget, separate from ngram_max
+# extension_max_tokens      = 6        # fixed request-local continuation horizon
+
+# Target VerifyWindow and native-MTP recovery controls
+# verify_window_min_tokens                    = 1
+# verify_window_max_tokens                    = 6
+# verify_window_pipeline_depth                = 2
+# native_mtp_reject_cooldown_tokens           = 4
+# native_mtp_suppress_cooldown_drafts         = true
+# native_mtp_suppress_cooldown_draft_limit    = 1
 
 # --- Request defaults (merged at OpenAI frontend only) -------------------
 [defaults.request_defaults]
@@ -663,7 +801,9 @@ Use the default config:
 mesh-llm serve
 ```
 
-If no startup models are configured, `mesh-llm serve` prints a `⚠️` warning, shows help, and exits.
+If no startup models are configured, `mesh-llm serve` remains alive as a
+healthy zero-model daemon. It reports `ready_idle` while no local, plugin, or
+remote route is available, and can load a model later without restarting.
 
 Or an explicit path:
 
@@ -702,6 +842,78 @@ Config precedence:
   process launch until direct plugin use. This is useful for very slow legacy
   hosts or emulator-assisted startup paths.
 
+## Speculative decode configuration
+
+Configure speculative decoding under `[defaults.speculative]` for all staged
+models, or under `[models.speculative]` to override one configured model. CLI
+flags have the highest precedence, followed by the selected model, then
+`[defaults.speculative]`; package strategies supply the remaining declared
+defaults. The resolved plan is validated once before Skippy starts.
+
+Set `strategy = "auto"` to use a package recommendation, `"disabled"` for
+the no-speculation baseline, or `"mtp"` for native MTP. A package may also
+publish stable names such as `mtp-cache`; that name is valid only for the
+package that declares it. Direct GGUF serving can use `ngram-cache` or
+`ngram-suffix` when it supplies valid N-gram bounds.
+
+```toml
+[[models]]
+model = "meshllm/GLM-4.7-Flash-MTP-GGUF:Q4_K_M"
+
+[models.speculative]
+strategy = "mtp"
+ngram_min = 2
+ngram_max = 4
+ngram_max_proposal_tokens = 6
+extension_max_tokens = 6
+verify_window_min_tokens = 1
+verify_window_max_tokens = 6
+verify_window_pipeline_depth = 2
+```
+
+`ngram_min` and `ngram_max` determine the history match length.
+`ngram_max_proposal_tokens` is separately the maximum continuation length.
+The request-local cache is limited to `ngram_max <= 4`. N-gram settings may run
+standalone or, with native MTP, form one composite proposal. All combinations
+are verified together by the target, so tuning these values changes speculative
+work, not output correctness.
+
+The `suffix` proposer is a pure-Rust longest-suffix matcher
+("prompt-lookup decoding"). Unlike `cache` it is not bound by
+llama.cpp's 4-token match window, so it can match long verbatim repeats in the
+context (up to `ngram_max <= 64`) and copy long, high-confidence drafts. It is
+designed for input-grounded, repetitive workloads — re-emitting a file with a
+small edit, echoed tool output, repeated identifiers — and stays silent when no
+sufficiently long match exists. Benchmark the target workload before assuming
+an uplift or neutrality on freeform prose. `ngram_min` is the minimum verbatim
+match length before it drafts; draft length scales with match length up to
+`ngram_max_proposal_tokens`.
+
+```toml
+[models.speculative]
+strategy = "mtp"
+ngram_proposer = "suffix"
+ngram_min = 5
+ngram_max = 32
+ngram_max_proposal_tokens = 48
+extension_max_tokens = 48
+verify_window_min_tokens = 1
+verify_window_max_tokens = 32
+verify_window_pipeline_depth = 2
+```
+
+Suffix can also run without MTP by setting `strategy = "ngram-suffix"` and
+omitting the extension controls. Layer packages may declare `ngram-suffix` as
+a request-local proposer and standalone strategy. See
+[Suffix N-gram Proposer](skippy/SUFFIX_NGRAM_PROPOSER.md) for the lookup
+contract, telemetry, and benchmark requirements.
+
+For package-authoring rules, see
+[Layer Package Repositories](specs/layer-package-repos.md#generation-defaults).
+For strategy diagrams, CLI overrides, and the VerifyWindow telemetry used to
+evaluate a configuration, see
+[Pipelined VerifyWindow Decode](skippy/PIPELINED_VERIFY_WINDOW.md).
+
 ## Lemonade integration
 
 Use the `openai-endpoint` plugin to route requests to a local [Lemonade Server](https://lemonade-server.ai) through the same `http://localhost:9337/v1` API that mesh-llm exposes.
@@ -728,10 +940,27 @@ mesh-llm plugins install Mesh-LLM/openai-endpoint
 Then enable the plugin in `~/.mesh-llm/config.toml`:
 
 ```toml
+[runtime]
+mode = "on_demand"
+
 [[plugin]]
 name = "openai-endpoint"
 url = "http://localhost:8000/api/v1"
 ```
+
+Plugins that declare a host-projected web UI may independently disable that
+console projection while leaving the plugin process and endpoint behavior
+enabled:
+
+```toml
+[[plugin]]
+name = "example-plugin"
+enabled = true
+web_ui_enabled = false
+```
+
+`web_ui_enabled` is meaningful only for a plugin that declares a web UI. It
+does not install, start, stop, or disable the plugin process.
 
 If you are running the plugin binary yourself instead of using
 `mesh-llm plugins install`, set `command = "openai-endpoint"` in the same
@@ -740,8 +969,12 @@ plugin block.
 Start mesh-llm normally:
 
 ```bash
-mesh-llm serve --model Qwen3-8B-Q4_K_M
+mesh-llm serve
 ```
+
+No `[[models]]` entry or placeholder local model is required. `on_demand`
+prevents any configured local models from loading eagerly while preserving the
+ability to load one later.
 
 After startup, mesh-llm should include Lemonade-hosted models in its own model list:
 
@@ -767,6 +1000,8 @@ Notes:
 - mesh-llm does not start or supervise Lemonade; run it separately with the Desktop app or CLI.
 - Use the exact model ID returned by Lemonade's `/api/v1/models`.
 - mesh-llm passes the configured URL to the plugin through `MESH_LLM_PLUGIN_URL`.
+- Plugin-process health and Lemonade endpoint health are separate; verify both
+  before reinstalling the plugin.
 
 Useful model commands:
 
@@ -793,6 +1028,12 @@ mesh-llm models prune
 - Skippy materialized stage GGUFs are derived cache and can be preview-pruned
   with `mesh-llm models prune`.
 
+Model downloads validate the Hugging Face Hub cache and Xet working cache
+before worker threads start. If either location is read-only, mesh-llm warns
+with the original operating-system error and uses a writable application-data
+directory instead. `MESH_LLM_DATA_DIR` chooses that fallback root;
+`HF_HUB_CACHE` and `HF_XET_CACHE` configure the two caches directly.
+
 ## Inspect local GPUs
 
 ```bash
@@ -805,7 +1046,7 @@ This prints the local GPU inventory with stable IDs, backend device names, VRAM,
 
 ## Local runtime control
 
-Stage one supports local-only hot load and unload on a running node.
+Local hot load and unload target the running daemon on this machine.
 
 ```bash
 mesh-llm load Llama-3.2-1B-Instruct-Q4_K_M
@@ -832,16 +1073,37 @@ curl -s localhost:3131/api/status | jq '.runtime.openai_guardrails'
 The guardrail mode update is also node-local. It changes the shared
 server-side `GuardrailPolicy.mode` without restarting the process, so existing
 hosted Skippy backends and future local runtime loads observe the new mode.
-Mesh-wide rebalancing and distributed load/unload come later.
+Single-owner remote load, ensure, unload, and drain are available through the
+explicitly targeted owner-control commands below. Autonomous mesh-wide
+placement and rebalancing remain future work; owner-control is not a public
+mesh-wide load/unload mechanism.
 
 ## Owner-control plane
 
-Owner-control is the operator lane for config and inventory actions. It does **not** replace the public mesh plane used for join, gossip, routing, or inference. Config and inventory mutation are exclusive to `mesh-llm-control/1`; the old mesh-plane config stream IDs are reserved but no longer carry protobuf request/response handling.
+Owner-control is the private operator lane for commands directed at exactly one
+owner-attested node. It does **not** replace the public mesh plane used for
+join, gossip, routing, or inference. Config and inventory mutation are
+exclusive to `mesh-llm-control/1`; the old mesh-plane config stream IDs are
+reserved but no longer carry protobuf request/response handling.
+
+`scan-refresh` is the first public owned-node command. It asks the explicitly
+targeted remote node to rescan its managed model inventory, republishes the
+model names from that exact scan, and returns the refreshed inventory to the
+requester. The compatible protobuf operation remains named
+`refresh_inventory` on the wire.
 
 ### Bootstrap contract
 
-- New control clients need an explicit owner-control endpoint token.
-- Read the local bootstrap policy from `GET /api/runtime/control-bootstrap` or `mesh-llm runtime bootstrap --json`.
+- New control clients need an explicit owner-control endpoint token. The token
+  identifies and cryptographically pins one target; it is not inferred from a
+  peer ID, public gossip, Nostr, routing state, or `/api/status`.
+- Read a target node's local bootstrap policy from
+  `GET /api/runtime/control-bootstrap` or
+  `mesh-llm runtime bootstrap --json` on that node, then transfer the endpoint
+  token to the controlling node out of band.
+- The controlling node must have a valid owner key for the same owner. The
+  target verifies requester ownership against the actual QUIC connection
+  identity before dispatching a command.
 - If no explicit endpoint is supplied, the current client contract returns `ControlEndpointRequired`.
 - If an explicit endpoint is configured and fails, the client stays on owner-control and reports a structured failure. It does **not** silently fall back to mesh-plane config streams.
 
@@ -869,7 +1131,8 @@ Run owner-control requests through the local management API using an explicit en
 
 ```bash
 mesh-llm runtime get-config --port 3131 --endpoint '<control-endpoint>' --json
-mesh-llm runtime refresh-inventory --port 3131 --endpoint '<control-endpoint>' --json
+mesh-llm runtime scan-refresh --port 3131 --endpoint '<control-endpoint>'
+mesh-llm runtime scan-refresh --port 3131 --endpoint '<control-endpoint>' --json
 mesh-llm runtime apply-config \
   --port 3131 \
   --endpoint '<control-endpoint>' \
@@ -878,6 +1141,27 @@ mesh-llm runtime apply-config \
   --json
 ```
 
+Owner lifecycle commands create session-only intents on the target node. They
+never mutate durable config or TOML — use `apply-config` for persistent changes.
+
+```bash
+mesh-llm runtime load-model --port 3131 --endpoint '<control-endpoint>' --model Qwen3-8B-Q4_K_M
+mesh-llm runtime unload-model --port 3131 --endpoint '<control-endpoint>' --model Qwen3-8B-Q4_K_M
+mesh-llm runtime ensure-model --port 3131 --endpoint '<control-endpoint>' --model Qwen3-8B-Q4_K_M
+mesh-llm runtime drain-model --port 3131 --endpoint '<control-endpoint>' --model Qwen3-8B-Q4_K_M
+```
+
+- `load-model`: one-shot present intent. Returns accepted lifecycle state.
+- `ensure-model`: maintained present intent with bounded retry. Survives
+  transient load failures for the session.
+- `unload-model`: absent intent. The model is unloaded.
+- `drain-model`: draining-then-absent intent. Already-admitted work finishes;
+  new work is rejected. Unloads at zero in-flight or force-cancels at the
+  configured drain deadline.
+
+Legacy hosts that do not implement these commands return typed
+`ControlUnsupported`, not a silent fallback to the public mesh.
+
 Equivalent REST calls:
 
 ```bash
@@ -885,6 +1169,11 @@ curl -s -X POST localhost:3131/api/runtime/control/get-config \
   -H 'Content-Type: application/json' \
   -d '{"endpoint":"<control-endpoint>"}' | jq .
 
+curl -s -X POST localhost:3131/api/runtime/control/scan-refresh \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>"}' | jq .
+
+# Compatibility alias: retains the legacy snapshot-only response shape.
 curl -s -X POST localhost:3131/api/runtime/control/refresh-inventory \
   -H 'Content-Type: application/json' \
   -d '{"endpoint":"<control-endpoint>"}' | jq .
@@ -896,7 +1185,70 @@ curl -s -X POST localhost:3131/api/runtime/control/apply-config \
     "expected_revision":7,
     "config":{"version":1}
   }' | jq .
+
+curl -s -X POST localhost:3131/api/runtime/control/load-model \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>","model":"Qwen3-8B-Q4_K_M"}' | jq .
+
+curl -s -X POST localhost:3131/api/runtime/control/unload-model \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>","model":"Qwen3-8B-Q4_K_M"}' | jq .
+
+curl -s -X POST localhost:3131/api/runtime/control/ensure-model \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>","model":"Qwen3-8B-Q4_K_M"}' | jq .
+
+curl -s -X POST localhost:3131/api/runtime/control/drain-model \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>","model":"Qwen3-8B-Q4_K_M"}' | jq .
 ```
+
+The local REST facade is loopback-only. The public CLI spelling is
+`runtime scan-refresh`; the old `runtime refresh-inventory` spelling remains a
+hidden compatibility alias and continues to return the legacy config snapshot.
+Neither facade discovers a target implicitly: both require `--endpoint` (or
+the REST `endpoint` field).
+
+### Scan-refresh result
+
+The JSON response contains `target_node_id`, `disposition`, and `inventory`.
+Inventory entries are sorted by `canonical_model_ref` and contain an optional
+`display_name`, `total_size_bytes`, and optional compact model metadata. The
+metadata includes the canonical model key plus GGUF-derived architecture,
+quantization, tokenizer, dimensions, RoPE, special-token, and MoE fields when
+known. `--json` prints this response unchanged; human output summarizes the
+disposition, target, model count, total bytes, and sorted model references.
+
+`disposition` is `executed` when this request performed the scan and
+`coalesced` when it joined an already-running scan. Joined callers receive the
+same successful inventory payload. A new client talking to an older
+owner-control server may receive only the legacy wire snapshot; the command
+still succeeds, but the REST fields `disposition` and `inventory` are `null`
+and human output labels the result `compatibility-limited`. This does not mean
+released nodes support the richer response fields.
+
+Scan failures are returned to all joined callers and preserve the last good
+inventory and model advertisements. Rich inventory results stay on the private
+owner-control response path: they are not copied wholesale into peer state,
+public gossip, runtime status, or `/api/status`. Endpoint tokens and raw command
+results must not be logged or advertised. The node continues to publish only
+its existing availability projection from a successful scan.
+
+### Owner-control limits
+
+- Inbound and outbound protobuf frames are limited to 8 MiB. An oversized
+  generated response becomes `ControlUnavailable` before any oversized body is
+  written.
+- Client connect, stream-open, handshake, and request-write waits are bounded
+  at 8 seconds, 2 seconds, 2 seconds, and 2 seconds respectively.
+- Get/apply unary responses have a 5-second bound; inventory scans have a
+  30-second bound. Watch acceptance has a 5-second bound, after which an
+  accepted watch remains streaming without a unary deadline.
+- The server bounds handshake and request reads at 2 and 5 seconds and admits
+  at most 32 concurrent owner-control stream workers per connection.
+- Request IDs are non-zero. Authentication, requester binding, target binding,
+  request validation, deadline selection, and response-size enforcement occur
+  in the common dispatcher path.
 
 ### Failure modes
 

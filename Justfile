@@ -87,55 +87,65 @@ with-lld *COMMAND:
 with-lld *COMMAND:
     @powershell -NoProfile -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = 'Stop'; $$linker = $$null; try { $$sysroot = (& rustc --print sysroot).Trim(); foreach ($$target in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) { $$candidate = Join-Path $$sysroot \"lib\rustlib\$$target\bin\rust-lld.exe\"; if (Test-Path $$candidate) { $$linker = $$candidate; break } } } catch {}; if (-not $$linker) { foreach ($$name in @('rust-lld.exe', 'lld-link.exe')) { $$command = Get-Command $$name -ErrorAction SilentlyContinue; if ($$command) { $$linker = $$command.Source; break } } }; if (-not $$linker) { Write-Error \"LLVM lld was not found for the Windows MSVC target.`n`nlld is required for faster Rust builds (measured up to 26% faster locally).`n`nInstall one of these, then rerun the just command:`n  rustup component add llvm-tools-preview`n`nOr install LLVM lld-link:`n  winget install LLVM.LLVM`n  choco install llvm`n`nThe build requires lld. It looks for rust-lld.exe in the active Rust sysroot first, then falls back to rust-lld.exe or lld-link.exe on PATH.\"; exit 1 }; $$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $$linker; $$env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER = $$linker; Invoke-Expression '{{ COMMAND }}'"
 
-# Build for the current platform (macOS Metal ABI, Linux/Windows auto ABI backend)
+# Build a local product for the current platform. This is always a
+# backend-neutral dynamic host plus an adjacent packaged runtime.
 [macos]
-build: build-mac
+build backend="" cuda_arch="" rocm_arch="":
+    @scripts/build-development-product.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
 
-# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+# Fast local iteration build: dynamic host + adjacent native runtime + UI.
 [macos]
 build-dev:
-    @MESH_LLM_BUILD_PROFILE=dev scripts/build-mac.sh
+    @MESH_LLM_BUILD_PROFILE=dev scripts/build-development-product.sh --profile dev
 
 # Linux overrides:
 #   just build backend=cpu
 #   just build backend=cuda cuda_arch='120;86'
 #   just build backend=rocm rocm_arch='gfx942;gfx90a'
-#   just build backend=vulkan
+# just build backend=vulkan
 [linux]
 build backend="" cuda_arch="" rocm_arch="":
-    @scripts/build-linux.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+    @scripts/build-development-product.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
 
-# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+# Fast local iteration build: dynamic host + adjacent native runtime + UI.
 [linux]
 build-dev backend="" cuda_arch="" rocm_arch="":
-    @MESH_LLM_BUILD_PROFILE=dev scripts/build-linux.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+    @MESH_LLM_BUILD_PROFILE=dev scripts/build-development-product.sh --profile dev --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
 
 # Windows overrides:
 #   just build backend=cpu
 #   just build backend=cuda cuda_arch='120;86'
 #   just build backend=rocm rocm_arch='gfx942;gfx90a'
-#   just build backend=vulkan
+# just build backend=vulkan
 [windows]
 build backend="" cuda_arch="" rocm_arch="":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend "{{backend}}" -CudaArch "{{cuda_arch}}" -RocmArch "{{rocm_arch}}"
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend "{{ backend }}" -CudaArch "{{ cuda_arch }}" -RocmArch "{{ rocm_arch }}" -DynamicHost
 
-# Fast local iteration build: patched llama.cpp + UI + debug mesh-llm.
+# Fast local iteration build: dynamic host + adjacent native runtime + UI.
 [windows]
 build-dev backend="" cuda_arch="" rocm_arch="":
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:MESH_LLM_BUILD_PROFILE='dev'; & './scripts/build-windows.ps1' -Backend '{{backend}}' -CudaArch '{{cuda_arch}}' -RocmArch '{{rocm_arch}}'"
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:MESH_LLM_BUILD_PROFILE='dev'; & './scripts/build-windows.ps1' -Backend '{{ backend }}' -CudaArch '{{ cuda_arch }}' -RocmArch '{{ rocm_arch }}' -DynamicHost"
 
-# Build on macOS Apple Silicon (Metal ABI)
+# Low-level static ABI primitive. This builds only the native runtime; it never
+# builds a MeshLLM host. Use `just build` for normal development.
 build-mac:
-    @scripts/build-mac.sh
+    @scripts/package-native-runtime.sh --build --backend metal
 
-# Build patched llama.cpp ABI and mesh-llm on Linux
+# Low-level static ABI primitive. This builds only the native runtime; it never
+# builds a MeshLLM host. Use `just build` for normal development.
 build-linux backend="" cuda_arch="" rocm_arch="":
-    @scripts/build-linux.sh --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    backend="{{ backend }}"
+    [[ -n "$backend" ]] || backend=cpu
+    LLAMA_STAGE_CUDA_ARCHITECTURES="{{ cuda_arch }}" LLAMA_STAGE_AMDGPU_TARGETS="{{ rocm_arch }}" scripts/package-native-runtime.sh --build --backend "$backend"
 
-# Build patched llama.cpp ABI and mesh-llm on Linux without rebuilding the UI.
+# Backward-compatible spelling for the explicit native-runtime primitive.
 [linux]
 build-runtime backend="" cuda_arch="" rocm_arch="":
-    @scripts/build-linux.sh --skip-ui --backend "{{ backend }}" --cuda-arch "{{ cuda_arch }}" --rocm-arch "{{ rocm_arch }}"
+    @backend="{{ backend }}"; \
+      [[ -n "$$backend" ]] || backend=cpu; \
+      LLAMA_STAGE_CUDA_ARCHITECTURES="{{ cuda_arch }}" LLAMA_STAGE_AMDGPU_TARGETS="{{ rocm_arch }}" scripts/package-native-runtime.sh --build --backend "$$backend"
 
 # Build release artifacts for the current platform.
 
@@ -143,21 +153,38 @@ build-runtime backend="" cuda_arch="" rocm_arch="":
 release version *ARGS:
     @scripts/release.sh "{{ version }}" {{ ARGS }}
 
-# Release builds default to dynamic native runtimes. Set
-# MESH_LLM_DYNAMIC_NATIVE_RUNTIME=0 when validating a release binary with
-# branch-local llama.cpp ABI changes embedded.
-release-build:
+# Build the backend-neutral release host once for the current platform.
+release-host-build:
     @scripts/build-release.sh
 
+# Build one packageable native runtime for the current platform.
+release-runtime-build backend="" target="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    selected_backend="{{ backend }}"
+    if [[ -z "$selected_backend" ]]; then
+        if [[ "$(uname -s)" == Darwin ]]; then selected_backend=metal; else selected_backend=cpu; fi
+    fi
+    if [[ -n "{{ target }}" ]]; then
+        scripts/package-native-runtime.sh --build --backend "$selected_backend" --target "{{ target }}"
+    else
+        scripts/package-native-runtime.sh --build --backend "$selected_backend"
+    fi
+
+# Build the backend-neutral host and the default runtime for this platform.
+release-build: release-host-build release-runtime-build
+
 # Build a Linux aarch64 CPU release artifact on a native aarch64 runner.
-release-build-aarch64:
-    @scripts/build-release.sh
+release-build-aarch64: release-host-build
+    @scripts/package-native-runtime.sh --build --backend cpu --target aarch64-unknown-linux-gnu
 
 # Build a Linux aarch64 CUDA release artifact (Jetson/Orin).
 # SM arches selected by MESH_CUDA_VERSION env (set by CI matrix).
-release-build-aarch64-cuda:
-    @MESH_LLM_BUILD_PROFILE=release MESH_RELEASE_ARCH=aarch64 scripts/build-linux.sh --backend cuda \
-      --cuda-arch "$(if [[ "${MESH_CUDA_VERSION:-}" == 13.* ]]; then echo '75;80;86;87;89;90;110'; else echo '75;80;86;87;89;90'; fi)"
+release-build-aarch64-cuda: release-host-build
+    @cuda_version="${MESH_CUDA_VERSION:-12}"; \
+      MESH_LLM_CUDA_TOOLKIT_MAJOR="${MESH_LLM_CUDA_TOOLKIT_MAJOR:-${cuda_version%%.*}}" \
+      LLAMA_STAGE_CUDA_ARCHITECTURES="$(if [[ "$cuda_version" == 13.* ]]; then echo '75;80;86;87;89;90;110'; else echo '75;80;86;87;89;90'; fi)" \
+      scripts/package-native-runtime.sh --build --backend cuda --target aarch64-unknown-linux-gnu
 
 # Prepare the pinned llama.cpp checkout and apply the Mesh-LLM ABI patch queue.
 llama-prepare:
@@ -172,30 +199,36 @@ llama-build: llama-prepare
     @scripts/build-llama.sh
 
 release-build-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cpu -BuildProfile release
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cpu -BuildProfile release -DynamicHost
+
+release-host-build-windows:
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -BuildProfile release -HostOnly
 
 # Build a Linux CUDA release artifact.
 # SM arches selected by MESH_CUDA_VERSION env (set by CI matrix).
-release-build-cuda:
-    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux.sh --backend cuda \
-      --cuda-arch "$(if [[ "${MESH_CUDA_VERSION:-}" == 13.* ]]; then echo '75;80;86;87;89;90;100;103;120;121'; else echo '75;80;86;87;89;90'; fi)"
+release-build-cuda: release-host-build
+    @cuda_version="${MESH_CUDA_VERSION:-12}"; \
+      MESH_LLM_CUDA_TOOLKIT_MAJOR="${MESH_LLM_CUDA_TOOLKIT_MAJOR:-${cuda_version%%.*}}" \
+      LLAMA_STAGE_CUDA_ARCHITECTURES="$(if [[ "$cuda_version" == 13.* ]]; then echo '75;80;86;87;89;90;100;103;120;121'; else echo '75;80;86;87;89;90'; fi)" \
+      scripts/package-native-runtime.sh --build --backend cuda --target x86_64-unknown-linux-gnu
 
 release-build-cuda-windows cuda_arch="75;80;86;87;89;90":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{cuda_arch}}" -BuildProfile release
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend cuda -CudaArch "{{ cuda_arch }}" -BuildProfile release -DynamicHost
 
 # Build a Linux ROCm ABI release artifact with an explicit architecture list.
-release-build-rocm rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
-    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux-rocm.sh "{{ rocm_arch }}"
+release-build-rocm rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1103;gfx1151;gfx1200;gfx1201": release-host-build
+    @LLAMA_STAGE_AMDGPU_TARGETS="{{ rocm_arch }}" \
+      scripts/package-native-runtime.sh --build --backend rocm --target x86_64-unknown-linux-gnu
 
-release-build-rocm-windows rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend rocm -RocmArch "{{rocm_arch}}" -BuildProfile release
+release-build-rocm-windows rocm_arch="gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1103;gfx1151;gfx1200;gfx1201":
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend rocm -RocmArch "{{ rocm_arch }}" -BuildProfile release -DynamicHost
 
 # Build a Linux Vulkan ABI release artifact.
-release-build-vulkan:
-    @MESH_LLM_BUILD_PROFILE=release scripts/build-linux.sh --backend vulkan
+release-build-vulkan: release-host-build
+    @scripts/package-native-runtime.sh --build --backend vulkan --target x86_64-unknown-linux-gnu
 
 release-build-vulkan-windows:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend vulkan -BuildProfile release
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -Backend vulkan -BuildProfile release -DynamicHost
 
 # Build the skippy benchmark/debug telemetry collector.
 [unix]
@@ -233,11 +266,15 @@ skippy-quantize-release-build:
 # llama.cpp quantization ABI linked into the executable.
 [unix]
 skippy-quantize-standalone-build backend="cpu":
-    LLAMA_STAGE_BACKEND="{{ backend }}" LLAMA_STAGE_LINK_MODE=static just with-lld cargo build -p skippy-quantize
+    scripts/prepare-llama.sh pinned
+    LLAMA_STAGE_BACKEND="{{ backend }}" LLAMA_STAGE_LINK_MODE=static scripts/build-llama.sh
+    LLAMA_STAGE_BACKEND="{{ backend }}" LLAMA_STAGE_LINK_MODE=static just with-lld cargo build -p skippy-quantize --no-default-features
 
 [unix]
 skippy-quantize-standalone-release-build backend="cpu":
-    LLAMA_STAGE_BACKEND="{{ backend }}" LLAMA_STAGE_LINK_MODE=static just with-lld cargo build --release --locked -p skippy-quantize
+    scripts/prepare-llama.sh pinned
+    LLAMA_STAGE_BACKEND="{{ backend }}" LLAMA_STAGE_LINK_MODE=static scripts/build-llama.sh
+    LLAMA_STAGE_BACKEND="{{ backend }}" LLAMA_STAGE_LINK_MODE=static just with-lld cargo build --release --locked -p skippy-quantize --no-default-features
 
 # Generate a reproducible benchmark corpus for skippy bench tooling.
 bench-corpus tier="smoke" *ARGS="":
@@ -275,11 +312,11 @@ download-model:
 
 # ── QUIC Mesh ──────────────────────────────────────────────────
 
-mesh_bin := "target/release/mesh-llm"
+mesh_bin := env("MESH_LLM_BIN", "target/release/mesh-llm")
 
 # Prints an invite token for other nodes to join.
 mesh-worker gguf=model:
-    {{ mesh_bin }} --model {{ gguf }}
+    "{{ mesh_bin }}" --model {{ gguf }}
 
 # Join an existing mesh and serve through the embedded runtime.
 mesh-join join="" port="9337" gguf=model split="":
@@ -292,24 +329,36 @@ mesh-join join="" port="9337" gguf=model split="":
     if [ -n "{{ split }}" ]; then
         ARGS="$ARGS --tensor-split {{ split }}"
     fi
-    exec {{ mesh_bin }} $ARGS
+    exec "{{ mesh_bin }}" $ARGS
 
-# Create a portable tarball with all binaries for deployment to another machine.
-bundle output="/tmp/mesh-llm-bundle.tar.gz":
+# Create a portable product tarball containing the neutral host and default runtime.
+bundle output="/tmp/mesh-llm-bundle.tar.gz": release-build
     #!/usr/bin/env bash
     set -euo pipefail
-    DIR=$(mktemp -d)
-    BUNDLE="$DIR/mesh-bundle"
-    mkdir -p "$BUNDLE"
-    cp {{ mesh_bin }} "$BUNDLE/"
-    # Fix rpaths for portability
-    for bin in "$BUNDLE/mesh-llm"; do
-        [ -f "$bin" ] || continue
-        install_name_tool -add_rpath @executable_path/ "$bin" 2>/dev/null || true
+    staging_dir="$(mktemp -d)"
+    trap 'rm -rf "$staging_dir"' EXIT
+    version="v$("{{ mesh_bin }}" --version | awk '{print $NF}')"
+    scripts/package-release.sh "$version" "$staging_dir"
+    stable_archive=""
+    for candidate in "$staging_dir"/mesh-llm-*.tar.gz; do
+        [[ -f "$candidate" ]] || continue
+        case "$(basename "$candidate")" in
+            mesh-llm-"$version"-*) continue ;;
+        esac
+        if [[ -n "$stable_archive" ]]; then
+            echo "multiple stable product archives were produced" >&2
+            exit 1
+        fi
+        stable_archive="$candidate"
     done
-    tar czf {{ output }} -C "$DIR" mesh-bundle/
-    rm -rf "$DIR"
-    echo "Bundle: {{ output }} ($(du -sh {{ output }} | cut -f1))"
+    if [[ -z "$stable_archive" ]]; then
+        echo "product packaging did not produce a stable archive" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "{{ output }}")"
+    cp "$stable_archive" "{{ output }}"
+    cp "$stable_archive.sha256" "{{ output }}.sha256"
+    echo "Bundle: {{ output }} ($(du -sh "{{ output }}" | cut -f1))"
 
 # Create release archive(s) for the current platform.
 
@@ -335,28 +384,28 @@ check-release:
     @just with-lld cargo run -p xtask -- repo-consistency release-targets
 
 release-bundle-windows version output="dist":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}"
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}"
 
 # Create Linux CUDA release archive(s).
 release-bundle-cuda version output="dist":
     MESH_RELEASE_FLAVOR=cuda scripts/package-release.sh "{{ version }}" "{{ output }}"
 
 release-bundle-cuda-windows version output="dist":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor cuda
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}" -Flavor cuda
 
 # Create Linux ROCm release archive(s).
 release-bundle-rocm version output="dist":
     MESH_RELEASE_FLAVOR=rocm scripts/package-release.sh "{{ version }}" "{{ output }}"
 
 release-bundle-rocm-windows version output="dist":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor rocm
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}" -Flavor rocm
 
 # Create Linux Vulkan release archive(s).
 release-bundle-vulkan version output="dist":
     MESH_RELEASE_FLAVOR=vulkan scripts/package-release.sh "{{ version }}" "{{ output }}"
 
 release-bundle-vulkan-windows version output="dist":
-    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{version}}" -OutputDir "{{output}}" -Flavor vulkan
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version "{{ version }}" -OutputDir "{{ output }}" -Flavor vulkan
 
 # Run the UI dev server with Vite HMR, proxying /api to mesh-llm (default: http://127.0.0.1:3131)
 ui-dev api="http://127.0.0.1:3131" port="5173":
@@ -386,10 +435,19 @@ ui-test:
 
 # ── Full Validation Gate ───────────────────────────────────────
 
-# Run all checks: repo consistency, Rust tests, fmt, clippy, ESLint, Prettier, E2E smoke.
+# Run all checks: repo consistency, Rust tests, author exemplars, fmt, clippy, UI/docs builds, and E2E smoke.
 test-all:
     #!/usr/bin/env bash
     set -euo pipefail
+
+    echo "=== 0/11 Test-all rust crate coverage preflight ==="
+    just with-lld cargo run -p xtask -- repo-consistency test-all-rust-crate-coverage
+
+    # A full workspace gate otherwise leaves hundreds of incompatible
+    # incremental feature graphs behind. CI already builds non-incrementally;
+    # use the same bounded-disk behavior here unless explicitly overridden.
+    export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+    dynamic_target_dir="${MESH_TEST_ALL_DYNAMIC_TARGET_DIR:-$PWD/target/test-all-dynamic}"
 
     native_backend="${LLAMA_STAGE_BACKEND:-${SKIPPY_LLAMA_BACKEND:-${LLAMA_BACKEND:-}}}"
     if [[ -z "$native_backend" ]]; then
@@ -412,95 +470,84 @@ test-all:
     echo ""
 
     # Each UI step runs in a subshell so cd doesn't leak between steps.
-    echo "=== 1/8 Repo consistency ==="
+    echo "=== 1/11 Repo consistency ==="
     just with-lld cargo run -p xtask -- repo-consistency ci-crate-lists
+    just with-lld cargo run -p xtask -- repo-consistency publish-crates
     echo ""
-    echo "=== 2/8 Rust format check ==="
+    echo "=== 2/11 Rust format check ==="
     just with-lld cargo fmt --all -- --check
     echo ""
-    echo "=== GPU bench Rust feature check ==="
-    MESH_LLM_GPU_BENCH_RUST_ONLY=1 just with-lld cargo check -p mesh-llm-gpu-bench --features cuda,hip,intel
+    echo "=== 3/11 GPU bench crate check ==="
+    just with-lld cargo check -p mesh-llm-gpu-bench
     echo ""
-    echo "=== 3/8 Clippy ==="
-    mapfile -t clippy_crates < <(bash scripts/plan-clippy-batches.sh --all --bins 1 | jq -r '.[].crates[]')
-    for crate in "${clippy_crates[@]}"; do
-        echo "--- $crate ---"
-        just with-lld cargo clippy -p "$crate" --all-targets -- -D warnings
-    done
+    echo "=== 4-5/11 Rust validation ==="
+    # Keep Clippy and tests adjacent for each compatible feature graph. Switching
+    # dynamic -> static -> dynamic -> static forces Cargo to relink both graphs.
+    echo "--- Dynamic-runtime bindings: Clippy ---"
+    CARGO_TARGET_DIR="$dynamic_target_dir" just with-lld cargo clippy \
+        -p mesh-llm-ffi \
+        -p mesh-llm-nodejs \
+        -p skippy-ffi \
+        -p skippy-quantize \
+        --all-targets -- -D warnings
+    echo "--- Dynamic-runtime bindings: tests ---"
+    CARGO_TARGET_DIR="$dynamic_target_dir" just with-lld cargo test \
+        -p mesh-llm-ffi \
+        -p mesh-llm-nodejs \
+        -p skippy-ffi \
+        -p skippy-quantize
+    echo "--- Static development workspace: Clippy ---"
+    just with-lld cargo clippy --workspace --all-targets \
+        --exclude mesh-llm-ffi \
+        --exclude mesh-llm-nodejs \
+        --exclude skippy-ffi \
+        --exclude skippy-quantize \
+        -- -D warnings
+    echo "--- Static development workspace: tests ---"
+    just with-lld cargo test --workspace \
+        --exclude mesh-llm-ffi \
+        --exclude mesh-llm-nodejs \
+        --exclude skippy-ffi \
+        --exclude skippy-quantize \
+        --exclude skippy-runtime \
+        --exclude skippy-server
+    echo "--- Static Skippy runtime tests ---"
+    just with-lld cargo test --package skippy-runtime --no-default-features --lib
+    echo "--- Static Skippy server tests ---"
+    just with-lld cargo test --package skippy-server --no-default-features --lib
     echo ""
-    echo "=== 4/8 Rust tests ==="
-    echo "--- mesh-llm-host-runtime lib ---"
-    just with-lld cargo test -p mesh-llm-host-runtime --lib
-    echo "--- mesh-llm ---"
-    just with-lld cargo test -p mesh-llm
-    echo "--- mesh-llm-protocol ---"
-    just with-lld cargo test -p mesh-llm-protocol
-    echo "--- mesh-llm-client ---"
-    just with-lld cargo test -p mesh-llm-client
-    echo "--- skippy-runtime lib ---"
-    just with-lld cargo test -p skippy-runtime --lib
+    echo "=== 6/11 Plugin author exemplar ==="
+    just with-lld cargo run --quiet --manifest-path docs/plugins/exemplars/web-ui/Cargo.toml -- --print-package-manifest > target/web-ui-exemplar-manifest.json
+    diff -u <(jq -S . docs/plugins/exemplars/web-ui/plugin.package.json) <(jq -S . target/web-ui-exemplar-manifest.json)
+    node --check docs/plugins/exemplars/web-ui/bundle/register-mesh-plugin-ui.js
+    (cd "{{ ui_dir }}" && pnpm exec tsc --ignoreConfig --noEmit --target ES2022 --module ESNext --moduleResolution Bundler --lib ES2022,DOM ../../docs/plugins/exemplars/web-ui/bundle/register-mesh-plugin-ui.ts)
     echo ""
-    echo "=== 5/8 ESLint + Prettier ==="
-    (cd "{{ ui_dir }}" && pnpm run lint)
+    echo "=== 7-10/11 Parallel portable checks and builds ==="
+    scripts/test-portable.sh
     echo ""
-    echo "=== 6/8 UI type check (tsc) ==="
-    (cd "{{ ui_dir }}" && pnpm run typecheck)
-    echo ""
-    echo "=== 7/8 UI unit tests (vitest) ==="
-    (cd "{{ ui_dir }}" && pnpm test)
-    echo ""
-    echo "=== 8/8 E2E smoke tests (Playwright) ==="
-    if curl -sf http://127.0.0.1:3131/health >/dev/null 2>&1; then
-        (cd "{{ ui_dir }}" && pnpm run test:e2e)
-    else
-        echo "No server on port 3131 — starting UI dev server with public mesh..."
-
-        # Start dev server in background, capture PID tree for cleanup
-        MESH_UI_API_ORIGIN="https://public.meshllm.cloud" VITE_API_URL="https://public.meshllm.cloud" bash -c 'cd "{{ ui_dir }}" && pnpm exec vite --host 0.0.0.0 --port 5173' &
-        DEV_PID=$!
-
-        # Wait for dev server to be ready (up to 30s)
-        READY=false
-        for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:5173/ >/dev/null 2>&1; then
-                READY=true
-                break
-            fi
-            sleep 1
-        done
-
-        # Cleanup function - always stop the dev server
-        cleanup_dev() {
-            kill $DEV_PID 2>/dev/null || true
-            wait $DEV_PID >/dev/null 2>&1 || true
-        }
-
-        if [ "$READY" = true ]; then
-            (cd "{{ ui_dir }}" && PLAYWRIGHT_PORT=5173 pnpm run test:e2e e2e/smoke/home.spec.ts e2e/smoke/topnav-responsive.spec.ts)
-            E2E_EXIT=$?
-            cleanup_dev
-            echo "Stopped UI dev server."
-
-            exit $E2E_EXIT
-        else
-            cleanup_dev
-            echo "WARNING: UI dev server didn't start in time — skipping E2E tests."
-            echo "Run E2E manually:"
-            echo "  cd {{ ui_dir }} && pnpm run test:e2e"
-        fi
-    fi
+    echo "=== 11/11 E2E smoke tests (Playwright) ==="
+    (cd "{{ ui_dir }}" && pnpm run test:e2e)
     echo ""
     echo "All checks passed."
 
 # Start a lite client — no GPU, no model, just a local HTTP proxy to the mesh host.
 
 # Only needs the mesh-llm binary (no llama.cpp binaries or model).
-mesh-client join="" port="9337":
-    {{ mesh_bin }} --client --port {{ port }} --join {{ join }}
+mesh-client join="" port="9337" console="3131" config="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(client --port "{{ port }}" --console "{{ console }}")
+    if [[ -n "{{ join }}" ]]; then
+        args+=(--join "{{ join }}")
+    fi
+    if [[ -n "{{ config }}" ]]; then
+        args+=(--config "{{ config }}")
+    fi
+    "{{ mesh_bin }}" "${args[@]}"
 
 # Build and auto-join a mesh (discover via Nostr)
 auto: build
-    {{ mesh_bin }} --auto
+    "{{ mesh_bin }}" --auto
 
 # ── Utilities ──────────────────────────────────────────────────
 

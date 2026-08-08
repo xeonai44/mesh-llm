@@ -8,11 +8,18 @@ use super::local::{
 };
 use hf_hub::{RepoType, RepoTypeModel};
 
+/// Prefix of synthetic model refs produced by `model-hf` for local GGUF files
+/// that cannot be mapped back to a Hugging Face repo/file identity.
+const SYNTHETIC_LOCAL_GGUF_PREFIX: &str = "local-gguf/";
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LocalModelInventorySnapshot {
     pub model_names: HashSet<String>,
     pub size_by_name: HashMap<String, u64>,
     pub metadata_by_name: HashMap<String, crate::proto::node::CompactModelMetadata>,
+    /// Human-readable labels (GGUF file stems) for synthetic `local-gguf/...`
+    /// keys, which would otherwise leak into user-facing display names.
+    pub display_name_by_name: HashMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -53,6 +60,15 @@ struct InventoryScanEntry {
     quantization_type: String,
     scans_metadata: bool,
     missing_cache_file: bool,
+}
+
+fn synthetic_local_display_name(entry: &InventoryScanEntry) -> Option<String> {
+    entry
+        .model_key
+        .starts_with(SYNTHETIC_LOCAL_GGUF_PREFIX)
+        .then(|| entry.path.file_stem())
+        .flatten()
+        .map(|stem| stem.to_string_lossy().into_owned())
 }
 
 impl CachedCompactModelMetadata {
@@ -317,6 +333,12 @@ where
     let mut snapshot = LocalModelInventorySnapshot::default();
     for entry in entries {
         snapshot.model_names.insert(entry.model_key.clone());
+        if let Some(display_name) = synthetic_local_display_name(&entry) {
+            snapshot
+                .display_name_by_name
+                .entry(entry.model_key.clone())
+                .or_insert(display_name);
+        }
         snapshot
             .size_by_name
             .entry(entry.model_key.clone())
@@ -347,6 +369,60 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    #[cfg(unix)]
+    #[test]
+    fn synthetic_display_name_preserves_non_utf8_file_stems_lossily() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let entry = InventoryScanEntry {
+            path: PathBuf::from(std::ffi::OsString::from_vec(b"Model-\xff.gguf".to_vec())),
+            size: 0,
+            model_key: format!("{SYNTHETIC_LOCAL_GGUF_PREFIX}hash"),
+            quantization_type: String::new(),
+            scans_metadata: false,
+            missing_cache_file: false,
+        };
+
+        assert_eq!(
+            synthetic_local_display_name(&entry).as_deref(),
+            Some("Model-�")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synthetic_display_name_preserves_ill_formed_utf16_file_stems_lossily() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = std::ffi::OsString::from_wide(&[
+            b'M' as u16,
+            b'o' as u16,
+            b'd' as u16,
+            b'e' as u16,
+            b'l' as u16,
+            b'-' as u16,
+            0xd800,
+            b'.' as u16,
+            b'g' as u16,
+            b'g' as u16,
+            b'u' as u16,
+            b'f' as u16,
+        ]);
+        let entry = InventoryScanEntry {
+            path: PathBuf::from(path),
+            size: 0,
+            model_key: format!("{SYNTHETIC_LOCAL_GGUF_PREFIX}hash"),
+            quantization_type: String::new(),
+            scans_metadata: false,
+            missing_cache_file: false,
+        };
+
+        assert_eq!(
+            synthetic_local_display_name(&entry).as_deref(),
+            Some("Model-�")
+        );
+    }
+
     struct EnvGuard {
         key: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -355,14 +431,18 @@ mod tests {
     impl EnvGuard {
         fn set_path(key: &'static str, value: &Path) -> Self {
             let previous = std::env::var_os(key);
-            // TODO: Audit that the environment access only happens in single-threaded code.
+            // SAFETY: inventory tests using this guard are annotated `#[serial]`,
+            // so this process environment key is mutated only while the test owns
+            // the guard.
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var_os(key);
-            // TODO: Audit that the environment access only happens in single-threaded code.
+            // SAFETY: inventory tests using this guard are annotated `#[serial]`,
+            // so this process environment key is mutated only while the test owns
+            // the guard.
             unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
@@ -371,10 +451,12 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             if let Some(value) = &self.previous {
-                // TODO: Audit that the environment access only happens in single-threaded code.
+                // SAFETY: restoration runs during drop in the same `#[serial]`
+                // inventory test that performed the mutation.
                 unsafe { std::env::set_var(self.key, value) };
             } else {
-                // TODO: Audit that the environment access only happens in single-threaded code.
+                // SAFETY: restoration runs during drop in the same `#[serial]`
+                // inventory test that performed the mutation.
                 unsafe { std::env::remove_var(self.key) };
             }
         }
@@ -398,10 +480,12 @@ mod tests {
 
     fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
         if let Some(value) = value {
-            // TODO: Audit that the environment access only happens in single-threaded code.
+            // SAFETY: callers are `#[serial]` inventory tests restoring the same
+            // process environment key they mutated earlier in the test.
             unsafe { std::env::set_var(key, value) };
         } else {
-            // TODO: Audit that the environment access only happens in single-threaded code.
+            // SAFETY: callers are `#[serial]` inventory tests restoring the same
+            // process environment key they mutated earlier in the test.
             unsafe { std::env::remove_var(key) };
         }
     }
@@ -424,11 +508,14 @@ mod tests {
         let model = temp.join("Inventory-Root-Q4_K_M.gguf");
         std::fs::write(&model, b"gguf").unwrap();
 
-        // TODO: Audit that the environment access only happens in single-threaded code.
+        // SAFETY: this `#[serial]` inventory test owns the process environment
+        // keys it mutates until explicit restoration below.
         unsafe { std::env::set_var("HF_HUB_CACHE", &temp) };
-        // TODO: Audit that the environment access only happens in single-threaded code.
+        // SAFETY: this `#[serial]` inventory test owns the process environment
+        // keys it mutates until explicit restoration below.
         unsafe { std::env::remove_var("HF_HOME") };
-        // TODO: Audit that the environment access only happens in single-threaded code.
+        // SAFETY: this `#[serial]` inventory test owns the process environment
+        // keys it mutates until explicit restoration below.
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
 
         let paths = local_gguf_paths();
@@ -463,13 +550,17 @@ mod tests {
         let model = snapshot_dir.join("Inventory-Snapshot-Q4_K_M.gguf");
         std::fs::write(&model, b"gguf").unwrap();
 
-        // TODO: Audit that the environment access only happens in single-threaded code.
+        // SAFETY: this `#[serial]` inventory test owns the process environment
+        // keys it mutates until explicit restoration below.
         unsafe { std::env::set_var("HF_HUB_CACHE", &temp) };
-        // TODO: Audit that the environment access only happens in single-threaded code.
+        // SAFETY: this `#[serial]` inventory test owns the process environment
+        // keys it mutates until explicit restoration below.
         unsafe { std::env::remove_var("HF_HOME") };
-        // TODO: Audit that the environment access only happens in single-threaded code.
+        // SAFETY: this `#[serial]` inventory test owns the process environment
+        // keys it mutates until explicit restoration below.
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
-        // TODO: Audit that the environment access only happens in single-threaded code.
+        // SAFETY: this `#[serial]` inventory test owns the process environment
+        // keys it mutates until explicit restoration below.
         unsafe { std::env::remove_var("MESH_LLM_ALLOW_FULL_HF_CACHE_SCAN") };
 
         let paths = local_gguf_paths();

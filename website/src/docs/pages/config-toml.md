@@ -24,11 +24,11 @@ Controls GPU assignment and parallelism.
 ```toml
 [gpu]
 assignment = "auto"       # "auto" (default) or "pinned"
-parallel  = {}            # Optional GPU parallel config map
+parallel  = 2              # Optional total parallel inference slots
 ```
 
 - `assignment` — `"auto"` lets mesh-llm assign GPUs dynamically; `"pinned"` locks models to specific GPUs.
-- `parallel` — map of device type to parallel config (rarely needed; `auto` handles most cases).
+- `parallel` — optional total parallel inference-slot count. Omit it to let the runtime choose.
 
 ## Owner Control
 
@@ -36,12 +36,12 @@ Network identity and binding.
 
 ```toml
 [owner_control]
-bind           = "[::]:9337"   # Listen address for inference API
-advertise_addr = ""             # Override advertised address (auto-detected if empty)
+bind           = "[::]:7447"   # Mesh owner-control listen address
+advertise_addr = ""             # Override the address advertised to peers
 ```
 
-- `bind` — address and port for the inference HTTP server. Default `[::]:9337`.
-- `advertise_addr` — advertised address for mesh discovery. Auto-detected when empty. Set this explicitly for NAT or Docker setups.
+- `bind` — address and port for the owner-control endpoint. The inference API remains on `9337` unless changed by the runtime surface.
+- `advertise_addr` — address and port announced to peers. Auto-detected when empty; set it explicitly for NAT or Docker setups.
 
 ## Telemetry
 
@@ -68,31 +68,67 @@ Peer compatibility constraints.
 
 ```toml
 [mesh_requirements]
-min_node_protocol         = 0    # Minimum acceptable peer protocol version
-max_node_protocol         = 0    # Maximum acceptable peer protocol version
-min_release_version       = ""   # Minimum release version string
+# Optional node/release bounds. Omit these unless the mesh needs an admission gate.
+# min_node_version         = "0.72.0"
+# max_node_version         = "0.72.1"
+min_protocol_version      = 0    # Minimum acceptable peer protocol version
+max_protocol_version      = 0    # Maximum acceptable peer protocol version
 require_release_attestation = false
-release_signer_keys       = []   # List of allowed release signer public keys
+release_signer_keys       = []   # Allowed release signer public keys
 ```
 
-- `min_node_protocol` / `max_node_protocol` — constrain which protocol versions to accept. `0` means no constraint.
-- `min_release_version` — reject peers running older release versions. Empty means no constraint.
+- `min_node_version` / `max_node_version` — optional semantic-version bounds for peers.
+- `min_protocol_version` / `max_protocol_version` — constrain peer protocol versions. `0` means no constraint.
 - `release_signer_keys` — if set, only accept peers whose release binary is signed by one of these keys.
 
 ## Runtime
 
-Runtime behavior and model reconciliation.
+Runtime mode, startup behavior, draining, activity-aware admission, and model
+reconciliation.
 
 ```toml
 [runtime]
-reconcile_model_targets              = true
+mode = "serve"
+startup_failure_policy = "best_effort"
+drain_timeout_secs = 30
+drain_timeout_max_secs = 300
+reconcile_model_targets                = false
 reconcile_model_target_demand_upgrades = false
-model_target_demand_upgrade_interval_secs = 300
-model_target_demand_upgrade_threshold = 0
-model_target_demand_upgrade_min_wait_secs = 0
+model_target_demand_upgrade_min_requests = 2
+model_target_demand_upgrade_max_age_secs = 3600
+
+[runtime.activity]
+enabled = false
+idle_after_secs = 300
+poll_interval_secs = 5
+resume_debounce_secs = 30
+response = "pause_remote"
+advertisement = "coarse_state"
 ```
 
-Model target reconciliation automatically adjusts running models to match configured targets. Demand upgrades allow the runtime to upgrade model quality (e.g., larger quantizations) when demand metrics cross the threshold.
+| Mode | Configured models | Explicit CLI models | Local loads |
+|---|---|---|---|
+| `serve` (default) | Eager | Eager | Allowed |
+| `on_demand` | Candidate metadata; not eager | Eager | Allowed |
+| `client` | Never loaded locally | Conflicts | Disabled |
+
+`startup_failure_policy` accepts `best_effort` (default, keep the daemon
+running) or `fail_fast` (abort when an eager model fails).
+`drain_timeout_secs` and `drain_timeout_max_secs` must each be from 1 to 3600,
+and the normal timeout cannot exceed the maximum.
+
+Activity adaptation is opt-in. `idle_after_secs` is 30–86400,
+`poll_interval_secs` is 1–60, and `resume_debounce_secs` is 0–300. `response`
+accepts `pause_remote`, `pause_all`, or `reduce_priority`. `advertisement`
+accepts `none`, `availability_only`, `coarse_state`, or
+`private_coarse_state`. Manual activity overrides are session-only and are not
+written to this file.
+
+Model target reconciliation keeps running models aligned with configured
+targets. Demand upgrades use the minimum request count and maximum request age
+above when deciding whether a higher-quality target is warranted. See
+[Runtime Lifecycle](/docs/pages/runtime-lifecycle/) for the complete behavior,
+security, and status model.
 
 ## Deep Dives
 
@@ -101,3 +137,4 @@ Model target reconciliation automatically adjusts running models to match config
 | [Config Defaults](/docs/pages/config-defaults/) | Model defaults: memory sizing, hardware, throughput, skippy, speculative, sampling |
 | [Config Models & Plugins](/docs/pages/config-models/) | Model entries and plugin configuration |
 | [Config Reference](/docs/pages/config-reference/) | Environment variables, CLI commands, rejected fields |
+| [Runtime Lifecycle](/docs/pages/runtime-lifecycle/) | Modes, startup policy, lifecycle control, draining, and activity admission |

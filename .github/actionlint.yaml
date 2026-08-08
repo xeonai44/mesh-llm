@@ -3,10 +3,15 @@ self-hosted-runner:
     - self-hosted
     - Linux
     - X64
-    - ARM64
     - amd64
     - gpu-nvidia
-    - blacksmith-4vcpu-ubuntu-2404
-    - blacksmith-6vcpu-macos-15
-    - blacksmith-4vcpu-ubuntu-2404-arm
-    - blacksmith-8vcpu-windows-2025
+    - mesh-llm-amd64
+    - mesh-llm-arm64
+    - depot-ubuntu-24.04
+    - depot-ubuntu-24.04-4
+    - depot-ubuntu-24.04-8
+    - depot-ubuntu-24.04-16
+    - depot-ubuntu-24.04-arm
+    - depot-ubuntu-24.04-arm-4
+    - depot-ubuntu-24.04-arm-8
+    - depot-ubuntu-24.04-arm-16

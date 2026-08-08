@@ -1,4 +1,10 @@
+mod discovery;
+
 use anyhow::{Context, Result, bail};
+pub use discovery::{
+    NATIVE_RUNTIME_BUNDLE_DIR_ENV, discover_local_native_runtimes,
+    discover_native_runtime_bundle_dirs,
+};
 use futures_util::StreamExt;
 pub use mesh_llm_native_runtime::{
     CachePrunePlan, CandidateEvaluation, CandidateRejection, HostGpuProfile, HostRuntimeProfile,
@@ -32,6 +38,14 @@ pub enum NativeRuntimeVerificationPolicy {
     RequireChecksumAndSignature,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeRuntimeBundleInstallPolicy {
+    #[default]
+    UseInPlace,
+    InstallExplicitBundlesIntoCache,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NativeRuntimeDownloadProgress {
     pub native_runtime_id: String,
@@ -60,6 +74,7 @@ pub struct NativeRuntimeInstallOptions {
     pub bundle_dirs: Vec<PathBuf>,
     pub cache_dir: Option<PathBuf>,
     pub verification_policy: NativeRuntimeVerificationPolicy,
+    pub bundle_install_policy: NativeRuntimeBundleInstallPolicy,
     pub progress: Option<NativeRuntimeDownloadProgressCallback>,
     pub allow_download: bool,
 }
@@ -101,6 +116,7 @@ impl Default for NativeRuntimeInstallOptions {
             bundle_dirs: Vec::new(),
             cache_dir: None,
             verification_policy: NativeRuntimeVerificationPolicy::RequireChecksum,
+            bundle_install_policy: NativeRuntimeBundleInstallPolicy::UseInPlace,
             progress: None,
             allow_download: true,
         }
@@ -142,6 +158,12 @@ pub fn current_skippy_abi_version() -> String {
     )
 }
 
+/// Returns whether native-runtime metadata matches the exact MeshLLM and
+/// Skippy ABI versions linked into this SDK build.
+pub fn native_runtime_versions_match_current_sdk(mesh_version: &str, skippy_abi: &str) -> bool {
+    mesh_version == CURRENT_MESH_VERSION && skippy_abi == current_skippy_abi_version()
+}
+
 pub fn default_native_runtime_cache() -> Result<NativeRuntimeCache> {
     native_runtime_cache(None)
 }
@@ -168,6 +190,13 @@ pub fn host_runtime_profile() -> HostRuntimeProfile {
 pub async fn load_release_manifest(
     options: NativeRuntimeManifestOptions,
 ) -> Result<NativeRuntimeReleaseManifest> {
+    Ok(load_release_manifest_with_bundle_dirs(options).await?.0)
+}
+
+async fn load_release_manifest_with_bundle_dirs(
+    mut options: NativeRuntimeManifestOptions,
+) -> Result<(NativeRuntimeReleaseManifest, Vec<PathBuf>)> {
+    options.bundle_dirs = discover_native_runtime_bundle_dirs(&options.bundle_dirs)?;
     let mut artifacts = Vec::new();
     let mut mesh_version = options.mesh_version.clone();
     let mut skippy_abi = current_skippy_abi_version();
@@ -188,24 +217,28 @@ pub async fn load_release_manifest(
         &mut skippy_abi,
         &options.bundle_dirs,
     )?;
-    Ok(NativeRuntimeReleaseManifest {
-        mesh_version,
-        skippy_abi,
-        artifacts,
-    })
+    Ok((
+        NativeRuntimeReleaseManifest {
+            mesh_version,
+            skippy_abi,
+            artifacts,
+        },
+        options.bundle_dirs,
+    ))
 }
 
 pub async fn install_native_runtime(
     options: NativeRuntimeInstallOptions,
 ) -> Result<NativeRuntimeInstallOutcome> {
-    let manifest = load_release_manifest(NativeRuntimeManifestOptions {
-        mesh_version: options.mesh_version.clone(),
-        manifest_path: options.manifest_path.clone(),
-        manifest_url: options.manifest_url.clone(),
-        bundle_dirs: options.bundle_dirs.clone(),
-        allow_default_manifest_url: true,
-    })
-    .await?;
+    let (manifest, bundle_dirs) =
+        load_release_manifest_with_bundle_dirs(NativeRuntimeManifestOptions {
+            mesh_version: options.mesh_version.clone(),
+            manifest_path: options.manifest_path.clone(),
+            manifest_url: options.manifest_url.clone(),
+            bundle_dirs: options.bundle_dirs.clone(),
+            allow_default_manifest_url: true,
+        })
+        .await?;
     if manifest.artifacts.is_empty() {
         bail!("no native runtime manifest entries found");
     }
@@ -221,7 +254,7 @@ pub async fn install_native_runtime(
         cache.clone(),
     )
     .with_skippy_abi_version(skippy_abi_version)
-    .with_bundle_dirs(options.bundle_dirs.clone())
+    .with_bundle_dirs(bundle_dirs)
     .resolve(&options.selection)?;
     install_resolved_runtime(&cache, resolution, &options).await
 }
@@ -231,19 +264,22 @@ async fn install_resolved_runtime(
     resolution: mesh_llm_native_runtime::NativeRuntimeResolution,
     options: &NativeRuntimeInstallOptions,
 ) -> Result<NativeRuntimeInstallOutcome> {
-    match &resolution.source {
+    match resolution.source.clone() {
         NativeRuntimeSource::Installed { path: _ } => installed_outcome(cache, resolution),
         NativeRuntimeSource::Bundle { path } => {
-            let runtime = cache.install_from_dir(path)?;
-            Ok(NativeRuntimeInstallOutcome {
-                status: NativeRuntimeInstallStatus::Installed,
-                runtime,
-                resolution,
-            })
+            if should_install_explicit_bundle_into_cache(&path, options)? {
+                let runtime = cache.install_from_dir(&path)?;
+                return Ok(NativeRuntimeInstallOutcome {
+                    status: NativeRuntimeInstallStatus::Installed,
+                    runtime,
+                    resolution,
+                });
+            }
+            in_place_bundle_outcome(&path, resolution)
         }
         NativeRuntimeSource::Download { url } if options.allow_download => {
             let runtime =
-                download_and_install_runtime(cache, &resolution.selected, url, options).await?;
+                download_and_install_runtime(cache, &resolution.selected, &url, options).await?;
             Ok(NativeRuntimeInstallOutcome {
                 status: NativeRuntimeInstallStatus::Installed,
                 runtime,
@@ -260,6 +296,65 @@ async fn install_resolved_runtime(
             )
         }
     }
+}
+
+fn should_install_explicit_bundle_into_cache(
+    bundle_path: &Path,
+    options: &NativeRuntimeInstallOptions,
+) -> Result<bool> {
+    match options.bundle_install_policy {
+        NativeRuntimeBundleInstallPolicy::UseInPlace => Ok(false),
+        NativeRuntimeBundleInstallPolicy::InstallExplicitBundlesIntoCache => {
+            bundle_path_matches_explicit_root(bundle_path, &options.bundle_dirs)
+        }
+    }
+}
+
+fn bundle_path_matches_explicit_root(
+    bundle_path: &Path,
+    explicit_dirs: &[PathBuf],
+) -> Result<bool> {
+    if explicit_dirs.is_empty() {
+        return Ok(false);
+    }
+    let bundle_path = bundle_path.canonicalize().with_context(|| {
+        format!(
+            "canonicalize native runtime bundle {}",
+            bundle_path.display()
+        )
+    })?;
+    for explicit_dir in explicit_dirs {
+        let Ok(explicit_dir) = explicit_dir.canonicalize() else {
+            continue;
+        };
+        if bundle_path.starts_with(&explicit_dir) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn in_place_bundle_outcome(
+    path: &Path,
+    resolution: mesh_llm_native_runtime::NativeRuntimeResolution,
+) -> Result<NativeRuntimeInstallOutcome> {
+    let manifest = NativeRuntimeManifest::read_from_dir(path)?;
+    let runtime = InstalledNativeRuntime {
+        mesh_version: manifest
+            .runtime
+            .mesh_version
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        native_runtime_id: manifest.runtime.id.clone(),
+        flavor: manifest.runtime.backend.kind.to_string(),
+        path: path.to_path_buf(),
+        manifest,
+    };
+    Ok(NativeRuntimeInstallOutcome {
+        status: NativeRuntimeInstallStatus::AlreadyInstalled,
+        runtime,
+        resolution,
+    })
 }
 
 fn installed_outcome(
@@ -280,22 +375,75 @@ fn installed_outcome(
 }
 
 async fn download_release_manifest(url: &str) -> Result<NativeRuntimeReleaseManifest> {
-    let text = reqwest::Client::builder()
+    let diagnostic_url = url_without_query(url);
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
-        .context("build native runtime manifest HTTP client")?
+        .context("build native runtime manifest HTTP client")?;
+    let bytes = client
         .get(url)
         .header("User-Agent", "mesh-llm")
         .send()
         .await
-        .with_context(|| format!("download native runtime release manifest {url}"))?
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("download native runtime release manifest {diagnostic_url}"))?
         .error_for_status()
-        .with_context(|| format!("native runtime release manifest request failed for {url}"))?
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| {
+            format!("native runtime release manifest request failed for {diagnostic_url}")
+        })?
+        .bytes()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| format!("read native runtime release manifest {diagnostic_url}"))?;
+    let checksum_url = release_manifest_checksum_url(url);
+    let diagnostic_checksum_url = url_without_query(&checksum_url);
+    let checksum = client
+        .get(&checksum_url)
+        .header("User-Agent", "mesh-llm")
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| {
+            format!("download native runtime manifest checksum {diagnostic_checksum_url}")
+        })?
+        .error_for_status()
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| {
+            format!("native runtime manifest checksum request failed for {diagnostic_checksum_url}")
+        })?
         .text()
         .await
-        .with_context(|| format!("read native runtime release manifest {url}"))?;
-    NativeRuntimeReleaseManifest::from_json_str(&text)
-        .with_context(|| format!("parse native runtime release manifest {url}"))
+        .map_err(reqwest::Error::without_url)
+        .with_context(|| {
+            format!("read native runtime manifest checksum {diagnostic_checksum_url}")
+        })?;
+    verify_release_manifest_checksum(&bytes, &checksum)
+        .with_context(|| format!("verify native runtime release manifest {diagnostic_url}"))?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("decode native runtime release manifest {diagnostic_url}"))?;
+    NativeRuntimeReleaseManifest::from_json_str(text)
+        .with_context(|| format!("parse native runtime release manifest {diagnostic_url}"))
+}
+
+fn verify_release_manifest_checksum(manifest_bytes: &[u8], checksum_text: &str) -> Result<()> {
+    let expected = normalize_sha256(checksum_text)?;
+    let actual = hex::encode(sha2::Sha256::digest(manifest_bytes));
+    if actual != expected {
+        bail!("native runtime manifest checksum mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+fn release_manifest_checksum_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, query)) => format!("{base}.sha256?{query}"),
+        None => format!("{url}.sha256"),
+    }
+}
+
+fn url_without_query(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
 }
 
 async fn download_and_install_runtime(
@@ -531,6 +679,8 @@ mod tests {
             backend: NativeRuntimeBackend::cpu(),
             rank: 0,
             libraries: vec!["lib/libllama.so".to_string()],
+            files: Default::default(),
+            tools: Default::default(),
             url: Some("https://example.invalid/runtime.tar.gz".to_string()),
             sha256: Some("a".repeat(64)),
             signature: signature.map(str::to_string),
@@ -552,6 +702,313 @@ mod tests {
             err.to_string().contains("missing required sha256"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn legacy_cached_manifest_does_not_block_valid_bundle_install() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("bundle");
+        let profile = host_runtime_profile();
+        let mut artifact = artifact_with_sha(None);
+        artifact.id = "valid-bundle-runtime".to_string();
+        artifact.platform.os = profile.os;
+        artifact.platform.arch = profile.arch;
+        artifact.platform.target = profile.target_triple;
+        artifact.url = None;
+        artifact.sha256 = None;
+        std::fs::create_dir_all(bundle.join("lib")).unwrap();
+        std::fs::write(bundle.join("lib/libllama.so"), b"valid runtime").unwrap();
+        NativeRuntimeManifest {
+            runtime: artifact.clone(),
+        }
+        .write_to_dir(&bundle)
+        .unwrap();
+
+        let install = |cache_dir: PathBuf| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(install_native_runtime(NativeRuntimeInstallOptions {
+                    selection: RuntimeSelection::Id(artifact.id.clone()),
+                    bundle_dirs: vec![bundle.clone()],
+                    cache_dir: Some(cache_dir),
+                    bundle_install_policy:
+                        NativeRuntimeBundleInstallPolicy::InstallExplicitBundlesIntoCache,
+                    allow_download: false,
+                    ..Default::default()
+                }))
+        };
+
+        install(temp.path().join("fresh-cache"))
+            .expect("the valid bundle should install into a fresh cache");
+
+        let polluted_cache = temp.path().join("polluted-cache");
+        let legacy_runtime = polluted_cache.join("0.74.0/legacy-cache-runtime");
+        std::fs::create_dir_all(legacy_runtime.join("lib")).unwrap();
+        std::fs::write(legacy_runtime.join("lib/libllama.so"), b"legacy runtime").unwrap();
+        std::fs::write(
+            legacy_runtime.join(NATIVE_RUNTIME_MANIFEST_FILE),
+            r#"{
+  "runtime": {
+    "id": "legacy-cache-runtime",
+    "mesh_version": "0.74.0",
+    "skippy_abi": "0.1.25",
+    "platform": {"os": "windows", "arch": "x86_64"},
+    "backend": {"kind": "vulkan"},
+    "libraries": ["lib/libllama.so"]
+  }
+}"#,
+        )
+        .unwrap();
+
+        install(polluted_cache)
+            .expect("a legacy cached manifest must not block the valid bundle install");
+    }
+
+    #[test]
+    fn bundled_runtime_is_used_in_place_without_cache_copy() {
+        let bundle = tempfile::tempdir().unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let mut artifact = artifact_with_sha(None);
+        artifact.url = None;
+        artifact.sha256 = None;
+        std::fs::create_dir_all(bundle.path().join("lib")).unwrap();
+        std::fs::write(bundle.path().join("lib/libllama.so"), b"runtime").unwrap();
+        NativeRuntimeManifest {
+            runtime: artifact.clone(),
+        }
+        .write_to_dir(bundle.path())
+        .unwrap();
+        let cache = NativeRuntimeCache::new(cache_root.path());
+        let resolution = NativeRuntimeResolution {
+            selected: artifact.clone(),
+            source: NativeRuntimeSource::Bundle {
+                path: bundle.path().to_path_buf(),
+            },
+            evaluated: Vec::new(),
+        };
+
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(install_resolved_runtime(
+                &cache,
+                resolution,
+                &NativeRuntimeInstallOptions {
+                    allow_download: false,
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(outcome.status, NativeRuntimeInstallStatus::AlreadyInstalled);
+        assert_eq!(outcome.runtime.path, bundle.path());
+        assert!(
+            !cache
+                .runtime_dir(
+                    artifact.mesh_version.as_deref().unwrap(),
+                    artifact.native_runtime_id()
+                )
+                .exists()
+        );
+    }
+
+    #[test]
+    fn bundled_runtime_is_used_in_place_when_policy_has_no_explicit_root_match() {
+        let bundle = tempfile::tempdir().unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let mut artifact = artifact_with_sha(None);
+        artifact.url = None;
+        artifact.sha256 = None;
+        std::fs::create_dir_all(bundle.path().join("lib")).unwrap();
+        std::fs::write(bundle.path().join("lib/libllama.so"), b"runtime").unwrap();
+        NativeRuntimeManifest {
+            runtime: artifact.clone(),
+        }
+        .write_to_dir(bundle.path())
+        .unwrap();
+        let cache = NativeRuntimeCache::new(cache_root.path());
+        let resolution = NativeRuntimeResolution {
+            selected: artifact.clone(),
+            source: NativeRuntimeSource::Bundle {
+                path: bundle.path().to_path_buf(),
+            },
+            evaluated: Vec::new(),
+        };
+
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(install_resolved_runtime(
+                &cache,
+                resolution,
+                &NativeRuntimeInstallOptions {
+                    bundle_install_policy:
+                        NativeRuntimeBundleInstallPolicy::InstallExplicitBundlesIntoCache,
+                    allow_download: false,
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(outcome.status, NativeRuntimeInstallStatus::AlreadyInstalled);
+        assert_eq!(outcome.runtime.path, bundle.path());
+        assert!(
+            !cache
+                .runtime_dir(
+                    artifact.mesh_version.as_deref().unwrap(),
+                    artifact.native_runtime_id()
+                )
+                .exists()
+        );
+    }
+
+    #[test]
+    fn explicit_product_bundle_root_is_installed_into_cache_when_policy_requires_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        let product_bundle = temp.path().join("mesh-bundle");
+        let runtime_bundle = product_bundle.join("native-runtimes/runtime-a");
+        let mut artifact = artifact_with_sha(None);
+        artifact.url = None;
+        artifact.sha256 = None;
+        std::fs::create_dir_all(runtime_bundle.join("lib")).unwrap();
+        std::fs::write(runtime_bundle.join("lib/libllama.so"), b"runtime").unwrap();
+        NativeRuntimeManifest {
+            runtime: artifact.clone(),
+        }
+        .write_to_dir(&runtime_bundle)
+        .unwrap();
+        let cache = NativeRuntimeCache::new(cache_root.path());
+        let resolution = NativeRuntimeResolution {
+            selected: artifact.clone(),
+            source: NativeRuntimeSource::Bundle {
+                path: runtime_bundle.clone(),
+            },
+            evaluated: Vec::new(),
+        };
+
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(install_resolved_runtime(
+                &cache,
+                resolution,
+                &NativeRuntimeInstallOptions {
+                    bundle_dirs: vec![product_bundle],
+                    bundle_install_policy:
+                        NativeRuntimeBundleInstallPolicy::InstallExplicitBundlesIntoCache,
+                    allow_download: false,
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+
+        let cached_path = cache.runtime_dir(
+            artifact.mesh_version.as_deref().unwrap(),
+            artifact.native_runtime_id(),
+        );
+        assert_eq!(outcome.status, NativeRuntimeInstallStatus::Installed);
+        assert_eq!(outcome.runtime.path, cached_path);
+        assert!(outcome.runtime.path.join("lib/libllama.so").exists());
+    }
+
+    #[test]
+    fn explicit_bundle_root_matching_accepts_runtime_native_runtimes_and_product_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let product_bundle = temp.path().join("mesh-bundle");
+        let native_runtimes_root = product_bundle.join("native-runtimes");
+        let runtime_bundle = native_runtimes_root.join("runtime-a");
+        let sibling = temp.path().join("other-bundle");
+        std::fs::create_dir_all(&runtime_bundle).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        assert!(
+            bundle_path_matches_explicit_root(
+                &runtime_bundle,
+                std::slice::from_ref(&runtime_bundle)
+            )
+            .unwrap()
+        );
+        assert!(
+            bundle_path_matches_explicit_root(
+                &runtime_bundle,
+                std::slice::from_ref(&native_runtimes_root)
+            )
+            .unwrap()
+        );
+        assert!(
+            bundle_path_matches_explicit_root(
+                &runtime_bundle,
+                std::slice::from_ref(&product_bundle)
+            )
+            .unwrap()
+        );
+        assert!(
+            !bundle_path_matches_explicit_root(&runtime_bundle, std::slice::from_ref(&sibling))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_bundle_root_matching_skips_uncanonicalizable_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let product_bundle = temp.path().join("mesh-bundle");
+        let runtime_bundle = product_bundle.join("native-runtimes/runtime-a");
+        std::fs::create_dir_all(&runtime_bundle).unwrap();
+
+        let matches = bundle_path_matches_explicit_root(
+            &runtime_bundle,
+            &[temp.path().join("missing"), product_bundle.clone()],
+        )
+        .unwrap();
+
+        assert!(matches);
+    }
+
+    #[test]
+    fn modified_release_manifest_is_rejected_before_parsing() {
+        let expected = hex::encode(sha2::Sha256::digest(b"expected manifest"));
+        let error = verify_release_manifest_checksum(
+            b"modified manifest",
+            &format!("{expected}  native-runtimes.json"),
+        )
+        .expect_err("modified release manifest must fail verification");
+        assert!(error.to_string().contains("checksum mismatch"), "{error:?}");
+    }
+
+    #[test]
+    fn release_manifest_checksum_url_preserves_query_parameters() {
+        assert_eq!(
+            release_manifest_checksum_url(
+                "https://example.invalid/native-runtimes.json?token=secret"
+            ),
+            "https://example.invalid/native-runtimes.json.sha256?token=secret"
+        );
+    }
+
+    #[test]
+    fn manifest_diagnostic_urls_redact_query_parameters() {
+        assert_eq!(
+            url_without_query("https://example.invalid/native-runtimes.json?token=secret"),
+            "https://example.invalid/native-runtimes.json"
+        );
+        assert_eq!(
+            url_without_query("https://example.invalid/native-runtimes.json"),
+            "https://example.invalid/native-runtimes.json"
+        );
+    }
+
+    #[test]
+    fn matching_release_manifest_checksum_is_accepted() {
+        let manifest = b"{\"mesh_version\":\"0.73.1\"}";
+        let expected = hex::encode(sha2::Sha256::digest(manifest));
+        verify_release_manifest_checksum(manifest, &format!("{expected}  native-runtimes.json"))
+            .unwrap();
     }
 
     #[test]
@@ -677,6 +1134,23 @@ mod tests {
     #[test]
     fn current_mesh_version_uses_release_version() {
         assert_eq!(CURRENT_MESH_VERSION, mesh_llm_build_info::RELEASE_VERSION);
+    }
+
+    #[test]
+    fn sdk_runtime_version_check_requires_exact_mesh_and_skippy_versions() {
+        let current_abi = current_skippy_abi_version();
+        assert!(native_runtime_versions_match_current_sdk(
+            CURRENT_MESH_VERSION,
+            &current_abi
+        ));
+        assert!(!native_runtime_versions_match_current_sdk(
+            "0.0.0",
+            &current_abi
+        ));
+        assert!(!native_runtime_versions_match_current_sdk(
+            CURRENT_MESH_VERSION,
+            "0.0.0"
+        ));
     }
 
     #[test]

@@ -22,15 +22,30 @@ mesh-llm --version
 
 ## Homebrew
 
-If you use Homebrew:
+Mesh publishes a versioned Homebrew formula for Apple Silicon through the
+canonical [`Mesh-LLM/tap`](https://github.com/Mesh-LLM/homebrew-tap) tap:
 
 ```sh
-brew install mesh-llm/tap/mesh-llm
+brew install Mesh-LLM/tap/mesh-llm
 ```
+
+The fully qualified formula name adds the tap automatically. Update later with
+`brew update` followed by `brew upgrade mesh-llm`.
+
+The formula downloads the checksummed Metal release archive from
+`Mesh-LLM/mesh-llm`. `Mesh-LLM/mesh-packaging` produces and validates each
+formula before the tap publishes it. Intel macOS is not available through
+Homebrew because the upstream release does not include an x86_64 macOS archive.
 
 ## What the installer does
 
 The installer downloads the `mesh-llm` executable and adds `~/.local/bin` to your user `PATH` when needed. After install, run `mesh-llm setup` to finish runtime configuration and, if you want it, the background service.
+
+`mesh-llm serve` is a foreground process attached to the current terminal.
+When setup installs the optional background service, launchd owns the same
+logical runtime's startup, restart, and logs. Do not start a second foreground
+copy on the same ports; stop or disable the setup-managed launchd agent before
+switching to foreground operation.
 
 ## Next step
 
@@ -67,3 +82,4 @@ curl -fsSL https://meshllm.cloud/install.sh | bash -s -- --install-dir "$HOME/bi
 - [Installing on Windows](/docs/pages/installing-windows/)
 - [Hardware support](/docs/pages/hardware-support/)
 - [Updating Mesh](/docs/pages/updating-mesh/)
+- [Runtime Lifecycle](/docs/pages/runtime-lifecycle/)

@@ -6,9 +6,12 @@ use std::{
 
 use anyhow::{Result, bail};
 use openai_frontend::OpenAiHookPolicy;
-use skippy_protocol::{LoadMode, StageConfig, StageKvCacheConfig, StageKvCachePayload};
+use skippy_protocol::{
+    LoadMode, StageConfig, StageKvCacheConfig, StageKvCacheMode, StageKvCachePayload,
+};
 use skippy_server::{
-    EmbeddedOpenAiArgs, EmbeddedOpenAiRequestDefaults, EmbeddedRuntimeOptions, telemetry::Telemetry,
+    EmbeddedOpenAiArgs, EmbeddedOpenAiRequestDefaults, EmbeddedRuntimeOptions,
+    NativeMtpProposalConfig, SpeculativeDecodeConfig, telemetry::Telemetry,
 };
 
 use super::super::{
@@ -240,38 +243,21 @@ impl ResolvedSkippyConfig {
                 None
             },
             speculative_window: self.speculative_window_for_embedded(mode),
-            adaptive_speculative_window: false,
+            adaptive_speculative_window: mode == "draft",
             draft_n_gpu_layers: if mode == "draft" || self.speculative.native_mtp_enabled {
                 self.speculative.draft_n_gpu_layers
             } else {
                 None
             },
-            ngram_min: if mode == "ngram" {
-                self.speculative.ngram_min as usize
-            } else {
-                0
-            },
-            ngram_max: if mode == "ngram" {
-                self.speculative.ngram_max as usize
-            } else {
-                0
-            },
+            speculative: self.speculative_decode_config(),
             native_mtp_enabled: self.speculative.native_mtp_enabled,
             native_mtp_draft_model_path: if self.speculative.native_mtp_enabled {
                 self.speculative.draft_model_path.clone()
             } else {
                 None
             },
-            native_mtp_max_tokens: if self.speculative.native_mtp_enabled {
-                self.speculative.draft_max_tokens as usize
-            } else {
-                0
-            },
-            native_mtp_min_tokens: if self.speculative.native_mtp_enabled {
-                self.speculative.draft_min_tokens as usize
-            } else {
-                0
-            },
+            native_mtp_max_tokens: self.speculative.decode.native_mtp.max_draft_tokens,
+            native_mtp_min_tokens: self.speculative.decode.native_mtp.min_draft_tokens,
             activation_width,
             wire_dtype: self.skippy.activation_wire_dtype.into(),
             reply_credit_limit: None,
@@ -294,14 +280,29 @@ impl ResolvedSkippyConfig {
             if self.skippy.prefill_controls_explicit {
                 bail!("skippy prefill chunk controls require staged serving");
             }
+            // A stage with no downstream delegates to generate_local_tokens, which
+            // has no N-gram verification path. Reject a standalone N-gram plan here
+            // rather than silently running target-only while reporting a proposer.
+            if self.speculative.decode.ngram.is_some()
+                && !self.speculative.decode.native_mtp.enabled
+            {
+                bail!(
+                    "standalone N-gram speculation ({}) requires multi-stage split serving; \
+                     single-stage and direct GGUF requests have no N-gram verification path",
+                    self.speculative.decode.effective_strategy
+                );
+            }
         }
         Ok(())
     }
 
-    fn speculative_mode_for_embedded(&self, _staged: bool) -> &'static str {
+    fn speculative_mode_for_embedded(&self, staged: bool) -> &'static str {
         if self.speculative.mode == "draft" && self.speculative.draft_model_path.is_some() {
             "draft"
-        } else if self.speculative.mode == "ngram" && self.speculative.ngram_min > 0 {
+        } else if staged
+            && self.speculative.decode.ngram.is_some()
+            && !self.speculative.decode.native_mtp.enabled
+        {
             "ngram"
         } else {
             "disabled"
@@ -311,7 +312,12 @@ impl ResolvedSkippyConfig {
     fn speculative_window_for_embedded(&self, mode: &str) -> usize {
         match mode {
             "draft" => self.speculative.draft_max_tokens as usize,
-            "ngram" => self.speculative.ngram_max as usize,
+            "ngram" => self
+                .speculative
+                .decode
+                .ngram
+                .as_ref()
+                .map_or(0, |ngram| ngram.max_proposal_tokens),
             _ => 0,
         }
     }
@@ -322,7 +328,15 @@ impl ResolvedSkippyConfig {
     ) -> Result<Option<StageKvCacheConfig>> {
         match &self.model_fit.prefix_cache {
             ResolvedStageKvCache::FamilyDefault => Ok(family_default),
-            ResolvedStageKvCache::Disabled => Ok(None),
+            ResolvedStageKvCache::Disabled => Ok(Some(StageKvCacheConfig {
+                mode: StageKvCacheMode::Disabled,
+                payload: StageKvCachePayload::Auto,
+                max_entries: 0,
+                max_bytes: 0,
+                min_tokens: 0,
+                shared_prefix_stride_tokens: 0,
+                shared_prefix_record_limit: 0,
+            })),
             ResolvedStageKvCache::Explicit(template) => {
                 let mut cache = family_default.unwrap_or(StageKvCacheConfig {
                     mode: template.mode.clone(),
@@ -356,6 +370,12 @@ impl ResolvedSkippyConfig {
     }
 }
 
+impl ResolvedSkippyConfig {
+    fn speculative_decode_config(&self) -> SpeculativeDecodeConfig {
+        self.speculative.decode.clone()
+    }
+}
+
 impl ResolvedEmbeddedOpenAiArgs {
     pub(crate) fn direct_single_stage_defaults(
         model_id: String,
@@ -379,8 +399,26 @@ impl ResolvedEmbeddedOpenAiArgs {
             speculative_window: 0,
             adaptive_speculative_window: false,
             draft_n_gpu_layers: None,
-            ngram_min: 0,
-            ngram_max: 0,
+            speculative: SpeculativeDecodeConfig {
+                native_mtp: NativeMtpProposalConfig {
+                    enabled: native_mtp_enabled,
+                    max_draft_tokens: if native_mtp_enabled {
+                        DEFAULT_NATIVE_MTP_MAX_TOKENS
+                    } else {
+                        1
+                    },
+                    min_draft_tokens: 0,
+                    reject_cooldown_tokens: 0,
+                    suppress_cooldown_drafts: false,
+                    suppress_cooldown_draft_limit: 0,
+                },
+                effective_strategy: if native_mtp_enabled {
+                    "native-mtp".to_string()
+                } else {
+                    "disabled".to_string()
+                },
+                ..SpeculativeDecodeConfig::default()
+            },
             native_mtp_enabled,
             native_mtp_draft_model_path: None,
             native_mtp_max_tokens: if native_mtp_enabled {
@@ -419,8 +457,26 @@ impl ResolvedEmbeddedOpenAiArgs {
             speculative_window: 0,
             adaptive_speculative_window: false,
             draft_n_gpu_layers: None,
-            ngram_min: 0,
-            ngram_max: 0,
+            speculative: SpeculativeDecodeConfig {
+                native_mtp: NativeMtpProposalConfig {
+                    enabled: native_mtp_enabled,
+                    max_draft_tokens: if native_mtp_enabled {
+                        DEFAULT_NATIVE_MTP_MAX_TOKENS
+                    } else {
+                        1
+                    },
+                    min_draft_tokens: 0,
+                    reject_cooldown_tokens: 0,
+                    suppress_cooldown_drafts: false,
+                    suppress_cooldown_draft_limit: 0,
+                },
+                effective_strategy: if native_mtp_enabled {
+                    "native-mtp".to_string()
+                } else {
+                    "disabled".to_string()
+                },
+                ..SpeculativeDecodeConfig::default()
+            },
             native_mtp_enabled,
             native_mtp_draft_model_path: None,
             native_mtp_max_tokens: if native_mtp_enabled {
@@ -462,8 +518,7 @@ impl ResolvedEmbeddedOpenAiArgs {
             speculative_window: self.speculative_window,
             adaptive_speculative_window: self.adaptive_speculative_window,
             draft_n_gpu_layers: self.draft_n_gpu_layers,
-            ngram_min: self.ngram_min,
-            ngram_max: self.ngram_max,
+            speculative: self.speculative,
             native_mtp_enabled: self.native_mtp_enabled,
             native_mtp_draft_model_path: self.native_mtp_draft_model_path,
             native_mtp_max_tokens: self.native_mtp_max_tokens,
@@ -479,6 +534,8 @@ impl ResolvedEmbeddedOpenAiArgs {
             prediction_returns: None,
             telemetry,
             hook_policy,
+            generation_receipt: None,
+            linear_proposal_ingress: None,
             openai_guardrails: None,
         }
     }

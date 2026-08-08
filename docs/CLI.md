@@ -167,7 +167,7 @@ Switches:
 
 - `--json`: machine-readable output.
 
-Runtime switches:
+### Common runtime options
 
 - `--join <TOKEN>`: join a specific mesh using an invite token (repeatable).
 - `--discover [NAME]`: discover a mesh and join it. With a name, joins the mesh matching that name. Without a name, behaves like `--auto`.
@@ -331,7 +331,15 @@ mesh-llm models download mlx-community/SmolLM-135M-8bit
 Switches:
 
 - `--draft`: also download the recommended draft model (if available).
+- `--direct`: download the exact Hugging Face GGUF file directly, bypassing catalog layer-package resolution.
 - `--json`: machine-readable output.
+
+Before downloading, mesh-llm checks both the Hugging Face Hub destination and
+the separate Xet working cache. A configured path that is read-only is replaced
+with a writable mesh-llm data directory, and the warning reports the rejected
+path, operating-system error, and selected replacement. Set
+`MESH_LLM_DATA_DIR` to choose the fallback root, or set `HF_HUB_CACHE` and
+`HF_XET_CACHE` independently when both locations should be explicit.
 
 ### `models package`
 
@@ -443,6 +451,9 @@ Switches:
 Use this to update mesh-llm and exit.
 
 Switches:
+- `--version <VERSION>`: install a specific release tag or version, for example `v0.60.0`.
+- `--flavor <FLAVOR>`: install or switch to a specific release bundle flavor (`cpu`, `cuda`, `rocm`, `vulkan`, or `metal`).
+- `--detect-flavor`: re-detect the best host backend flavor before selecting the release bundle. Cannot be combined with `--flavor`.
 - `--auto-update`: available on most commands; when set, mesh-llm checks for a newer bundled release before proceeding.
 
 
@@ -492,7 +503,7 @@ mesh-llm benchmark tune --model /models/qwen3-8b.gguf --mmap-values auto,true,fa
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --flash-attention on,off
 mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types auto
 mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types mtp --debug-telemetry --json
-mesh-llm benchmark tune --model /models/qwen3-8b.gguf --speculative-types draft,ngram,disabled --spec-draft-models /models/qwen3-draft.gguf --spec-draft-max-tokens 4,8,16 --spec-ngram-min 12,24 --spec-ngram-max 48,64
+mesh-llm benchmark tune --model /models/qwen3-mtp.gguf --speculative-types mtp,mtp-ngram,disabled --spec-draft-max-tokens 4,8,16 --spec-ngram-min 2,3 --spec-ngram-max 3,4
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --throughput-tolerance-pct 2.5
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply
 mesh-llm benchmark tune --model /models/qwen3-8b.gguf --apply --replace-existing
@@ -512,11 +523,11 @@ Switches:
 - `--mmap-values <VALUES>`: comma-separated mmap values to benchmark independently: `auto`, `enabled`/`true`, or `disabled`/`false`. If omitted, benchmark tune tries all three.
 - `--mlock-values <VALUES>`: comma-separated mlock values to benchmark independently: `enabled`/`true` or `disabled`/`false`. If omitted, benchmark tune tries `false` and also tries `true` only when the mlock probe says the evaluated budget can be locked.
 - `--flash-attention <VALUES>`: comma-separated flash attention values to benchmark independently: `on`/`enabled`/`true` or `off`/`disabled`/`false`. When omitted, flash attention is not varied during the sweep. When supplied (e.g. `--flash-attention on,off`), trial count doubles and the recommendation applies the best flash attention setting.
-- `--speculative-types <VALUES>`: comma-separated speculative decoding types to benchmark: `auto`, `mtp`, `draft`, `ngram`, or `disabled`. If omitted, `auto` tries native MTP first for MTP-looking targets, then discovered draft candidates, then ngram candidates, then a disabled baseline.
+- `--speculative-types <VALUES>`: comma-separated speculative decoding types to benchmark: `auto`, `mtp`, `mtp-ngram`, `draft`, or `disabled`. If omitted, `auto` tries native MTP and the bounded MTP + request-local N-gram cache composite for MTP-looking targets, then discovered draft candidates and a disabled baseline.
 - `--no-speculative-tune`: skip speculative sweeps and benchmark only the disabled speculative baseline.
 - `--spec-draft-models <PATHS>`: comma-separated local draft GGUF paths for `draft` speculation trials. Tune also considers configured `draft_model` values and obvious local sibling draft/EAGLE GGUF files.
 - `--spec-draft-max-tokens <TOKENS>` / `--spec-draft-min-tokens <TOKENS>`: comma-separated draft-token window candidates for MTP and draft speculation.
-- `--spec-ngram-min <TOKENS>` / `--spec-ngram-max <TOKENS>`: comma-separated ngram token-window candidates for ngram speculation.
+- `--spec-ngram-min <TOKENS>` / `--spec-ngram-max <TOKENS>`: comma-separated cache match-window candidates for `mtp-ngram` speculation.
 - `--throughput-tolerance-pct <PCT>`: treat candidates within this percent of the raw best decode tok/s as throughput-equivalent, then prefer the largest `ctx_size` among them, default `10.0`.
 - `--max-tokens <TOKENS>`: generated tokens per measured request, default `128`.
 - `--startup-timeout-secs <SECONDS>` / `--request-timeout-secs <SECONDS>`: per-trial startup and HTTP request limits, both default `600`.
@@ -588,6 +599,101 @@ Verify the active posture through `/api/status`:
 ```bash
 curl -s localhost:3131/api/status | jq '.runtime.openai_guardrails'
 ```
+
+### `runtime load-model`
+
+Use this to load a model on a remote owner-attested node through the private
+owner-control plane. The command enqueues a one-shot present intent on the
+target node's reconciler and returns the accepted lifecycle state within the
+unary deadline. It does not wait for the model to finish loading.
+
+Usage:
+
+```bash
+mesh-llm runtime load-model --endpoint '<control-endpoint>' --model Qwen3-8B-Q4_K_M [--profile low-ctx]
+```
+
+Switches:
+
+- `--endpoint <TOKEN>`: explicit owner-control endpoint token (required).
+- `--model <REF>`: canonical model reference (required).
+- `--profile <NAME>`: optional runtime profile.
+- `--port <PORT>`: local management/API port (default `3131`).
+- `--json`: machine-readable output.
+
+Equivalent REST call:
+
+```bash
+curl -s -X POST localhost:3131/api/runtime/control/load-model \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>","model":"Qwen3-8B-Q4_K_M"}' | jq .
+```
+
+### `runtime unload-model`
+
+Use this to unload a model from a remote owner-attested node. The command
+enqueues an absent intent and returns the accepted lifecycle state.
+
+Usage:
+
+```bash
+mesh-llm runtime unload-model --endpoint '<control-endpoint>' --model Qwen3-8B-Q4_K_M
+mesh-llm runtime unload-model --endpoint '<control-endpoint>' --instance-id abc123
+```
+
+Specify exactly one of `--model <REF>` or `--instance-id <ID>`. The endpoint,
+port, and JSON switches are the same as `runtime load-model`.
+
+### `runtime ensure-model`
+
+Use this to ensure a model is loaded and maintained on a remote owner-attested
+node. Unlike `load-model` (one-shot), `ensure-model` creates a maintained
+present intent with bounded retry that survives transient load failures for
+the duration of the session.
+
+Usage:
+
+```bash
+mesh-llm runtime ensure-model --endpoint '<control-endpoint>' --model Qwen3-8B-Q4_K_M [--profile low-ctx]
+```
+
+Switches: same as `runtime load-model`.
+
+### `runtime drain-model`
+
+Use this to drain and unload a model on a remote owner-attested node. The
+command enqueues a draining-then-absent intent. Already-admitted inference work
+finishes; new work is rejected. The instance unloads immediately at zero
+in-flight, or force-cancels remaining work at the configured drain deadline.
+
+Usage:
+
+```bash
+mesh-llm runtime drain-model --endpoint '<control-endpoint>' --model Qwen3-8B-Q4_K_M
+mesh-llm runtime drain-model --endpoint '<control-endpoint>' --instance-id abc123
+```
+
+Specify exactly one of `--model <REF>` or `--instance-id <ID>`. The endpoint,
+port, and JSON switches are the same as `runtime load-model`.
+
+### Owner lifecycle command semantics
+
+All four owner lifecycle commands share these properties:
+
+- **Session-only**: intents disappear when the target node restarts. They never
+  mutate durable config or TOML. Use `runtime apply-config` for persistent
+  configuration changes.
+- **Private**: commands travel the `mesh-llm-control/1` ALPN, not the public
+  mesh plane. They require an explicit endpoint token and same-owner
+  authentication.
+- **Legacy peers**: a current client talking to a released host that does not
+  implement these commands receives a typed `ControlUnsupported` result, not a
+  silent fallback to the public mesh.
+- **Deduplication**: duplicate request IDs are idempotent within the unary
+  deadline.
+- **Privacy**: no raw owner payloads, model references, instance IDs, or
+  lifecycle states appear in public gossip, `/api/status`, or telemetry beyond
+  the coarse admission signal.
 
 ### `discover`
 
@@ -696,14 +802,37 @@ Switches:
 - `--limit <LIMIT>`: max rows (default `20`).
 - `--port <PORT>`: target management/API port (default `3131`).
 
-### `plugin`
+### `plugins` (alias: `plugin`)
 
-Use this to inspect plugin status or run plugin compatibility shims.
+Use this to install, inspect, and manage native plugins. `plugin` remains an
+alias for scripts that used the older singular spelling.
 
 Subcommands:
 
-- `plugin list`: list auto-registered/configured plugins.
-- `plugin install <NAME>`: compatibility shim for older install workflows.
+- `plugins install <REFERENCE>`: install from a catalog name, GitHub
+  `owner/repository`, or GitHub URL.
+- `plugins install --archive <PATH> --name <NAME> [--version <VERSION>]`:
+  install a local `.tar.gz` or `.zip` release archive. `--name` is required;
+  `--version` defaults to `dev`. These flags conflict with `<REFERENCE>`.
+- `plugins update <NAME>`: install the latest compatible release for an
+  installed plugin.
+- `plugins enable <NAME>`: mark an installed plugin runnable by mesh-llm.
+- `plugins disable <NAME>`: keep an installed plugin on disk but prevent host
+  startup from launching it.
+- `plugins delete <NAME>`: remove the installed archive contents and local
+  metadata.
+- `plugins info <NAME>`: show source, version, target, path, and latest known
+  status for an installed or configured plugin.
+- `plugins search [QUERY]`: search the configured plugin catalog.
+- `plugins list`: list installed, auto-registered, and configured plugins.
+
+Local archives are for authoring and validation. Rebuild and reinstall them;
+`plugins update` remains a GitHub release workflow.
+
+Plugin installation and enablement are separate from the optional web UI
+projection. A plugin that declares a web UI can be shown or hidden with its
+`web_ui_enabled` config field or the console toggle without changing its
+process state.
 
 
 ### `auth`

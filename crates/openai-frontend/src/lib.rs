@@ -20,9 +20,10 @@ pub use chat::{
     MessageContent, MessageContentPart, message_content_to_text, messages_to_plain_prompt,
 };
 pub use common::{
-    FinishReason, PromptCacheRetention, ReasoningConfig, ReasoningEffort, ReasoningTemplateOptions,
-    StopSequence, StreamOptions, THINKING_BOOLEAN_ALIASES, Usage, completion_id,
-    normalize_reasoning_template_options, now_unix_secs,
+    AgentSessionIdentity, AgentSessionSource, FinishReason, PromptCacheRetention, ReasoningConfig,
+    ReasoningEffort, ReasoningTemplateOptions, StopSequence, StreamOptions,
+    THINKING_BOOLEAN_ALIASES, Usage, completion_id, normalize_reasoning_template_options,
+    now_unix_secs,
 };
 pub use completions::{
     CompletionChoice, CompletionChunk, CompletionChunkChoice, CompletionPrompt, CompletionRequest,
@@ -32,7 +33,8 @@ pub use errors::{OpenAiError, OpenAiErrorKind, already_openai_error, map_upstrea
 pub use guardrails::{
     CompactingOpenAiBackend, CompactionConfig, CompactionDecision, CompactionOverride,
     CompactionReport, GuardedOpenAiBackend, GuardrailMode, GuardrailPolicy, GuardrailPolicyHandle,
-    GuardrailTelemetrySink, MESH_COMPACT_FIELD, MESH_RESPOND_TOOL_NAME, StreamingGuardrailMode,
+    GuardrailTelemetrySink, MESH_COMPACT_FIELD, MESH_RESPOND_TOOL_NAME, RetryExhaustionMode,
+    StreamingGuardrailMode,
 };
 pub use hooks::{
     ChatHookAction, ChatHookOutcome, ChatMediaKind, ChatMediaRef, GenerationHookSignals,

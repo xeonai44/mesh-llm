@@ -1,7 +1,8 @@
 # mesh-llm Message Protocol
 
-Use this reference for control-plane communication between mesh-llm nodes over
-the `meshllm.node.v1` protobuf schema on QUIC ALPN `mesh-llm/1`.
+Use this reference for public mesh communication over the `meshllm.node.v1`
+protobuf schema on QUIC ALPN `mesh-llm/1` and for the separate private
+owner-control lane on `mesh-llm-control/1`.
 
 ## ALPN
 
@@ -38,9 +39,164 @@ All protobuf control-plane streams use the same framing:
 [1 byte stream type][4 bytes LE length][N bytes protobuf body]
 ```
 
-Maximum frame size: 8 MiB (`MAX_CONTROL_FRAME_BYTES`). Frames exceeding this limit are rejected.
+Maximum frame size: 8 MiB (`MAX_CONTROL_FRAME_BYTES`). Frames exceeding this
+limit are rejected before allocation on read and before a prefix or body is
+written on send.
 
 Config and inventory mutation are exclusive to `mesh-llm-control/1`. The former mesh-plane config stream IDs `0x0b` and `0x0c` remain reserved for wire compatibility bookkeeping, but `mesh-llm/1` no longer dispatches protobuf request/response handlers for them. Skippy layer-package artifact transfer is not a mesh-owned schema. Gossip advertises `skippy-stage/2` feature support through `PeerAnnouncement.subprotocols`; mesh stream `0x0d` opens the advertised subprotocol, and the request/response schema plus artifact byte framing remain owned by `skippy-protocol`.
+
+## Private owner-control (`mesh-llm-control/1`)
+
+Owned-node commands use a separate QUIC ALPN and do not consume a public mesh
+stream type. Each bidirectional owner-control stream carries 4-byte
+little-endian length-prefixed `OwnerControlEnvelope` messages: a handshake,
+then typed request/response envelopes. Current unary client calls (`get_config`,
+`apply_config`, and `refresh_inventory`) open one authenticated stream per
+command and expect one response before closing. `watch_config` sends one
+request, then receives either an initial `accepted` response
+(`include_snapshot=false`) or `snapshot` response (`include_snapshot=true`),
+followed by zero or more `update` responses until either side closes the stream.
+The same 8 MiB inbound and outbound limit applies.
+
+The client must receive an explicit owner-control endpoint token out of band.
+Control endpoints are never derived from peer IDs, gossip, Nostr, route tables,
+or `/api/status`. QUIC authenticates the explicitly pinned target endpoint;
+the handshake contains signed ownership bound to the requester's live QUIC
+endpoint identity. The server verifies same-owner authorization before decoding
+and dispatching a command, then verifies the common requester and target node
+IDs for every typed request.
+
+The request and response oneofs are the owned-node command registry. Current
+request tags are:
+
+| Tag | Protobuf operation | Execution shape |
+|---:|---|---|
+| 2 | `get_config` | unary |
+| 3 | `watch_config` | accepted stream |
+| 4 | `apply_config` | unary |
+| 5 | `refresh_inventory` | unary scan |
+| 6 | `load_model` | unary (session intent) |
+| 7 | `unload_model` | unary (session intent) |
+| 8 | `ensure_model` | unary (session intent) |
+| 9 | `drain_model` | unary (session intent) |
+
+`scan-refresh` is the operator-facing CLI/API name for the existing wire
+operation `refresh_inventory = 5`; tag 5 is not renamed or renumbered. The
+server converts the oneof into an exhaustive typed `OwnedNodeCommand` and uses
+one authenticated dispatcher for requester binding, target binding, request
+ID, execution shape, deadline policy, and bounded response handling. There are
+no opaque command names or JSON payloads on this ALPN.
+
+### Inventory refresh response compatibility
+
+`OwnerControlRefreshInventoryResponse.snapshot = 1` remains the legacy result.
+Current servers add `inventory = 2`, containing:
+
+```proto
+message OwnerControlRefreshInventory {
+  repeated OwnerControlInventoryEntry entries = 1;
+  OwnerControlRefreshInventoryDisposition disposition = 2;
+}
+
+message OwnerControlInventoryEntry {
+  string canonical_model_ref = 1;
+  optional string display_name = 2;
+  uint64 total_size_bytes = 3;
+  CompactModelMetadata metadata = 4;
+}
+```
+
+Entries are strictly sorted by `canonical_model_ref`. Metadata is optional and
+retains the compact GGUF-derived fields needed by future private management
+clients. `EXECUTED` means the caller led the scan; `COALESCED` means it joined
+an in-flight scan. All successful joiners receive the same inventory snapshot.
+The successful scan snapshot is also the sole source used to update the node's
+available-model projection; there is no second disk scan.
+
+Old clients ignore tag 2 and continue reading tag 1. New clients accept an old
+server's snapshot-only response as a successful, compatibility-limited result
+without inventing inventory or disposition data. Released peers are not
+assumed to understand the new response field. A failed scan reports one
+structured error to all waiters and preserves the last good runtime snapshot
+and advertised availability.
+
+Rich inventory entries are private command output. They are not persisted as a
+raw response in `PeerInfo`, public gossip, runtime status, or `/api/status`, and
+endpoint tokens are not advertised. Existing public model-availability fields
+remain a separate projection of a successful local scan.
+
+### Bounds and deadlines
+
+- Client connect: 8 seconds; stream open: 2 seconds; handshake write: 2
+  seconds; request write: 2 seconds.
+- Client get/apply unary response: 5 seconds; client inventory response: 35
+  seconds, covering the server's 30-second scan deadline plus margin; watch
+  acceptance: 5 seconds. An accepted watch has no unary response deadline.
+- Client lifecycle-command unary response: 5 seconds.
+- Server handshake read: 2 seconds; request read: 5 seconds.
+- At most 32 owner-control stream workers are active per connection. The
+  permit is acquired before spawning request work.
+- Request IDs never use zero, including after `u64` wraparound.
+- A response that would exceed 8 MiB is replaced with the existing
+  `CONTROL_UNAVAILABLE` error before transport write.
+
+### Model lifecycle commands (tags 6-9)
+
+`load_model` (tag 6), `unload_model` (tag 7), `ensure_model` (tag 8), and
+`drain_model` (tag 9) are shipped additive owner-control commands on
+`mesh-llm-control/1`. They create session-only desired intents on the target
+node's reconciler and never mutate durable config.
+
+- **`load_model`**: one-shot present intent. Accepts one canonical model
+  reference. Returns accepted/current lifecycle state within the five-second
+  lifecycle-command unary deadline.
+- **`ensure_model`**: maintained present intent with bounded retry. Accepts one
+  canonical model reference. Survives transient load failures for the session.
+- **`unload_model`**: absent intent. Accepts one canonical model reference or
+  instance ID.
+- **`drain_model`**: draining-then-absent intent. Accepts one canonical model
+  reference or instance ID. Already-admitted work finishes; new work is
+  rejected. Unloads at zero in-flight or force-cancels at the configured drain
+  deadline (default 30s, capped by `drain_timeout_max_secs`).
+
+Responses return request/intent ID, accepted/current lifecycle state, resolved
+model/instance when known, and bounded typed errors. They acknowledge queueing
+within the lifecycle-command unary deadline and never wait for a model load to
+complete.
+
+Old peers that do not implement these commands return `UNKNOWN_COMMAND`, which
+new clients translate to typed `CONTROL_UNSUPPORTED`. There is no silent
+fallback to the public mesh.
+
+### Adding future owned-node commands
+
+Start/stop inference, configuration additions beyond the current typed
+get/watch/apply operations, and long-running operation queries are design
+targets only. Those future operations are **not shipped** by the owner-control
+command surface described here beyond the model lifecycle commands above.
+
+Every future command addition must include all of the following:
+
+1. Additive typed protobuf request and response oneof variants with new tags;
+   never repurpose an existing field or add an opaque command/payload registry.
+2. A new exhaustive typed decoder/dispatcher arm and a small command executor
+   under `mesh/owner_control/commands/`.
+3. Shared requester identity, single target identity, non-zero request ID,
+   same-owner authorization, execution shape, deadline, frame-limit, and
+   structured-error policy.
+4. Defined idempotency behavior. Long-running or mutating operations must also
+   define progress, cancellation, disconnect, timeout, and process-restart
+   semantics before implementation.
+5. Explicit old-peer behavior, normally a structured unsupported-command
+   result; never a silent public-mesh fallback or compatibility claim for an
+   older binary.
+6. Typed client support plus loopback-only REST and CLI facades, including any
+   required compatibility alias.
+7. A privacy review covering logs, public gossip, runtime status, endpoint
+   tokens, command inputs, and command results.
+8. Unit/compatibility tests and two-node evidence for success, wrong-owner and
+   wrong-target rejection, bounds/deadlines, failure preservation, and public
+   mixed-version join/routing coexistence.
 
 ## Protocol Generation
 
@@ -114,8 +270,41 @@ Each `PeerAnnouncement` describes one node's state. Fields:
 | `available_model_metadata` | GGUF-derived metadata for each available model |
 | `available_model_sizes` | File sizes in bytes per model name |
 | `serialized_addr` | JSON-serialized `EndpointAddr` for peer discovery |
+| `admission` | Optional coarse inference admission state (tag 49, additive) |
 
 These GPU telemetry fields are additive and optional. Older peers continue to interoperate by ignoring unknown `/1` protobuf fields, and the richer hardware reporting does not replace the existing model-metadata flow. For the shipped Skippy-enabled binary, GPU telemetry represents devices the embedded backend reports as runtime-selectable; platform probes are not a fallback source for advertised GPU count or usable capacity when Skippy reports no backend GPU. For clarity, `gpu_mem_bandwidth_gbps` values are serialized in GB/s (gigabytes/sec), matching benchmark output and CLI formatting; only the field name still carries the older `gbps` suffix for backward compatibility. ROCm `rocm-smi --showmeminfo` and Intel `xpu-smi` discovery expose used-memory counters rather than a true reserved/system-memory value, so `gpu_reserved_bytes` is intentionally omitted for those backends.
+
+### Admission advertisement (tag 49)
+
+The optional `admission` field (protobuf tag 49 on `PeerAnnouncement`) carries
+a coarse inference admission enum so peers can route around nodes that are
+temporarily not accepting work. The field is additive; old peers that do not
+recognize it treat its absence as `UNSPECIFIED` and continue to use legacy
+eligibility.
+
+Enum values:
+
+| Value | Meaning |
+|-------|---------|
+| `UNSPECIFIED` | Legacy/unknown; treated as eligible by old peers |
+| `ACCEPTING` | Node is accepting new inference work |
+| `ACCEPTING_DEPRIORITIZED` | Node is accepting but deprioritized |
+| `REMOTE_PAUSED` | Remote/mesh inference is paused; local work continues |
+| `ALL_PAUSED` | All inference admission is paused; management/owner-control remain reachable |
+
+Advertisement modes (configured via `[runtime.activity].advertisement`):
+
+- `none`: emit nothing. Old peers see no change.
+- `availability_only`: publish hosted/serving availability as
+  explicitly-known-and-empty while non-admitting. Does not emit the enum.
+- `coarse_state` (default): emit the admission enum and also publish
+  known-empty availability for old peers that do not recognize tag 49.
+- `private_coarse_state`: emit the enum only on private meshes; use
+  known-empty availability publicly.
+
+**Privacy**: the admission field encodes only the coarse state above. No raw
+activity data, input events, app/window names, usernames, idle durations,
+timestamps, or detector errors are ever encoded in gossip.
 
 #### ExpertsSummary
 
@@ -248,7 +437,7 @@ Used by a Skippy worker to fetch missing Hugging Face layer-package artifacts fr
 ```proto
 message MeshSubprotocol {
   string name = 1;              // "skippy-stage"
-  uint32 major = 2;             // 1
+  uint32 major = 2;             // 2
   repeated string features = 3; // includes "artifact-transfer"
 }
 
@@ -259,7 +448,7 @@ message MeshSubprotocolOpen {
 }
 ```
 
-Outbound transfer uses mesh stream `0x0d` (`STREAM_SUBPROTOCOL`), followed by a length-prefixed `MeshSubprotocolOpen { name: "skippy-stage", major: 2 }`, the Skippy-owned stream kind `0x03`, a length-prefixed `StageArtifactTransferRequest`, a length-prefixed `StageArtifactTransferResponse`, and raw artifact bytes when accepted. Skippy stage major 2 is a compatibility break for generation-3 direct prediction return.
+Outbound transfer uses mesh stream `0x0d` (`STREAM_SUBPROTOCOL`), followed by a length-prefixed `MeshSubprotocolOpen { name: "skippy-stage", major: 2 }`, the Skippy-owned stream kind `0x03`, a length-prefixed `StageArtifactTransferRequest`, a length-prefixed `StageArtifactTransferResponse`, and raw artifact bytes when accepted. Skippy stage major 2 is a compatibility break for generation-4 direct prediction return and verify retirement.
 
 **Request:**
 ```proto

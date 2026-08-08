@@ -1,150 +1,20 @@
-//! Direct UDP path maintenance for mesh peers.
+//! Compatibility handling for legacy direct-path repair requests.
 //!
-//! This module keeps direct-path repair close to the iroh/mesh layer. It is
-//! deliberately targeted: one peer per tick, per-peer cooldowns on both sender
-//! and receiver, and no gossip fanout.
+//! Modern nodes let iroh own NAT traversal and no longer emit these requests.
+//! The receiver remains so mixed-version meshes can safely accept the additive
+//! stream type from older peers.
 
-use super::*;
-use crate::protocol::{STREAM_DIRECT_PATH_REQUEST, ValidateControlFrame};
+use super::{ConnectionCaptureEvent, Node, connect_mesh, connection_protocol};
+use crate::protocol::{ValidateControlFrame, read_len_prefixed};
+use anyhow::{Context, Result};
+use iroh::endpoint::Connection;
+use iroh::{EndpointAddr, EndpointId, TransportAddr};
+use prost::Message;
 
-pub(super) const DIRECT_PATH_MAINTENANCE_CHECK_SECS: u64 = 30;
-pub(super) const DIRECT_PATH_REPAIR_GRACE_SECS: u64 = 15;
-pub(super) const DIRECT_PATH_REPAIR_COOLDOWN_SECS: u64 = 120;
 pub(super) const DIRECT_PATH_REQUEST_COOLDOWN_SECS: u64 = 120;
 const DIRECT_PATH_REQUEST_TIMEOUT_SECS: u64 = 10;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum DirectPathRepairReason {
-    RelaySelected,
-    UnknownSelected,
-}
-
-impl DirectPathRepairReason {
-    fn label(self) -> &'static str {
-        match self {
-            Self::RelaySelected => "selected path is relay",
-            Self::UnknownSelected => "selected path is unknown",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(super) struct DirectPathPeerHealth {
-    pub(super) non_direct_since: Option<std::time::Instant>,
-    pub(super) last_request_at: Option<std::time::Instant>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct DirectPathObservation {
-    pub(super) peer_id: EndpointId,
-    pub(super) snapshot: heartbeat::RelayPathSnapshot,
-    pub(super) has_direct_candidate: bool,
-}
-
-#[derive(Default)]
-pub(super) struct DirectPathMaintenanceController {
-    peer_health: HashMap<EndpointId, DirectPathPeerHealth>,
-}
-
-impl DirectPathMaintenanceController {
-    pub(super) fn plan_request<I>(
-        &mut self,
-        observations: I,
-        now: std::time::Instant,
-        inflight_requests: u64,
-    ) -> Option<(EndpointId, DirectPathRepairReason)>
-    where
-        I: IntoIterator<Item = DirectPathObservation>,
-    {
-        let mut observations: Vec<DirectPathObservation> = observations.into_iter().collect();
-        observations.sort_by_key(|observation| endpoint_id_hex(observation.peer_id));
-
-        if observations.is_empty() {
-            self.peer_health.clear();
-            return None;
-        }
-
-        let active_peers: std::collections::HashSet<EndpointId> = observations
-            .iter()
-            .map(|observation| observation.peer_id)
-            .collect();
-        self.peer_health
-            .retain(|peer_id, _| active_peers.contains(peer_id));
-
-        if inflight_requests > 0 {
-            for observation in observations {
-                self.observe_peer(observation, now);
-            }
-            return None;
-        }
-
-        for observation in observations {
-            let health = self.observe_peer(observation, now);
-            if let Some(reason) = direct_path_repair_reason(health, observation, now) {
-                return Some((observation.peer_id, reason));
-            }
-        }
-
-        None
-    }
-
-    fn observe_peer(
-        &mut self,
-        observation: DirectPathObservation,
-        now: std::time::Instant,
-    ) -> &DirectPathPeerHealth {
-        let health = self.peer_health.entry(observation.peer_id).or_default();
-        match (observation.snapshot.kind, observation.has_direct_candidate) {
-            (heartbeat::SelectedPathKind::Direct, _) | (_, false) => {
-                health.non_direct_since = None;
-            }
-            (heartbeat::SelectedPathKind::Relay | heartbeat::SelectedPathKind::Unknown, true) => {
-                if health.non_direct_since.is_none() {
-                    health.non_direct_since = Some(now);
-                }
-            }
-        }
-        health
-    }
-
-    pub(super) fn record_request_attempt(&mut self, peer_id: EndpointId, now: std::time::Instant) {
-        self.peer_health.entry(peer_id).or_default().last_request_at = Some(now);
-    }
-
-    #[cfg(test)]
-    pub(super) fn peer_health(&self, peer_id: EndpointId) -> Option<&DirectPathPeerHealth> {
-        self.peer_health.get(&peer_id)
-    }
-}
-
-pub(super) fn direct_path_repair_reason(
-    health: &DirectPathPeerHealth,
-    observation: DirectPathObservation,
-    now: std::time::Instant,
-) -> Option<DirectPathRepairReason> {
-    if !observation.has_direct_candidate
-        || observation.snapshot.kind == heartbeat::SelectedPathKind::Direct
-    {
-        return None;
-    }
-    if health.last_request_at.is_some_and(|last| {
-        now.duration_since(last) < std::time::Duration::from_secs(DIRECT_PATH_REPAIR_COOLDOWN_SECS)
-    }) {
-        return None;
-    }
-    if !health.non_direct_since.is_some_and(|started| {
-        now.duration_since(started) >= std::time::Duration::from_secs(DIRECT_PATH_REPAIR_GRACE_SECS)
-    }) {
-        return None;
-    }
-    match observation.snapshot.kind {
-        heartbeat::SelectedPathKind::Relay => Some(DirectPathRepairReason::RelaySelected),
-        heartbeat::SelectedPathKind::Unknown => Some(DirectPathRepairReason::UnknownSelected),
-        heartbeat::SelectedPathKind::Direct => None,
-    }
-}
-
-fn endpoint_addr_has_direct_candidate(addr: &EndpointAddr) -> bool {
+pub(crate) fn endpoint_addr_has_direct_candidate(addr: &EndpointAddr) -> bool {
     addr.addrs
         .iter()
         .any(|candidate| matches!(candidate, TransportAddr::Ip(_)))
@@ -164,106 +34,6 @@ pub(super) fn endpoint_addr_with_previously_advertised_direct_candidates(
 }
 
 impl Node {
-    /// Start bounded mesh-level direct path maintenance.
-    ///
-    /// This is not gossip-driven. Each tick selects at most one admitted peer
-    /// whose selected path is non-direct while a direct UDP candidate exists,
-    /// then sends a targeted request asking that peer to dial our current
-    /// advertised endpoint address. The receiver has its own per-peer cooldown.
-    pub fn start_direct_path_maintenance(&self) {
-        let node = self.clone();
-        tokio::spawn(async move {
-            let mut controller = DirectPathMaintenanceController::default();
-
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    DIRECT_PATH_MAINTENANCE_CHECK_SECS,
-                ))
-                .await;
-
-                let now = std::time::Instant::now();
-                let observations = node.direct_path_observations().await;
-                let inflight_requests = node.inflight_requests();
-                let Some((peer_id, reason)) =
-                    controller.plan_request(observations, now, inflight_requests)
-                else {
-                    continue;
-                };
-
-                controller.record_request_attempt(peer_id, now);
-                let _ = node.request_direct_path_from_peer(peer_id, reason).await;
-            }
-        });
-    }
-
-    async fn direct_path_observations(&self) -> Vec<DirectPathObservation> {
-        let state = self.state.lock().await;
-        state
-            .peers
-            .iter()
-            .filter_map(|(peer_id, peer)| {
-                if !peer.is_admitted() {
-                    return None;
-                }
-                let conn = state.connections.get(peer_id)?;
-                Some(DirectPathObservation {
-                    peer_id: *peer_id,
-                    snapshot: heartbeat::selected_path_snapshot(conn),
-                    has_direct_candidate: endpoint_addr_has_direct_candidate(&peer.addr),
-                })
-            })
-            .collect()
-    }
-
-    async fn request_direct_path_from_peer(
-        &self,
-        peer_id: EndpointId,
-        reason: DirectPathRepairReason,
-    ) -> bool {
-        let Some(conn) = self.direct_path_request_connection(peer_id).await else {
-            return false;
-        };
-        let Some(request) = self.build_direct_path_request(peer_id) else {
-            return false;
-        };
-
-        tracing::debug!(
-            peer = %peer_id.fmt_short(),
-            reason = reason.label(),
-            "Direct path maintenance requesting reverse dial"
-        );
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(DIRECT_PATH_REQUEST_TIMEOUT_SECS),
-            send_direct_path_request(conn, request),
-        )
-        .await;
-        log_direct_path_request_result(peer_id, result)
-    }
-
-    fn build_direct_path_request(
-        &self,
-        peer_id: EndpointId,
-    ) -> Option<crate::proto::node::DirectPathRequest> {
-        let Ok(serialized_addr) = serde_json::to_vec(&self.endpoint_addr_for_advertisement())
-        else {
-            tracing::debug!(
-                peer = %peer_id.fmt_short(),
-                "Direct path maintenance could not serialize local endpoint address"
-            );
-            return None;
-        };
-        Some(crate::proto::node::DirectPathRequest {
-            requester_id: self.endpoint.id().as_bytes().to_vec(),
-            r#gen: NODE_PROTOCOL_GENERATION,
-            serialized_addr,
-        })
-    }
-
-    async fn direct_path_request_connection(&self, peer_id: EndpointId) -> Option<Connection> {
-        let state = self.state.lock().await;
-        state.connections.get(&peer_id).cloned()
-    }
-
     pub(super) fn spawn_direct_path_request_stream(
         &self,
         remote: EndpointId,
@@ -280,7 +50,7 @@ impl Node {
         });
     }
 
-    async fn handle_direct_path_request_stream(
+    pub(crate) async fn handle_direct_path_request_stream(
         &self,
         remote: EndpointId,
         mut recv: iroh::endpoint::RecvStream,
@@ -311,43 +81,8 @@ impl Node {
     }
 }
 
-async fn send_direct_path_request(
-    conn: Connection,
-    request: crate::proto::node::DirectPathRequest,
-) -> Result<()> {
-    let (mut send, _) = conn.open_bi().await?;
-    send.write_all(&[STREAM_DIRECT_PATH_REQUEST]).await?;
-    write_len_prefixed(&mut send, &request.encode_to_vec()).await?;
-    let _ = send.finish();
-    Ok(())
-}
-
-fn log_direct_path_request_result(
-    peer_id: EndpointId,
-    result: Result<Result<()>, tokio::time::error::Elapsed>,
-) -> bool {
-    match result {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            tracing::debug!(
-                peer = %peer_id.fmt_short(),
-                error = %error,
-                "Direct path maintenance request failed"
-            );
-            false
-        }
-        Err(_) => {
-            tracing::debug!(
-                peer = %peer_id.fmt_short(),
-                "Direct path maintenance request timed out"
-            );
-            false
-        }
-    }
-}
-
 impl Node {
-    async fn read_direct_path_request(
+    pub(crate) async fn read_direct_path_request(
         &self,
         remote: EndpointId,
         recv: &mut iroh::endpoint::RecvStream,
@@ -365,7 +100,7 @@ impl Node {
         Ok(frame)
     }
 
-    async fn direct_path_request_addr_for_peer(
+    pub(crate) async fn direct_path_request_addr_for_peer(
         &self,
         remote: EndpointId,
         requested: EndpointAddr,
@@ -375,7 +110,7 @@ impl Node {
         endpoint_addr_with_previously_advertised_direct_candidates(requested, &peer.addr)
     }
 
-    async fn record_direct_path_request(&self, remote: EndpointId) -> bool {
+    pub(crate) async fn record_direct_path_request(&self, remote: EndpointId) -> bool {
         let mut state = self.state.lock().await;
         let now = std::time::Instant::now();
         if state
@@ -392,7 +127,11 @@ impl Node {
         true
     }
 
-    async fn dial_direct_path_request_peer(&self, remote: EndpointId, addr: EndpointAddr) {
+    pub(crate) async fn dial_direct_path_request_peer(
+        &self,
+        remote: EndpointId,
+        addr: EndpointAddr,
+    ) {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(DIRECT_PATH_REQUEST_TIMEOUT_SECS),
             connect_mesh(&self.endpoint, addr),
@@ -419,7 +158,51 @@ impl Node {
         }
     }
 
-    async fn install_direct_path_request_connection(&self, remote: EndpointId, conn: Connection) {
+    pub(crate) async fn install_direct_path_request_connection(
+        &self,
+        remote: EndpointId,
+        conn: Connection,
+    ) {
+        let (existing, pending) = {
+            let state = self.state.lock().await;
+            (
+                state.connections.get(&remote).cloned(),
+                state.pending_connections.contains_key(&remote),
+            )
+        };
+        if pending {
+            conn.close(0u32.into(), b"direct-path-pending-handshake");
+            return;
+        }
+        let expected_stable_id = existing.as_ref().map(Connection::stable_id);
+
+        if let Err(error) = self
+            .initiate_gossip_inner(conn.clone(), remote, false)
+            .await
+        {
+            conn.close(0u32.into(), b"direct-path-gossip-failed");
+            tracing::debug!(
+                peer = %remote.fmt_short(),
+                error = %error,
+                "Direct path request gossip after reverse dial failed"
+            );
+            return;
+        }
+
+        {
+            let mut state = self.state.lock().await;
+            if state.pending_connections.contains_key(&remote) {
+                drop(state);
+                conn.close(0u32.into(), b"direct-path-raced-pending");
+                return;
+            }
+            if state.connections.get(&remote).map(Connection::stable_id) != expected_stable_id {
+                drop(state);
+                conn.close(0u32.into(), b"direct-path-raced");
+                return;
+            }
+            state.connections.insert(remote, conn.clone());
+        }
         self.capture_connection_event(ConnectionCaptureEvent {
             event: "peer_connection_opened",
             remote,
@@ -432,21 +215,31 @@ impl Node {
             reason: Some("reverse_dial"),
         });
         self.capture_selected_connection_path(remote, &conn, "direct_path_request_path");
-        {
-            let mut state = self.state.lock().await;
-            state.connections.insert(remote, conn.clone());
-        }
         let node = self.clone();
         let conn_for_dispatch = conn.clone();
         tokio::spawn(async move {
             node.dispatch_streams(conn_for_dispatch, remote).await;
         });
-        if let Err(error) = self.initiate_gossip_inner(conn, remote, false).await {
-            tracing::debug!(
-                peer = %remote.fmt_short(),
-                error = %error,
-                "Direct path request gossip after reverse dial failed"
-            );
+        if let Some(existing) = existing.filter(|existing| existing.stable_id() != conn.stable_id())
+        {
+            record_draining_replaced_connection(remote, Some(&existing), &conn);
+            Self::spawn_replaced_connection_drain(remote, existing);
         }
     }
+}
+
+fn record_draining_replaced_connection(
+    remote: EndpointId,
+    existing: Option<&Connection>,
+    replacement: &Connection,
+) {
+    let Some(existing) = existing else {
+        return;
+    };
+    tracing::debug!(
+        peer = %remote.fmt_short(),
+        replaced_stable_id = existing.stable_id(),
+        replacement_stable_id = replacement.stable_id(),
+        "Direct path connection replaced; allowing existing streams to drain"
+    );
 }

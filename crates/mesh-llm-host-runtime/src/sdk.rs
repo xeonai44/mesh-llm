@@ -20,6 +20,7 @@ use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 
 mod embedded_config;
+mod embedded_startup;
 
 pub use embedded_config::*;
 
@@ -138,6 +139,7 @@ impl Drop for EmbeddedServeHandle {
 pub async fn start_embedded_node(
     mut config: EmbeddedMeshNodeConfig,
 ) -> Result<EmbeddedServeHandle> {
+    embedded_startup::prepare_embedded_native_runtime(&config.mode)?;
     let isolated_config = prepare_isolated_config(&mut config)?;
     let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
     let runtime_options = embedded_runtime_options(&config, Some(control_rx));
@@ -501,9 +503,7 @@ impl ServingController for EmbeddedServingController {
             let capabilities = models::runtime_verified_model_capabilities(
                 &model_id,
                 &model_path,
-                models::RuntimeMediaCapabilityEvidence {
-                    vision_projector_loaded: false,
-                },
+                models::RuntimeMediaCapabilityEvidence::default(),
             );
 
             let mut state = self.inner.lock().await;

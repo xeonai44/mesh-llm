@@ -1,7 +1,7 @@
-From 47644eabc90e1e5cd2dc2264327084935531d7d0 Mon Sep 17 00:00:00 2001
+From b2a802de169d16a9dbbf19d33d134ea1e9c8e293 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 3 Jul 2026 12:18:37 -0400
-Subject: [PATCH 13/14] Add external MTP draft sidecar attachment
+Subject: [PATCH 13/47] Add external MTP draft sidecar attachment
 
 ---
  include/skippy.h        |  6 ++++
@@ -172,5 +172,5 @@ index fcd8a48f..db17f7d2 100644
              llama_free(model->ctx);
          }
 -- 
-2.54.0 (Apple Git-157)
+2.50.1 (Apple Git-155)
 

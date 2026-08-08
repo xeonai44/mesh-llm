@@ -1,18 +1,18 @@
-From 16fc6fb849ab5eb39c73a6742f2540ef28d9ae84 Mon Sep 17 00:00:00 2001
+From aec3d7b74786f7434166c15be069d882cdb39ea8 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Fri, 26 Jun 2026 13:47:52 +1000
-Subject: [PATCH 04/14] Add lanes, external media, and chat grammar support
+Subject: [PATCH 04/47] Add lanes, external media, and chat grammar support
 
 Squashes Qwen3 MoE staged execution, KV cache type and generation signal ABI, backend device selection, external media prefill, shared execution lanes, batch/flash-attention config, tool-aware chat templates, and chat grammar sampling.
 ---
  common/stage-chat.cpp    |  230 ++++++++
  include/skippy-signals.h |   44 ++
  include/skippy.h         |  165 +++---
- src/llama-kv-cache.cpp   |  361 +------------
+ src/llama-kv-cache.cpp   |  356 +------------
  src/llama-kv-cache.h     |   19 -
  src/models/qwen3moe.cpp  |   18 +-
  src/skippy.cpp           | 1079 +++++++++++++++++++++++---------------
- 7 files changed, 1019 insertions(+), 897 deletions(-)
+ 7 files changed, 1017 insertions(+), 894 deletions(-)
  create mode 100644 include/skippy-signals.h
 
 diff --git a/common/stage-chat.cpp b/common/stage-chat.cpp
@@ -573,7 +573,7 @@ index 4dd985da..3ffdb879 100644
          const char * path,
          struct skippy_model_info ** out_info,
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index e8be39b0..bbcd5b67 100644
+index 638c9664..41962096 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -196,12 +196,10 @@ llama_kv_cache::llama_kv_cache(
@@ -593,19 +593,7 @@ index e8be39b0..bbcd5b67 100644
          }
  
          // [TAG_V_CACHE_VARIABLE]
-@@ -323,9 +321,8 @@ llama_kv_cache::llama_kv_cache(
-             ggml_is_quantized(type_k) &&
-             hparams.n_embd_head_k() % 64 == 0;
- 
--        // always create Hadamard rotation tensors for DeepSeek lightning indexers
--        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4) &&
--                hparams.n_embd_head_k_full == hparams.indexer_head_size) {
-+        // always create Hadamard rotation tensors for DeepSeek V3.2 DSA lightning indexer
-+        if (model.arch == LLM_ARCH_DEEPSEEK32 && hparams.n_embd_head_k_full == hparams.indexer_head_size) {
-             attn_rot_k = true;
-         }
- 
-@@ -1225,352 +1222,6 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+@@ -1338,352 +1336,6 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
      return layers[ikv].k;
  }
  
@@ -959,7 +947,7 @@ index e8be39b0..bbcd5b67 100644
      uint32_t result = 0;
  
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index d9301c19..92394d4c 100644
+index e421bd1c..6c92186d 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -13,8 +13,6 @@ struct llama_cparams;
@@ -2392,5 +2380,5 @@ index ab5a147c..e4d08ee4 100644
  }
  
 -- 
-2.54.0 (Apple Git-157)
+2.50.1 (Apple Git-155)
 

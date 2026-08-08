@@ -8,6 +8,7 @@ LLAMA_UPSTREAM_URL="${LLAMA_UPSTREAM_URL:-https://github.com/ggml-org/llama.cpp.
 LLAMA_WORKDIR="${LLAMA_WORKDIR:-$ROOT/.deps/llama.cpp}"
 PIN_FILE="${LLAMA_PIN_FILE:-$ROOT/third_party/llama.cpp/upstream.txt}"
 PATCH_DIR="${LLAMA_PATCH_DIR:-$ROOT/third_party/llama.cpp/patches}"
+PREPARE_SCHEMA=2
 
 if [[ ! -f "$PIN_FILE" ]]; then
   echo "missing llama upstream pin: $PIN_FILE" >&2
@@ -76,7 +77,7 @@ clone_llama_workdir() {
 
   while (( attempt <= max_attempts )); do
     rm -rf "$LLAMA_WORKDIR"
-    if git clone --filter=blob:none "$LLAMA_UPSTREAM_URL" "$LLAMA_WORKDIR"; then
+    if git clone "$LLAMA_UPSTREAM_URL" "$LLAMA_WORKDIR"; then
       return 0
     else
       status=$?
@@ -94,15 +95,26 @@ clone_llama_workdir() {
   done
 }
 
-# Re-clone unless $LLAMA_WORKDIR is genuinely its own git repository. A bare
-# `[[ ! -d "$LLAMA_WORKDIR/.git" ]]` check passes a partial/corrupt checkout
-# (dir present, .git missing or incomplete) straight through to the `git -C`
-# operations below; combined with discovery walking upward, that is what lets
-# this script escape into an enclosing repo. `rev-parse --git-dir` only
-# succeeds for a real repo rooted at the workdir (discovery cannot escape past
-# GIT_CEILING_DIRECTORIES set above). clone_llama_workdir rm -rf's first, so
-# re-cloning a partial dir is safe.
-if ! git -C "$LLAMA_WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
+is_partial_llama_workdir() {
+  local promisor
+  promisor="$(git -C "$LLAMA_WORKDIR" config --bool --get remote.origin.promisor 2>/dev/null || true)"
+  [[ "$promisor" == "true" ]] ||
+    [[ -n "$(git -C "$LLAMA_WORKDIR" config --get extensions.partialClone 2>/dev/null || true)" ]]
+}
+
+# Re-clone unless $LLAMA_WORKDIR is genuinely its own complete git repository.
+# A bare `[[ ! -d "$LLAMA_WORKDIR/.git" ]]` check passes a partial/corrupt
+# checkout (dir present, .git missing or incomplete) straight through to the
+# `git -C` operations below; combined with discovery walking upward, that is
+# what lets this script escape into an enclosing repo. A blobless checkout is
+# also unsuitable: `git am --3way` must read both older upstream preimages and
+# patch-result object IDs, which a promisor remote can incorrectly try to
+# fetch from upstream. `rev-parse --git-dir` only succeeds for a real repo
+# rooted at the workdir (discovery cannot escape past GIT_CEILING_DIRECTORIES
+# set above). clone_llama_workdir rm -rf's first, so re-cloning this generated
+# dependency worktree is safe.
+if ! git -C "$LLAMA_WORKDIR" rev-parse --git-dir >/dev/null 2>&1 ||
+    is_partial_llama_workdir; then
   clone_llama_workdir
 fi
 
@@ -169,7 +181,7 @@ sha256_stream() {
 compute_patch_digest() {
   (
     for patch in "${PATCHES[@]}"; do
-      rel="${patch#$PATCH_DIR/}"
+      rel="${patch#"$PATCH_DIR"/}"
       checksum="$(sha256_file "$patch")"
       printf '%s\n' "$rel"
       printf '%s\n' "$checksum"
@@ -181,13 +193,16 @@ PATCH_DIGEST="$(compute_patch_digest)"
 
 if [[ -f "$LLAMA_WORKDIR/.mesh-llm-upstream-sha" &&
       -f "$LLAMA_WORKDIR/.mesh-llm-patched-sha" &&
-      -f "$LLAMA_WORKDIR/.mesh-llm-patch-digest" ]]; then
+      -f "$LLAMA_WORKDIR/.mesh-llm-patch-digest" &&
+      -f "$LLAMA_WORKDIR/.mesh-llm-prepare-schema" ]]; then
   PREPARED_UPSTREAM="$(tr -d '[:space:]' < "$LLAMA_WORKDIR/.mesh-llm-upstream-sha")"
   PREPARED_PATCHED="$(tr -d '[:space:]' < "$LLAMA_WORKDIR/.mesh-llm-patched-sha")"
   PREPARED_DIGEST="$(tr -d '[:space:]' < "$LLAMA_WORKDIR/.mesh-llm-patch-digest")"
+  PREPARED_SCHEMA="$(tr -d '[:space:]' < "$LLAMA_WORKDIR/.mesh-llm-prepare-schema")"
   CURRENT_HEAD="$(git -C "$LLAMA_WORKDIR" rev-parse HEAD 2>/dev/null || true)"
 
-  if [[ "$PREPARED_UPSTREAM" == "$TARGET_SHA" &&
+  if [[ "$PREPARED_SCHEMA" == "$PREPARE_SCHEMA" &&
+        "$PREPARED_UPSTREAM" == "$TARGET_SHA" &&
         "$PREPARED_PATCHED" == "$CURRENT_HEAD" &&
         "$PREPARED_DIGEST" == "$PATCH_DIGEST" &&
         ! -d "$LLAMA_WORKDIR/.git/rebase-apply" ]] &&
@@ -205,8 +220,11 @@ git -C "$LLAMA_WORKDIR" remote set-url origin "$LLAMA_UPSTREAM_URL"
 if [[ "$MODE" != "latest" ]]; then
   git_retry git -C "$LLAMA_WORKDIR" fetch origin master --tags
 fi
-git -C "$LLAMA_WORKDIR" config user.name "${GIT_AUTHOR_NAME:-Mesh-LLM CI}"
-git -C "$LLAMA_WORKDIR" config user.email "${GIT_AUTHOR_EMAIL:-ci@mesh-llm.local}"
+# The patched checkout is an artifact identity shared across CI jobs. Keep the
+# synthetic committer and timestamp deterministic so applying the same ordered
+# patch queue to the same upstream pin always produces the same HEAD.
+git -C "$LLAMA_WORKDIR" config user.name "Mesh-LLM CI"
+git -C "$LLAMA_WORKDIR" config user.email "ci@mesh-llm.local"
 
 # The llama.cpp checkout is a generated dependency worktree. Local edits there
 # should live in third_party/llama.cpp/patches, so reset before switching pins.
@@ -219,11 +237,30 @@ git -C "$LLAMA_WORKDIR" clean -fdx
 printf '%s\n' "$TARGET_SHA" > "$LLAMA_WORKDIR/.mesh-llm-upstream-sha"
 
 if (( ${#PATCHES[@]} > 0 )); then
-  git -C "$LLAMA_WORKDIR" am --3way "${PATCHES[@]}"
+  (
+    # Do not let ambient Git identity/date overrides make the generated
+    # patched commit graph job-specific.
+    unset \
+      GIT_AUTHOR_DATE \
+      GIT_AUTHOR_EMAIL \
+      GIT_AUTHOR_NAME \
+      GIT_COMMITTER_DATE \
+      GIT_COMMITTER_EMAIL \
+      GIT_COMMITTER_NAME
+    # `git am --no-verify` was added after the Git shipped by Debian Bookworm.
+    # Disable hooks through configuration instead so container and local Git
+    # versions produce the same non-interactive patch application.
+    git -c core.hooksPath=/dev/null -C "$LLAMA_WORKDIR" am \
+      --3way \
+      --committer-date-is-author-date \
+      --no-gpg-sign \
+      "${PATCHES[@]}"
+  )
 fi
 
 git -C "$LLAMA_WORKDIR" rev-parse HEAD > "$LLAMA_WORKDIR/.mesh-llm-patched-sha"
 printf '%s\n' "$PATCH_DIGEST" > "$LLAMA_WORKDIR/.mesh-llm-patch-digest"
+printf '%s\n' "$PREPARE_SCHEMA" > "$LLAMA_WORKDIR/.mesh-llm-prepare-schema"
 
 echo "prepared llama.cpp"
 echo "  upstream: $TARGET_SHA"

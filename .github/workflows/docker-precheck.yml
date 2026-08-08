@@ -34,7 +34,9 @@ jobs:
     name: ${{ inputs.job_name }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Validate target Dockerfile exists
         run: test -f "${{ inputs.dockerfile_path }}"
@@ -69,9 +71,11 @@ jobs:
             crates/mesh-llm-hardware-profile/ \
             crates/mesh-llm-identity/ \
             crates/mesh-llm-native-runtime/ \
+            crates/mesh-llm-release-footer/ \
             crates/mesh-llm-protocol/ \
             crates/mesh-llm-routing/ \
             crates/mesh-llm-runtime-install/ \
+            crates/mesh-llm-system/ \
             crates/mesh-llm-guardrails/ \
             crates/mesh-llm-types/ \
             crates/mesh-llm-config/ \

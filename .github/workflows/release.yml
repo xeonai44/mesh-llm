@@ -1,7 +1,7 @@
 name: Release
 
-# Set USE_SELF_HOSTED=true to route x86_64 CUDA release jobs and ARM64 smoke
-# validation to self-hosted runners; unset or false uses GitHub-hosted runners.
+# Set USE_SELF_HOSTED=true to route x86_64 CUDA release jobs to the dedicated
+# GPU runner; unset or false uses GitHub-hosted runners.
 
 on:
   push:
@@ -22,18 +22,32 @@ on:
         required: true
         default: false
         type: boolean
+      force_hosted_runners:
+        description: Route the self-hosted x86_64 CUDA release lane to GitHub-hosted runners for this run only
+        required: true
+        default: false
+        type: boolean
+      use_depot:
+        description: Route eligible non-GPU Linux jobs to Depot for a trusted main-ref canary
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+  packages: read
 
 env:
   CACHE_NAMESPACE: mesh-llm
+  SCCACHE_DIR: ${{ github.workspace }}/../.sccache
   SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
+  SCCACHE_MULTILEVEL_CHAIN: disk,gha
+  SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY: ignore
 
 jobs:
   metadata:
@@ -45,13 +59,47 @@ jobs:
       prerelease: ${{ steps.meta.outputs.prerelease }}
       skip_gpu_bundles: ${{ steps.meta.outputs.skip_gpu_bundles }}
       canary: ${{ steps.meta.outputs.canary }}
+      force_hosted_runners: ${{ steps.meta.outputs.force_hosted_runners }}
+      depot_enabled: ${{ steps.runners.outputs.depot_enabled }}
+      allow_depot_remote_cache: ${{ steps.runners.outputs.allow_depot_remote_cache }}
+      runner: ${{ steps.runners.outputs.runner }}
+      runner_4: ${{ steps.runners.outputs.runner_4 }}
+      runner_8: ${{ steps.runners.outputs.runner_8 }}
+      runner_16: ${{ steps.runners.outputs.runner_16 }}
+      runner_arm: ${{ steps.runners.outputs.runner_arm }}
+      runner_arm_4: ${{ steps.runners.outputs.runner_arm_4 }}
+      runner_arm_8: ${{ steps.runners.outputs.runner_arm_8 }}
+      runner_arm_16: ${{ steps.runners.outputs.runner_arm_16 }}
     steps:
+      - name: Require the trusted release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Manual releases must be dispatched from refs/heads/main, not $GITHUB_REF." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Require release tags to point at main history
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "Release tag $GITHUB_REF must point at a commit reachable from main." >&2
+            exit 1
+          fi
       - id: meta
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_SKIP_GPU_BUNDLES: ${{ inputs.skip_gpu_bundles || 'false' }}
           INPUT_CANARY: ${{ inputs.canary || 'false' }}
+          INPUT_FORCE_HOSTED_RUNNERS: ${{ inputs.force_hosted_runners || 'false' }}
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
@@ -74,11 +122,33 @@ jobs:
             echo "prerelease=$prerelease"
             echo "skip_gpu_bundles=$INPUT_SKIP_GPU_BUNDLES"
             echo "canary=$INPUT_CANARY"
+            echo "force_hosted_runners=$INPUT_FORCE_HOSTED_RUNNERS"
           } >> "$GITHUB_OUTPUT"
+      - name: Reject an existing manual release tag
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.canary != true }}
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Manual release tag already exists and is immutable: $RELEASE_TAG" >&2
+            exit 1
+          fi
+      - name: Select trusted Linux runners
+        id: runners
+        uses: ./.github/actions/select-ci-runners
+        with:
+          event_name: ${{ github.event_name }}
+          ref: ${{ github.ref }}
+          depot_main_enabled: ${{ vars.DEPOT_RUNNERS_ENABLED == 'true' }}
+          manual_use_depot: ${{ inputs.use_depot == true }}
 
   build:
-    name: Build ${{ matrix.name }}
+    name: Build immutable host ${{ matrix.name }}
     needs: metadata
+    # Host attestation consumes the signing key. Keep this producer on GitHub
+    # until compilation and signing are split into separate jobs.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -86,28 +156,20 @@ jobs:
         include:
           - name: macOS aarch64 Metal
             os: macos-15
-            artifact_name: release-macos
-            build_recipe: release-build
-            bundle_recipe: release-bundle
-            backend: metal
+            target: darwin-aarch64
           - name: Linux x86_64 CPU
             os: ubuntu-24.04
-            artifact_name: release-linux
-            build_recipe: release-build
-            bundle_recipe: release-bundle
-            backend: cpu
-    env:
-      LLAMA_STAGE_BACKEND: ${{ matrix.backend }}
+            target: linux-x86_64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 24
           cache: pnpm
@@ -115,11 +177,14 @@ jobs:
             .github/cache-version.txt
             crates/mesh-llm-ui/pnpm-lock.yaml
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
 
-      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@3d23c1bbdafe696dfccad2664945a04f47d03dc3 # just
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - uses: ./.github/actions/configure-sccache-gha
+        with:
+          allow_depot_remote_cache: ${{ needs.metadata.outputs.allow_depot_remote_cache }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -135,49 +200,121 @@ jobs:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
 
-      - name: Build release bundle
+      - name: Prepare release attestation keys
         env:
           MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
           MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
           RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
           printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
           printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
-          just --shell bash --shell-arg -c ${{ matrix.build_recipe }}
-          just --shell bash --shell-arg -c ${{ matrix.bundle_recipe }} "$RELEASE_TAG" dist
 
-      - name: Upload release bundle
-        uses: actions/upload-artifact@v6
+      - name: Build and attest release host
+        uses: ./.github/actions/prepare-host-input
+        with:
+          profile: release
+          output_dir: host-input
+          attestation_signing_key_file: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+
+      - name: Upload immutable host input
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: host-input-${{ matrix.target }}
+          path: host-input/*
+          if-no-files-found: error
+
+  compose_cpu_products:
+    name: Compose CPU product ${{ matrix.name }}
+    needs: [metadata, build, build_native_runtime]
+    runs-on: ${{ matrix.host_target == 'linux-x86_64' && needs.metadata.outputs.runner_4 || matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS aarch64 Metal
+            os: macos-15
+            host_target: darwin-aarch64
+            runtime_artifact: release-native-runtime-darwin-aarch64-metal
+            flavor: metal
+            release_os: Darwin
+            release_arch: aarch64
+            artifact_name: release-macos
+          - name: Linux x86_64 CPU
+            os: ubuntu-24.04
+            host_target: linux-x86_64
+            runtime_artifact: release-native-runtime-linux-x86_64-cpu
+            flavor: cpu
+            release_os: Linux
+            release_arch: x86_64
+            artifact_name: release-linux
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+      - name: Download immutable host input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: host-input-${{ matrix.host_target }}
+          path: host-input
+      - name: Download immutable runtime input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ${{ matrix.runtime_artifact }}
+          path: runtime-input
+      - name: Prepare release verification key
+        env:
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
+        run: printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
+
+      - name: Compose from verified producer inputs
+        id: compose
+        uses: ./.github/actions/compose-product-input
+        with:
+          host_input_dir: host-input
+          runtime_input_dir: runtime-input
+          output_dir: product-input
+          version: ${{ needs.metadata.outputs.tag }}
+          backend: ${{ matrix.flavor }}
+          readiness_smoke: "true"
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+
+      - name: Package verified product
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_RELEASE_OS: ${{ matrix.release_os }}
+          MESH_RELEASE_ARCH: ${{ matrix.release_arch }}
+          MESH_RELEASE_FLAVOR: ${{ matrix.flavor }}
+          MESH_LLM_RELEASE_BIN_DIR: ${{ github.workspace }}/host-input
+          MESH_LLM_NATIVE_RUNTIME_ROOT: ${{ steps.compose.outputs.runtime_root }}
+          MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}
+          MESH_RELEASE_HOST_PRESTAMPED: "1"
+          MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+        run: scripts/package-release.sh "$RELEASE_TAG" dist
+      - name: Upload composed release product
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ matrix.artifact_name }}
           path: dist/*
           if-no-files-found: error
-
-      - name: Upload Linux smoke binary
+      - name: Upload Linux composed smoke product
         if: matrix.artifact_name == 'release-linux'
-        run: |
-          set -euo pipefail
-          tmp_dir="$(mktemp -d)"
-          trap 'rm -rf "$tmp_dir"' EXIT
-          tar -xzf dist/mesh-llm-x86_64-unknown-linux-gnu.tar.gz -C "$tmp_dir"
-          cp "$tmp_dir/mesh-bundle/mesh-llm" dist/mesh-llm
-
-      - name: Upload Linux smoke binary artifact
-        if: matrix.artifact_name == 'release-linux'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: release-linux-inference-binary
-          path: dist/mesh-llm
+          name: ci-release-linux-inference-product
+          path: ${{ steps.compose.outputs.archive_path }}
           if-no-files-found: error
 
   inference_smoke_tests:
-    needs: [metadata, build]
-    if: needs.build.result == 'success'
+    needs: [metadata, compose_cpu_products]
+    if: needs.compose_cpu_products.result == 'success'
     uses: ./.github/workflows/smoke.yml
     with:
-      artifact_name: release-linux-inference-binary
+      artifact_name: ci-release-linux-inference-product
       mesh_binary_target: target/release/mesh-llm
       cache_key_prefix: release-
       release_tag: ${{ needs.metadata.outputs.tag }}
@@ -187,7 +324,9 @@ jobs:
   build_native_sdk_runtime:
     name: Build native SDK runtime ${{ matrix.name }}
     needs: metadata
-    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -207,60 +346,55 @@ jobs:
             backend: cpu
             target: aarch64-unknown-linux-gnu
             artifact_suffix: linux-aarch64-cpu
-    env:
-      LLAMA_STAGE_BACKEND: ${{ matrix.backend }}
-      MESH_NATIVE_SDK_TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
+    uses: ./.github/workflows/native-sdk-artifact.yml
+    with:
+      backend: ${{ matrix.backend }}
+      target: ${{ matrix.target }}
+      profile: release
+      artifact_name: release-native-sdk-${{ matrix.artifact_suffix }}
+      static_abi_artifact_name: ci-release-native-sdk-static-abi-${{ matrix.artifact_suffix }}
+      static_abi_artifact_path: native-sdk-static-abi-input
+      produce_static_abi: ${{ endsWith(matrix.target, '-unknown-linux-gnu') }}
+      runner_size: '8'
+      include_runtime_crate: true
+      release_tag: ${{ needs.metadata.outputs.tag }}
+      prepare_release_version: ${{ github.event_name == 'workflow_dispatch' }}
+      retention_days: 90
+      timeout_minutes: 90
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl lld
-
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        run: brew install cmake ninja lld
-
-      - name: Prepare dispatched release version
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-        run: scripts/release-version.sh "$RELEASE_TAG"
-
-      - name: Package native SDK runtime
-        run: |
-          scripts/package-native-sdk.sh \
-            --build \
-            --backend "${{ matrix.backend }}" \
-            --target "${{ matrix.target }}" \
-            --out dist/native-sdk
-
-      - name: Verify native SDK runtime artifact
-        run: scripts/verify-native-sdk-package.sh dist/native-sdk/*.tar.gz
-
-      - name: Package native SDK runtime crate
-        run: scripts/package-native-sdk-crate.sh --out dist/native-sdk-crates dist/native-sdk/*.tar.gz
-
-      - name: Upload native SDK runtime
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-native-sdk-${{ matrix.artifact_suffix }}
-          path: |
-            dist/native-sdk/*.tar.gz
-            dist/native-sdk/*.sha256
-            dist/native-sdk-crates/*/target/package/*.crate
-          if-no-files-found: error
+  build_node_sdk_addon:
+    name: Build Node SDK addon ${{ matrix.name }}
+    needs: metadata
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM64
+            target: darwin-arm64
+          - name: macOS x64
+            target: darwin-x64
+          - name: Linux ARM64
+            target: linux-arm64
+          - name: Linux x64
+            target: linux-x64
+          - name: Windows x64
+            target: win32-x64
+    uses: ./.github/workflows/node-sdk-addon-artifact.yml
+    with:
+      target: ${{ matrix.target }}
+      artifact_name: release-node-sdk-addon-${{ matrix.target }}
+      release_tag: ${{ needs.metadata.outputs.tag }}
+      prepare_release_version: ${{ github.event_name == 'workflow_dispatch' }}
+      retention_days: 90
+      timeout_minutes: 90
 
   build_native_runtime:
     name: Build native runtime ${{ matrix.name }}
     needs: metadata
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && needs.metadata.outputs.runner_8 || matrix.target == 'aarch64-unknown-linux-gnu' && needs.metadata.outputs.runner_arm_8 || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -284,13 +418,16 @@ jobs:
       LLAMA_STAGE_BACKEND: ${{ matrix.backend }}
       MESH_NATIVE_RUNTIME_TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - uses: ./.github/actions/configure-sccache-gha
+        with:
+          allow_depot_remote_cache: ${{ needs.metadata.outputs.allow_depot_remote_cache }}
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -299,6 +436,10 @@ jobs:
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         run: brew install cmake ninja lld
+      - name: Resolve hosted native toolchain epoch
+        uses: ./.github/actions/resolve-native-toolchain-epoch
+        with:
+          include_tool_versions: "true"
 
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
@@ -307,18 +448,14 @@ jobs:
         run: scripts/release-version.sh "$RELEASE_TAG"
 
       - name: Package native runtime
-        run: |
-          scripts/package-native-runtime.sh \
-            --build \
-            --backend "${{ matrix.backend }}" \
-            --target "${{ matrix.target }}" \
-            --out dist/native-runtimes
-
-      - name: Verify native runtime artifact
-        run: scripts/verify-native-runtime-package.sh dist/native-runtimes/*.tar.gz
+        uses: ./.github/actions/prepare-native-runtime-input
+        with:
+          backend: ${{ matrix.backend }}
+          target: ${{ matrix.target }}
+          output_dir: dist/native-runtimes
 
       - name: Upload native runtime
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-native-runtime-${{ matrix.artifact_suffix }}
           path: |
@@ -337,52 +474,50 @@ jobs:
         include:
           - cuda_version: '12.9.2'
             cuda_major: '12'
+            runner_image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:c5b85ef527230f77cf9933ef40bcb44316f9bbcb8fd2ce0651b58acda5143dfd
+            toolchain_epoch: mesh-llm-cuda-runner-sha256-c5b85ef527230f77cf9933ef40bcb44316f9bbcb8fd2ce0651b58acda5143dfd
           - cuda_version: '13.1.2'
             cuda_major: '13'
+            runner_image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:6b87598605f5d8deeafecfb1a55027e0ca9e47f4fc6f230d030487c450c31aa6
+            toolchain_epoch: mesh-llm-cuda-runner-sha256-6b87598605f5d8deeafecfb1a55027e0ca9e47f4fc6f230d030487c450c31aa6
     container:
-      image: nvidia/cuda:${{ matrix.cuda_version }}-devel-ubuntu24.04
+      image: ${{ matrix.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       LLAMA_STAGE_BACKEND: cuda
       MESH_NATIVE_RUNTIME_TARGET: aarch64-unknown-linux-gnu
       MESH_LLM_CUDA_TOOLKIT_MAJOR: ${{ matrix.cuda_major }}
+      SCCACHE_GHA_ENABLED: "false"
     steps:
-      - name: Install base packages
-        run: |
-          for attempt in 1 2 3; do
-            apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld patchelf &&
-              break
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
-          rm -rf /var/lib/apt/lists/*
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Trust checkout directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/setup-node@v5
+      - name: Verify prebuilt backend environment
+        run: verify-runner-image public cuda
+      - name: Resolve CUDA native toolchain epoch
+        uses: ./.github/actions/resolve-native-toolchain-epoch
         with:
-          node-version: 24
-      - uses: dtolnay/rust-toolchain@stable
+          pinned_epoch: ${{ matrix.toolchain_epoch }}
+      - uses: ./.github/actions/configure-sccache-gha
+        with:
+          allow_depot_remote_cache: ${{ needs.metadata.outputs.allow_depot_remote_cache }}
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Package native runtime
-        run: |
-          scripts/package-native-runtime.sh \
-            --build \
-            --backend cuda \
-            --target aarch64-unknown-linux-gnu \
-            --out dist/native-runtimes
-      - name: Verify native runtime artifact
-        run: scripts/verify-native-runtime-package.sh dist/native-runtimes/*.tar.gz
+        uses: ./.github/actions/prepare-native-runtime-input
+        with:
+          backend: cuda
+          target: aarch64-unknown-linux-gnu
+          output_dir: dist/native-runtimes
       - name: Upload native runtime
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-native-runtime-linux-aarch64-cuda-${{ matrix.cuda_major }}
           path: |
@@ -394,70 +529,69 @@ jobs:
     name: Build native runtime Linux x86_64 CUDA (${{ matrix.cuda_major }})
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ${{ fromJson(vars.USE_SELF_HOSTED == 'true' && '["self-hosted","Linux","X64","amd64","gpu-nvidia"]' || '["ubuntu-24.04"]') }}
+    runs-on: ${{ fromJson(vars.USE_SELF_HOSTED == 'true' && needs.metadata.outputs.force_hosted_runners != 'true' && '["self-hosted","Linux","X64","amd64","gpu-nvidia"]' || '["ubuntu-24.04"]') }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - cuda_version: '12.9.2'
             cuda_major: '12'
+            runner_image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:c5b85ef527230f77cf9933ef40bcb44316f9bbcb8fd2ce0651b58acda5143dfd
+            toolchain_epoch: mesh-llm-cuda-runner-sha256-c5b85ef527230f77cf9933ef40bcb44316f9bbcb8fd2ce0651b58acda5143dfd
             cuda_architectures: '75;80;86;87;89;90'
             cuda_architectures_cache: '75_80_86_87_89_90'
           - cuda_version: '13.1.2'
             cuda_major: '13'
+            runner_image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:6b87598605f5d8deeafecfb1a55027e0ca9e47f4fc6f230d030487c450c31aa6
+            toolchain_epoch: mesh-llm-cuda-runner-sha256-6b87598605f5d8deeafecfb1a55027e0ca9e47f4fc6f230d030487c450c31aa6
             cuda_architectures: '75;80;86;87;89;90;100;103;120;121'
             cuda_architectures_cache: '75_80_86_87_89_90_100_103_120_121'
     container:
-      image: nvidia/cuda:${{ matrix.cuda_version }}-devel-ubuntu24.04
+      image: ${{ matrix.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       LLAMA_STAGE_BACKEND: cuda
       LLAMA_STAGE_CUDA_ARCHITECTURES: ${{ matrix.cuda_architectures }}
       LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-dynamic-cuda-sm${{ matrix.cuda_architectures_cache }}
       MESH_NATIVE_RUNTIME_TARGET: x86_64-unknown-linux-gnu
       MESH_LLM_CUDA_TOOLKIT_MAJOR: ${{ matrix.cuda_major }}
+      SCCACHE_GHA_ENABLED: "false"
     steps:
-      - name: Install base packages
-        run: |
-          for attempt in 1 2 3; do
-            apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld patchelf &&
-              break
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
-          rm -rf /var/lib/apt/lists/*
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Trust checkout directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/setup-node@v5
+      - name: Verify prebuilt backend environment
+        run: verify-runner-image public cuda
+      - name: Resolve CUDA native toolchain epoch
+        id: native_toolchain
+        uses: ./.github/actions/resolve-native-toolchain-epoch
         with:
-          node-version: 24
-      - uses: dtolnay/rust-toolchain@stable
+          pinned_epoch: ${{ matrix.toolchain_epoch }}
+      - uses: ./.github/actions/configure-sccache-gha
+        with:
+          allow_depot_remote_cache: ${{ needs.metadata.outputs.allow_depot_remote_cache }}
       - name: Cache native runtime CUDA backend build
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.LLAMA_STAGE_BUILD_DIR }}
-          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-cuda${{ matrix.cuda_major }}-${{ matrix.cuda_version }}-dynamic-${{ matrix.cuda_architectures_cache }}-${{ hashFiles('scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'scripts/package-native-runtime.sh', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
+          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-cuda${{ matrix.cuda_major }}-${{ matrix.cuda_version }}-dynamic-${{ matrix.cuda_architectures_cache }}-${{ steps.native_toolchain.outputs.epoch }}-${{ hashFiles('scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'scripts/package-native-runtime.sh', '.github/actions/prepare-native-runtime-input/action.yml', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Package native runtime
-        run: |
-          scripts/package-native-runtime.sh \
-            --build \
-            --backend cuda \
-            --target x86_64-unknown-linux-gnu \
-            --out dist/native-runtimes
-      - name: Verify native runtime artifact
-        run: scripts/verify-native-runtime-package.sh dist/native-runtimes/*.tar.gz
+        uses: ./.github/actions/prepare-native-runtime-input
+        with:
+          backend: cuda
+          target: x86_64-unknown-linux-gnu
+          output_dir: dist/native-runtimes
       - name: Upload native runtime
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-native-runtime-linux-x86_64-cuda-${{ matrix.cuda_major }}
           path: |
@@ -469,57 +603,52 @@ jobs:
     name: Build native runtime Linux x86_64 ROCm
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.metadata.outputs.runner_16 }}
     container:
-      image: rocm/dev-ubuntu-24.04:7.0-complete
+      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:0e13e5d2d2c121df265ff6c69be81e468989e09f81d6b7ff049b110cc0bb0d2b
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       LLAMA_STAGE_BACKEND: rocm
-      LLAMA_STAGE_AMDGPU_TARGETS: gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201
-      LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-dynamic-rocm-gfx90a_gfx942_gfx1100_gfx1101_gfx1102_gfx1200_gfx1201
+      LLAMA_STAGE_AMDGPU_TARGETS: gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1103;gfx1151;gfx1200;gfx1201
+      LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-dynamic-rocm-gfx90a_gfx942_gfx1100_gfx1101_gfx1102_gfx1103_gfx1151_gfx1200_gfx1201
       MESH_NATIVE_RUNTIME_TARGET: x86_64-unknown-linux-gnu
+      SCCACHE_GHA_ENABLED: "false"
     steps:
-      - name: Install base packages
-        run: |
-          for attempt in 1 2 3; do
-            apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld patchelf &&
-              break
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
-          rm -rf /var/lib/apt/lists/*
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Trust checkout directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/setup-node@v5
+      - name: Verify prebuilt backend environment
+        run: verify-runner-image public rocm
+      - name: Resolve ROCm native toolchain epoch
+        id: native_toolchain
+        uses: ./.github/actions/resolve-native-toolchain-epoch
         with:
-          node-version: 24
-      - uses: dtolnay/rust-toolchain@stable
+          pinned_epoch: mesh-llm-cuda-runner-sha256-0e13e5d2d2c121df265ff6c69be81e468989e09f81d6b7ff049b110cc0bb0d2b
+      - uses: ./.github/actions/configure-sccache-gha
+        with:
+          allow_depot_remote_cache: ${{ needs.metadata.outputs.allow_depot_remote_cache }}
       - name: Cache native runtime ROCm backend build
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.LLAMA_STAGE_BUILD_DIR }}
-          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-rocm7.0-dynamic-gfx90a_gfx942_gfx1100_gfx1101_gfx1102_gfx1200_gfx1201-${{ hashFiles('scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'scripts/package-native-runtime.sh', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
+          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-rocm7.0-dynamic-gfx90a_gfx942_gfx1100_gfx1101_gfx1102_gfx1103_gfx1151_gfx1200_gfx1201-${{ steps.native_toolchain.outputs.epoch }}-${{ hashFiles('scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'scripts/package-native-runtime.sh', '.github/actions/prepare-native-runtime-input/action.yml', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Package native runtime
-        run: |
-          scripts/package-native-runtime.sh \
-            --build \
-            --backend rocm \
-            --target x86_64-unknown-linux-gnu \
-            --out dist/native-runtimes
-      - name: Verify native runtime artifact
-        run: scripts/verify-native-runtime-package.sh dist/native-runtimes/*.tar.gz
+        uses: ./.github/actions/prepare-native-runtime-input
+        with:
+          backend: rocm
+          target: x86_64-unknown-linux-gnu
+          output_dir: dist/native-runtimes
       - name: Upload native runtime
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-native-runtime-linux-x86_64-rocm
           path: |
@@ -531,39 +660,51 @@ jobs:
     name: Build native runtime Linux x86_64 Vulkan
     needs: metadata
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.metadata.outputs.runner_16 }}
+    container:
+      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:ce55fed5c680cd3184b5d4770d9a77c43a702687690906e5753efd2cea27ed80
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       LLAMA_STAGE_BACKEND: vulkan
       LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-dynamic-vulkan
       MESH_NATIVE_RUNTIME_TARGET: x86_64-unknown-linux-gnu
+      SCCACHE_GHA_ENABLED: "false"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl python3 glslc libvulkan-dev spirv-headers lld patchelf
+      - name: Trust checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Verify prebuilt backend environment
+        run: verify-runner-image public vulkan
+      - name: Resolve Vulkan native toolchain epoch
+        id: native_toolchain
+        uses: ./.github/actions/resolve-native-toolchain-epoch
+        with:
+          pinned_epoch: mesh-llm-cuda-runner-sha256-ce55fed5c680cd3184b5d4770d9a77c43a702687690906e5753efd2cea27ed80
+      - uses: ./.github/actions/configure-sccache-gha
+        with:
+          allow_depot_remote_cache: ${{ needs.metadata.outputs.allow_depot_remote_cache }}
       - name: Cache native runtime Vulkan backend build
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ${{ env.LLAMA_STAGE_BUILD_DIR }}
-          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-vulkan-dynamic-${{ hashFiles('scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'scripts/package-native-runtime.sh', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
+          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-vulkan-dynamic-${{ steps.native_toolchain.outputs.epoch }}-${{ hashFiles('scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'scripts/package-native-runtime.sh', '.github/actions/prepare-native-runtime-input/action.yml', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Package native runtime
-        run: |
-          scripts/package-native-runtime.sh \
-            --build \
-            --backend vulkan \
-            --target x86_64-unknown-linux-gnu \
-            --out dist/native-runtimes
-      - name: Verify native runtime artifact
-        run: scripts/verify-native-runtime-package.sh dist/native-runtimes/*.tar.gz
+        uses: ./.github/actions/prepare-native-runtime-input
+        with:
+          backend: vulkan
+          target: x86_64-unknown-linux-gnu
+          output_dir: dist/native-runtimes
       - name: Upload native runtime
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-native-runtime-linux-x86_64-vulkan
           path: |
@@ -574,109 +715,44 @@ jobs:
   build_swift_sdk_artifact:
     name: Build Swift SDK XCFramework
     needs: metadata
-    runs-on: macos-15
-    env:
-      LLAMA_STAGE_BACKEND: metal
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: |
-            .github/cache-version.txt
-            crates/mesh-llm-ui/pnpm-lock.yaml
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Install macOS dependencies
-        run: brew install cmake ninja lld
-
-      - name: Prepare dispatched release version
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-        run: scripts/release-version.sh "$RELEASE_TAG"
-
-      - name: Prepare Swift console resources
-        run: |
-          scripts/package-sdk-console-assets.sh --sdk swift
-          scripts/verify-sdk-console-assets.sh --sdk swift
-
-      - name: Verify tagged Swift console resources
-        if: github.event_name != 'workflow_dispatch'
-        run: git ls-files --error-unmatch sdk/swift/Sources/MeshLLM/Resources/Console/index.html
-
-      - name: Build SwiftPM binary artifact
-        run: |
-          sdk/swift/scripts/build-xcframework.sh
-          mkdir -p dist
-          rm -f dist/MeshLLMFFI.xcframework.zip
-          ditto -c -k --sequesterRsrc --keepParent \
-            sdk/swift/Generated/MeshLLMFFI.xcframework \
-            dist/MeshLLMFFI.xcframework.zip
-
-      - name: Prepare SwiftPM manifest for dispatched release
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          scripts/update-swift-package-manifest.sh \
-            "${{ needs.metadata.outputs.tag }}" \
-            dist/MeshLLMFFI.xcframework.zip
-
-      - name: Verify SwiftPM binary artifact
-        run: |
-          scripts/verify-swift-release-artifact.sh dist/MeshLLMFFI.xcframework.zip
-          scripts/verify-swift-package-manifest.sh \
-            "${{ needs.metadata.outputs.tag }}" \
-            dist/MeshLLMFFI.xcframework.zip
-
-      - name: Upload generated SwiftPM manifest
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v6
-        with:
-          name: swift-package-manifest
-          path: Package.swift
-          if-no-files-found: error
-
-      - name: Upload SwiftPM binary artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: release-swift-sdk
-          path: dist/MeshLLMFFI.xcframework.zip
-          if-no-files-found: error
+    permissions:
+      contents: read
+    uses: ./.github/workflows/swift-sdk-artifact.yml
+    with:
+      mode: full
+      artifact_name: release-swift-sdk
+      release_tag: ${{ needs.metadata.outputs.tag }}
+      prepare_release_version: ${{ github.event_name == 'workflow_dispatch' }}
+      update_release_manifest: ${{ github.event_name == 'workflow_dispatch' }}
+      require_tracked_console: ${{ github.event_name != 'workflow_dispatch' }}
+      retention_days: 90
+      timeout_minutes: 180
 
   build_linux_arm64:
-    name: Build Linux ARM64 CPU
+    name: Build immutable host Linux ARM64
     needs: metadata
+    # Host attestation consumes the signing key. Keep this producer on GitHub
+    # until compilation and signing are split into separate jobs.
     runs-on: ubuntu-24.04-arm
     env:
       LLAMA_STAGE_BACKEND: cpu
       MESH_RELEASE_ARCH: aarch64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: |
             .github/cache-version.txt
             crates/mesh-llm-ui/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+      - uses: taiki-e/install-action@3d23c1bbdafe696dfccad2664945a04f47d03dc3 # just
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl lld
       - name: Prepare dispatched release version
@@ -684,19 +760,80 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
-      - name: Build ARM64 CPU release bundle
+      - name: Prepare release attestation keys
         env:
           MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
           MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
           RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
           RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
           printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
           printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
-          just --shell bash --shell-arg -c release-build-aarch64
-          just --shell bash --shell-arg -c release-bundle-aarch64 "$RELEASE_TAG" dist
-      - uses: actions/upload-artifact@v6
+
+      - name: Build and attest ARM64 release host
+        uses: ./.github/actions/prepare-host-input
+        with:
+          profile: release
+          output_dir: host-input
+          attestation_signing_key_file: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: host-input-linux-aarch64
+          path: host-input/*
+          if-no-files-found: error
+
+  compose_linux_arm64_cpu:
+    name: Compose Linux ARM64 CPU product
+    needs: [metadata, build_linux_arm64, build_native_runtime]
+    runs-on: ${{ needs.metadata.outputs.runner_arm_4 }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: host-input-linux-aarch64
+          path: host-input
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-native-runtime-linux-aarch64-cpu
+          path: runtime-input
+      - name: Prepare release verification key
+        env:
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
+        run: printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
+
+      - name: Compose from verified producer inputs
+        id: compose
+        uses: ./.github/actions/compose-product-input
+        with:
+          host_input_dir: host-input
+          runtime_input_dir: runtime-input
+          output_dir: product-input
+          version: ${{ needs.metadata.outputs.tag }}
+          backend: cpu
+          readiness_smoke: "true"
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+
+      - name: Package verified ARM64 CPU product
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_RELEASE_OS: Linux
+          MESH_RELEASE_ARCH: aarch64
+          MESH_RELEASE_FLAVOR: cpu
+          MESH_LLM_RELEASE_BIN_DIR: ${{ github.workspace }}/host-input
+          MESH_LLM_NATIVE_RUNTIME_ROOT: ${{ steps.compose.outputs.runtime_root }}
+          MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}
+          MESH_RELEASE_HOST_PRESTAMPED: "1"
+          MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+        run: scripts/package-release.sh "$RELEASE_TAG" dist
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-linux-arm64
           path: dist/*
@@ -704,11 +841,14 @@ jobs:
 
   smoke_linux_arm64_artifact:
     name: Smoke Linux ARM64 artifact
-    needs: [metadata, build_linux_arm64]
-    if: ${{ needs.build_linux_arm64.result == 'success' }}
-    runs-on: ${{ fromJson(vars.USE_SELF_HOSTED == 'true' && '["self-hosted","Linux","ARM64"]' || '["ubuntu-24.04-arm"]') }}
+    needs: [metadata, compose_linux_arm64_cpu]
+    if: ${{ needs.compose_linux_arm64_cpu.result == 'success' }}
+    runs-on: ${{ needs.metadata.outputs.runner_arm }}
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: release-linux-arm64
           path: release-linux-arm64
@@ -717,18 +857,16 @@ jobs:
           EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           set -euo pipefail
-          cd release-linux-arm64
-          tarball="mesh-llm-aarch64-unknown-linux-gnu.tar.gz"
+          artifact_dir="release-linux-arm64"
+          tarball="$artifact_dir/mesh-llm-aarch64-unknown-linux-gnu.tar.gz"
           if [[ ! -f "$tarball" ]]; then
             echo "missing expected ARM64 release archive: $tarball" >&2
-            find . -maxdepth 1 -type f -print | sort >&2
+            find "$artifact_dir" -maxdepth 1 -type f -print | sort >&2
             exit 1
           fi
-          if command -v sha256sum >/dev/null 2>&1 && [[ -f "$tarball.sha256" ]]; then
-            sha256sum -c "$tarball.sha256"
-          fi
+          python3 scripts/verify-checksum-sidecar.py "$tarball"
           mkdir -p smoke
-          tar -xzf "$tarball" -C smoke
+          python3 scripts/safe-extract-tar.py "$tarball" smoke
           binary="smoke/mesh-bundle/mesh-llm"
           version_output="$("$binary" --version)"
           actual_version="$(awk '{print $NF}' <<<"$version_output")"
@@ -740,148 +878,166 @@ jobs:
           "$binary" --help | head -5
           "$binary" runtime --help | head -20
 
-  build_linux_aarch64_cuda:
-    name: Build Linux aarch64 CUDA (${{ matrix.cuda_version }})
-    needs: metadata
+  compose_linux_aarch64_cuda:
+    name: Compose Linux aarch64 CUDA (${{ matrix.cuda_version }})
+    needs: [metadata, build_linux_arm64, build_native_runtime_linux_aarch64_cuda]
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
-        cuda_version: ['12.9.2', '13.1.2']
+        include:
+          - cuda_version: '12.9.2'
+            runner_image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:c5b85ef527230f77cf9933ef40bcb44316f9bbcb8fd2ce0651b58acda5143dfd
+          - cuda_version: '13.1.2'
+            runner_image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:6b87598605f5d8deeafecfb1a55027e0ca9e47f4fc6f230d030487c450c31aa6
     container:
-      image: nvidia/cuda:${{ matrix.cuda_version }}-devel-ubuntu24.04
+      image: ${{ matrix.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
-      LLAMA_STAGE_BACKEND: cuda
-      MESH_RELEASE_ARCH: aarch64
       MESH_CUDA_VERSION: ${{ matrix.cuda_version }}
     steps:
-      - name: Install base packages
-        run: |
-          for attempt in 1 2 3; do
-            apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld &&
-              break
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
-          rm -rf /var/lib/apt/lists/*
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Trust checkout directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: pnpm/action-setup@v4
+      - name: Verify prebuilt backend environment
+        run: verify-runner-image public cuda
+      - name: Download immutable host input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          version: 10
-      - uses: actions/setup-node@v5
+          name: host-input-linux-aarch64
+          path: host-input
+      - name: Download immutable runtime input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: |
-            .github/cache-version.txt
-            crates/mesh-llm-ui/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
+          name: release-native-runtime-linux-aarch64-cuda-${{ matrix.cuda_version == '12.9.2' && '12' || '13' }}
+          path: runtime-input
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
-      - name: Build aarch64 CUDA release bundle
+
+      - name: Prepare release verification key
         env:
-          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
           MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
           RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
-        run: |
-          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
-          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
-          just --shell bash --shell-arg -c release-build-aarch64-cuda
-          just --shell bash --shell-arg -c release-bundle-aarch64-cuda "$RELEASE_TAG" dist
-      - uses: actions/upload-artifact@v6
+        run: printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
+
+      - name: Compose aarch64 CUDA product from producer inputs
+        id: compose
+        uses: ./.github/actions/compose-product-input
+        with:
+          host_input_dir: host-input
+          runtime_input_dir: runtime-input
+          output_dir: product-input
+          version: ${{ needs.metadata.outputs.tag }}
+          backend: cuda
+          readiness_smoke: "true"
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+
+      - name: Package verified aarch64 CUDA product
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_RELEASE_OS: Linux
+          MESH_RELEASE_ARCH: aarch64
+          MESH_RELEASE_FLAVOR: cuda
+          MESH_LLM_RELEASE_BIN_DIR: ${{ github.workspace }}/host-input
+          MESH_LLM_NATIVE_RUNTIME_ROOT: ${{ steps.compose.outputs.runtime_root }}
+          MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}
+          MESH_RELEASE_HOST_PRESTAMPED: "1"
+          MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+        run: scripts/package-release.sh "$RELEASE_TAG" dist
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-linux-aarch64-cuda-${{ matrix.cuda_version }}
           path: dist/*
           if-no-files-found: error
 
-  build_linux_cuda:
-    name: Build Linux CUDA (${{ matrix.cuda_version }})
-    needs: metadata
+  compose_linux_cuda:
+    name: Compose Linux CUDA (${{ matrix.cuda_version }})
+    needs: [metadata, build, build_native_runtime_linux_x86_64_cuda]
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ${{ fromJson(vars.USE_SELF_HOSTED == 'true' && '["self-hosted","Linux","X64","amd64","gpu-nvidia"]' || '["ubuntu-24.04"]') }}
+    runs-on: ${{ needs.metadata.outputs.runner_4 }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - cuda_version: '12.9.2'
             cuda_major: '12'
-            cuda_architectures_cache: '75_80_86_87_89_90'
+            runner_image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:c5b85ef527230f77cf9933ef40bcb44316f9bbcb8fd2ce0651b58acda5143dfd
           - cuda_version: '13.1.2'
             cuda_major: '13'
-            cuda_architectures_cache: '75_80_86_87_89_90_100_103_120_121'
+            runner_image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:6b87598605f5d8deeafecfb1a55027e0ca9e47f4fc6f230d030487c450c31aa6
     container:
-      image: nvidia/cuda:${{ matrix.cuda_version }}-devel-ubuntu24.04
+      image: ${{ matrix.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
-      LLAMA_STAGE_BACKEND: cuda
-      LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-cuda-sm${{ matrix.cuda_architectures_cache }}
       MESH_CUDA_VERSION: ${{ matrix.cuda_version }}
     steps:
-      - name: Install base packages
-        run: |
-          for attempt in 1 2 3; do
-            apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld &&
-              break
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
-          rm -rf /var/lib/apt/lists/*
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Trust checkout directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: pnpm/action-setup@v4
+      - name: Verify prebuilt backend environment
+        run: verify-runner-image public cuda
+      - name: Download immutable host input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          version: 10
-      - uses: actions/setup-node@v5
+          name: host-input-linux-x86_64
+          path: host-input
+      - name: Download immutable runtime input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: |
-            .github/cache-version.txt
-            crates/mesh-llm-ui/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
-      - name: Cache release CUDA backend build
-        uses: actions/cache@v5
-        with:
-          path: ${{ env.LLAMA_STAGE_BUILD_DIR }}
-          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-cuda${{ matrix.cuda_major }}-${{ matrix.cuda_version }}-static-${{ matrix.cuda_architectures_cache }}-${{ hashFiles('scripts/build-linux.sh', 'scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'Justfile', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
+          name: release-native-runtime-linux-x86_64-cuda-${{ matrix.cuda_major }}
+          path: runtime-input
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
-      - name: Build CUDA release bundle
+      - name: Prepare release verification key
         env:
-          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
           MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
           RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
-        run: |
-          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
-          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
-          just --shell bash --shell-arg -c release-build-cuda
-          just --shell bash --shell-arg -c release-bundle-cuda "$RELEASE_TAG" dist
-      - uses: actions/upload-artifact@v6
+        run: printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
+
+      - name: Compose CUDA product from producer inputs
+        id: compose
+        uses: ./.github/actions/compose-product-input
+        with:
+          host_input_dir: host-input
+          runtime_input_dir: runtime-input
+          output_dir: product-input
+          version: ${{ needs.metadata.outputs.tag }}
+          backend: cuda
+          readiness_smoke: "true"
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+
+      - name: Package verified CUDA product
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_RELEASE_OS: Linux
+          MESH_RELEASE_ARCH: x86_64
+          MESH_RELEASE_FLAVOR: cuda
+          MESH_LLM_RELEASE_BIN_DIR: ${{ github.workspace }}/host-input
+          MESH_LLM_NATIVE_RUNTIME_ROOT: ${{ steps.compose.outputs.runtime_root }}
+          MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}
+          MESH_RELEASE_HOST_PRESTAMPED: "1"
+          MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+        run: scripts/package-release.sh "$RELEASE_TAG" dist
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-linux-cuda-${{ matrix.cuda_version }}
           path: dist/*
@@ -889,277 +1045,324 @@ jobs:
 
 
 
-  build_linux_rocm:
-    name: Build Linux ROCm
-    needs: metadata
+  compose_linux_rocm:
+    name: Compose Linux ROCm
+    needs: [metadata, build, build_native_runtime_linux_x86_64_rocm]
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.metadata.outputs.runner_4 }}
     container:
-      image: rocm/dev-ubuntu-24.04:7.0-complete
-    env:
-      LLAMA_STAGE_BACKEND: rocm
-      LLAMA_STAGE_AMDGPU_TARGETS: gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201
-      LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-rocm-gfx90a_gfx942_gfx1100_gfx1101_gfx1102_gfx1200_gfx1201
+      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:0e13e5d2d2c121df265ff6c69be81e468989e09f81d6b7ff049b110cc0bb0d2b
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Install base packages
-        run: |
-          for attempt in 1 2 3; do
-            apt-get -o Acquire::Retries=5 update &&
-              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --fix-missing ca-certificates curl git cmake ninja-build pkg-config libssl-dev libdbus-1-dev python3 build-essential lld &&
-              break
-            if [ "$attempt" -eq 3 ]; then
-              exit 1
-            fi
-            sleep $((attempt * 10))
-          done
-          rm -rf /var/lib/apt/lists/*
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Trust checkout directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: pnpm/action-setup@v4
+      - name: Verify prebuilt backend environment
+        run: verify-runner-image public rocm
+      - name: Download immutable host input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          version: 10
-      - uses: actions/setup-node@v5
+          name: host-input-linux-x86_64
+          path: host-input
+      - name: Download immutable runtime input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: |
-            .github/cache-version.txt
-            crates/mesh-llm-ui/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
-      - name: Cache release ROCm backend build
-        uses: actions/cache@v5
-        with:
-          path: ${{ env.LLAMA_STAGE_BUILD_DIR }}
-          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-rocm7.0-static-gfx90a_gfx942_gfx1100_gfx1101_gfx1102_gfx1200_gfx1201-${{ hashFiles('scripts/build-linux.sh', 'scripts/build-linux-rocm.sh', 'scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'Justfile', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
+          name: release-native-runtime-linux-x86_64-rocm
+          path: runtime-input
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
-      - name: Build ROCm release bundle
+      - name: Prepare release verification key
         env:
-          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
           MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
           RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
-        run: |
-          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
-          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
-          just --shell bash --shell-arg -c release-build-rocm
-          just --shell bash --shell-arg -c release-bundle-rocm "$RELEASE_TAG" dist
-      - uses: actions/upload-artifact@v6
+        run: printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
+
+      - name: Compose ROCm product from producer inputs
+        id: compose
+        uses: ./.github/actions/compose-product-input
+        with:
+          host_input_dir: host-input
+          runtime_input_dir: runtime-input
+          output_dir: product-input
+          version: ${{ needs.metadata.outputs.tag }}
+          backend: rocm
+          readiness_smoke: "true"
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+
+      - name: Package verified ROCm product
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_RELEASE_OS: Linux
+          MESH_RELEASE_ARCH: x86_64
+          MESH_RELEASE_FLAVOR: rocm
+          MESH_LLM_RELEASE_BIN_DIR: ${{ github.workspace }}/host-input
+          MESH_LLM_NATIVE_RUNTIME_ROOT: ${{ steps.compose.outputs.runtime_root }}
+          MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}
+          MESH_RELEASE_HOST_PRESTAMPED: "1"
+          MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+        run: scripts/package-release.sh "$RELEASE_TAG" dist
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-linux-rocm
           path: dist/*
           if-no-files-found: error
 
-  build_linux_vulkan:
-    name: Build Linux Vulkan
-    needs: metadata
+  compose_linux_vulkan:
+    name: Compose Linux Vulkan
+    needs: [metadata, build, build_native_runtime_linux_x86_64_vulkan]
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
-    runs-on: ubuntu-24.04
-    env:
-      LLAMA_STAGE_BACKEND: vulkan
-      LLAMA_STAGE_BUILD_DIR: .deps/llama-build/build-stage-abi-vulkan
+    runs-on: ${{ needs.metadata.outputs.runner_4 }}
+    container:
+      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:ce55fed5c680cd3184b5d4770d9a77c43a702687690906e5753efd2cea27ed80
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
+      - name: Trust checkout directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Verify prebuilt backend environment
+        run: verify-runner-image public vulkan
+      - name: Download immutable host input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          version: 10
-      - uses: actions/setup-node@v5
+          name: host-input-linux-x86_64
+          path: host-input
+      - name: Download immutable runtime input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: |
-            .github/cache-version.txt
-            crates/mesh-llm-ui/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config libssl-dev libdbus-1-dev curl glslc libvulkan-dev spirv-headers lld
-      - name: Cache release Vulkan backend build
-        uses: actions/cache@v5
-        with:
-          path: ${{ env.LLAMA_STAGE_BUILD_DIR }}
-          key: ${{ env.CACHE_NAMESPACE }}-release-llama-linux-x86_64-vulkan-static-${{ hashFiles('scripts/build-linux.sh', 'scripts/build-llama.sh', 'scripts/prepare-llama.sh', 'Justfile', 'third_party/llama.cpp/upstream.txt', 'third_party/llama.cpp/patches/**', '.github/cache-version.txt') }}
+          name: release-native-runtime-linux-x86_64-vulkan
+          path: runtime-input
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
-      - name: Build Vulkan release bundle
+      - name: Prepare release verification key
         env:
-          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
           MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
           RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
-        run: |
-          printf '%s' "$RELEASE_ATTESTATION_SIGNING_KEY" > "$MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE"
-          printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
-          just --shell bash --shell-arg -c release-build-vulkan
-          just --shell bash --shell-arg -c release-bundle-vulkan "$RELEASE_TAG" dist
-      - uses: actions/upload-artifact@v6
+        run: printf '%s' "$RELEASE_ATTESTATION_PUBLIC_KEY" > "$MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE"
+
+      - name: Compose Vulkan product from producer inputs
+        id: compose
+        uses: ./.github/actions/compose-product-input
+        with:
+          host_input_dir: host-input
+          runtime_input_dir: runtime-input
+          output_dir: product-input
+          version: ${{ needs.metadata.outputs.tag }}
+          backend: vulkan
+          readiness_smoke: "true"
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+
+      - name: Package verified Vulkan product
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_RELEASE_OS: Linux
+          MESH_RELEASE_ARCH: x86_64
+          MESH_RELEASE_FLAVOR: vulkan
+          MESH_LLM_RELEASE_BIN_DIR: ${{ github.workspace }}/host-input
+          MESH_LLM_NATIVE_RUNTIME_ROOT: ${{ steps.compose.outputs.runtime_root }}
+          MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}
+          MESH_RELEASE_HOST_PRESTAMPED: "1"
+          MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+        run: scripts/package-release.sh "$RELEASE_TAG" dist
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-linux-vulkan
           path: dist/*
           if-no-files-found: error
 
-  build_windows_cpu:
-    name: Build Windows CPU
+  windows_host_input:
+    name: Build immutable host Windows x86_64
     needs: metadata
     runs-on: windows-2022
     env:
-      LLAMA_STAGE_BACKEND: cpu
+      MESH_LLM_REQUIRE_SCCACHE: "1"
+      RUSTC_WRAPPER: sccache
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         with:
           version: 10
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 24
           cache: pnpm
           cache-dependency-path: |
             .github/cache-version.txt
             crates/mesh-llm-ui/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.x'
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
-      - name: Build Windows CPU release bundle
+      - name: Prepare release attestation keys
         shell: pwsh
         env:
           MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
           MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-          MESH_LLM_REQUIRE_SCCACHE: "1"
           RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
           RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
         run: |
           Set-Content -Path $env:MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE -Value $env:RELEASE_ATTESTATION_SIGNING_KEY -NoNewline
           Set-Content -Path $env:MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE -Value $env:RELEASE_ATTESTATION_PUBLIC_KEY -NoNewline
-          just release-build-windows
-          just release-bundle-windows "$env:RELEASE_TAG" dist
-      - uses: actions/upload-artifact@v6
+      - name: Build and attest Windows release host
+        uses: ./.github/actions/prepare-windows-host-input
         with:
-          name: release-windows
-          path: dist/*
+          profile: release
+          attestation_signing_key_file: ${{ runner.temp }}/mesh-release-attestation-private-key.json
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: host-input-windows-x86_64
+          path: host-input/*
           if-no-files-found: error
 
-  build_windows_gpu:
-    name: Build Windows ${{ matrix.name }}
-    needs: metadata
+  compose_windows_gpu:
+    name: Compose Windows ${{ matrix.name }} product
+    needs: [metadata, windows_host_input, build_native_runtime_windows_gpu]
     if: ${{ needs.metadata.outputs.skip_gpu_bundles != 'true' }}
     runs-on: windows-2022
-    env:
-      ROCM_HIP_SDK_FILENAME: AMD-Software-PRO-Edition-25.Q3-WinSvr2022-For-HIP.exe
-      # Pin Windows CUDA to a version sccache 0.15.0 supports.
-      # `choco install cuda` (used previously via install-windows-sdk.ps1)
-      # pulls latest = CUDA 13.2, which deterministically crashes sccache
-      # on nvcc output (see mozilla/sccache#2470). CI pins to the same
-      # version via Jimver/cuda-toolkit; mirror that here.
-      WINDOWS_CUDA_VERSION: ${{ vars.CUDA_VERSION || '12.9.2' }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: CUDA
             backend: cuda
-            build_recipe: release-build-cuda-windows
-            bundle_recipe: release-bundle-cuda-windows
+            runtime_artifact: release-native-runtime-windows-x86_64-cuda12
             artifact_name: release-windows-cuda
           - name: ROCm
             backend: rocm
-            build_recipe: release-build-rocm-windows
-            bundle_recipe: release-bundle-rocm-windows
+            runtime_artifact: release-native-runtime-windows-x86_64-rocm
             artifact_name: release-windows-rocm
           - name: Vulkan
             backend: vulkan
-            build_recipe: release-build-vulkan-windows
-            bundle_recipe: release-bundle-vulkan-windows
+            runtime_artifact: release-native-runtime-windows-x86_64-vulkan
             artifact_name: release-windows-vulkan
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
-          version: 10
-      - uses: actions/setup-node@v5
+          python-version: '3.x'
+      - name: Download immutable host input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          node-version: 24
-          cache: pnpm
-          cache-dependency-path: |
-            .github/cache-version.txt
-            crates/mesh-llm-ui/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@just
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Prepare dispatched release version
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-        run: scripts/release-version.sh "$RELEASE_TAG"
-      - name: Install CUDA toolkit
-        if: ${{ matrix.backend == 'cuda' }}
-        uses: Jimver/cuda-toolkit@v0.2.35
+          name: host-input-windows-x86_64
+          path: host-input
+      - name: Download immutable runtime input
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          cuda: ${{ env.WINDOWS_CUDA_VERSION }}
-          method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "visual_studio_integration"]'
-          use-github-cache: true
-          use-local-cache: true
-          log-file-suffix: windows-cuda-release
-      - name: Verify CUDA toolkit
-        if: ${{ matrix.backend == 'cuda' }}
-        shell: pwsh
-        run: |
-          if (-not $env:CUDA_PATH -or -not (Test-Path $env:CUDA_PATH)) {
-            throw "CUDA_PATH was not configured by Jimver/cuda-toolkit."
-          }
-          & nvcc --version
-      - name: Install backend SDK
-        if: ${{ matrix.backend != 'cuda' }}
-        shell: pwsh
-        run: |
-          .\scripts\install-windows-sdk.ps1 `
-            -Backend "${{ matrix.backend }}" `
-            -RocmHipSdkFilename "$env:ROCM_HIP_SDK_FILENAME" `
-            -InstallerCacheDir "$HOME\sdk-installer-cache"
-      - name: Build Windows GPU release bundle
+          name: ${{ matrix.runtime_artifact }}
+          path: runtime-input
+      - name: Prepare release verification key
         shell: pwsh
         env:
-          MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-private-key.json
           MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
-          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
-          MESH_LLM_REQUIRE_SCCACHE: "1"
-          MESH_LLM_WINDOWS_BUILD_JOBS: ${{ matrix.backend == 'cuda' && '1' || '' }}
-          RELEASE_ATTESTATION_SIGNING_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE }}
           RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
-        run: |
-          Set-Content -Path $env:MESH_RELEASE_ATTESTATION_SIGNING_KEY_FILE -Value $env:RELEASE_ATTESTATION_SIGNING_KEY -NoNewline
-          Set-Content -Path $env:MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE -Value $env:RELEASE_ATTESTATION_PUBLIC_KEY -NoNewline
-          just ${{ matrix.build_recipe }}
-          just ${{ matrix.bundle_recipe }} "$env:RELEASE_TAG" dist
-      - uses: actions/upload-artifact@v6
+        run: Set-Content -Path $env:MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE -Value $env:RELEASE_ATTESTATION_PUBLIC_KEY -NoNewline
+      - name: Compose Windows GPU product from producer inputs
+        id: compose
+        uses: ./.github/actions/compose-product-input
+        with:
+          host_input_dir: host-input
+          runtime_input_dir: runtime-input
+          output_dir: product-input
+          version: ${{ needs.metadata.outputs.tag }}
+          backend: ${{ matrix.backend }}
+          binary_name: mesh-llm.exe
+          readiness_smoke: "true"
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+          attestation_verifier: host-input/release-attestation-verifier.exe
+      - name: Package verified Windows GPU product
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}
+          MESH_RELEASE_HOST_PRESTAMPED: "1"
+          MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+        run: .\scripts\package-release.ps1 -Version $env:RELEASE_TAG -OutputDir dist -Flavor "${{ matrix.backend }}"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ matrix.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  compose_windows_cpu:
+    name: Compose Windows CPU product
+    needs: [metadata, windows_host_input, build_native_runtime_windows_cpu]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.x'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: host-input-windows-x86_64
+          path: host-input
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-native-runtime-windows-x86_64-cpu
+          path: runtime-input
+      - name: Prepare release verification key
+        shell: pwsh
+        env:
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+          RELEASE_ATTESTATION_PUBLIC_KEY: ${{ secrets.MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE }}
+        run: Set-Content -Path $env:MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE -Value $env:RELEASE_ATTESTATION_PUBLIC_KEY -NoNewline
+      - name: Compose Windows CPU product from producer inputs
+        id: compose
+        uses: ./.github/actions/compose-product-input
+        with:
+          host_input_dir: host-input
+          runtime_input_dir: runtime-input
+          output_dir: product-input
+          version: ${{ needs.metadata.outputs.tag }}
+          backend: cpu
+          binary_name: mesh-llm.exe
+          readiness_smoke: "true"
+          attestation_public_key_file: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+          attestation_verifier: host-input/release-attestation-verifier.exe
+      - name: Package verified Windows CPU product
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          MESH_LLM_PRECOMPOSED_PRODUCT_DIR: ${{ steps.compose.outputs.product_dir }}
+          MESH_RELEASE_HOST_PRESTAMPED: "1"
+          MESH_RELEASE_ATTESTATION_PREVERIFIED: "1"
+          MESH_RELEASE_ATTESTATION_PUBLIC_KEY_FILE: ${{ runner.temp }}/mesh-release-attestation-public-key.json
+        run: .\scripts\package-release.ps1 -Version $env:RELEASE_TAG -OutputDir dist -Flavor cpu
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-windows
           path: dist/*
           if-no-files-found: error
 
@@ -1169,16 +1372,30 @@ jobs:
     runs-on: windows-2022
     env:
       LLAMA_STAGE_BACKEND: cpu
+      LLAMA_STAGE_BUILD_DIR: .deps/llama-build/windows/build-stage-abi-cpu
       MESH_NATIVE_RUNTIME_TARGET: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.x'
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Resolve Windows native toolchain epoch
+        id: native_toolchain
+        uses: ./.github/actions/resolve-native-toolchain-epoch
+      - name: Restore exact Windows CPU ABI cache
+        uses: ./.github/actions/restore-windows-abi-cache
+        with:
+          backend: cpu
+          build_dir: ${{ env.LLAMA_STAGE_BUILD_DIR }}
+          toolchain_epoch: ${{ steps.native_toolchain.outputs.epoch }}
+      - name: Initialize MSVC for native runtime
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         shell: bash
@@ -1186,18 +1403,13 @@ jobs:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
       - name: Package native runtime
-        shell: bash
-        run: |
-          scripts/package-native-runtime.sh \
-            --build \
-            --backend cpu \
-            --target x86_64-pc-windows-msvc \
-            --out dist/native-runtimes
-      - name: Verify native runtime artifact
-        shell: bash
-        run: scripts/verify-native-runtime-package.sh dist/native-runtimes/*.tar.gz
+        uses: ./.github/actions/prepare-native-runtime-input
+        with:
+          backend: cpu
+          target: x86_64-pc-windows-msvc
+          output_dir: dist/native-runtimes
       - name: Upload native runtime
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-native-runtime-windows-x86_64-cpu
           path: |
@@ -1213,6 +1425,8 @@ jobs:
     env:
       ROCM_HIP_SDK_FILENAME: AMD-Software-PRO-Edition-25.Q3-WinSvr2022-For-HIP.exe
       WINDOWS_CUDA_VERSION: ${{ vars.CUDA_VERSION || '12.9.2' }}
+      WINDOWS_VULKAN_SDK_VERSION: ${{ vars.VULKAN_SDK_VERSION || '1.4.328.1' }}
+      LLAMA_STAGE_BUILD_DIR: .deps/llama-build/windows/build-stage-abi-${{ matrix.backend }}
       MESH_NATIVE_RUNTIME_TARGET: x86_64-pc-windows-msvc
     strategy:
       fail-fast: false
@@ -1224,29 +1438,57 @@ jobs:
             artifact_name: release-native-runtime-windows-x86_64-cuda12
           - name: ROCm
             backend: rocm
-            rocm_architectures: gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1200;gfx1201
+            rocm_architectures: gfx90a;gfx942;gfx1100;gfx1101;gfx1102;gfx1103;gfx1151;gfx1200;gfx1201
             artifact_name: release-native-runtime-windows-x86_64-rocm
+            # sccache + hipcc is broken on Windows: HIP's multi-offload-arch
+            # compile pipeline plus the long arch-derived build directory pushes
+            # object paths past MAX_PATH, and sccache fails to persist its temp
+            # file (os error 3). Disable the compiler launcher for this row only;
+            # CUDA/Vulkan keep sccache.
+            use_sccache: '0'
           - name: Vulkan
             backend: vulkan
             artifact_name: release-native-runtime-windows-x86_64-vulkan
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.x'
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Resolve Windows native toolchain epoch
+        id: native_toolchain
+        uses: ./.github/actions/resolve-native-toolchain-epoch
+      - name: Restore exact Windows GPU ABI cache
+        uses: ./.github/actions/restore-windows-abi-cache
+        with:
+          backend: ${{ matrix.backend }}
+          build_dir: ${{ env.LLAMA_STAGE_BUILD_DIR }}
+          toolchain_epoch: ${{ steps.native_toolchain.outputs.epoch }}
+          architecture_set: ${{ matrix.cuda_architectures || matrix.rocm_architectures || '' }}
+          cuda_toolchain_version: ${{ env.WINDOWS_CUDA_VERSION }}
+          vulkan_toolchain_version: ${{ env.WINDOWS_VULKAN_SDK_VERSION }}
+          rocm_toolchain_version: ${{ env.ROCM_HIP_SDK_FILENAME }}
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: scripts/release-version.sh "$RELEASE_TAG"
+      - name: Validate CUDA 12 artifact contract
+        if: ${{ matrix.backend == 'cuda' }}
+        shell: pwsh
+        run: |
+          $cudaVersion = "$env:WINDOWS_CUDA_VERSION".Trim()
+          $cudaMajor = ($cudaVersion -split '\.', 2)[0]
+          if ($cudaMajor -ne '12') {
+            throw "CUDA_VERSION must select CUDA 12.x because this release lane publishes cuda12-labelled artifacts; got '$cudaVersion'."
+          }
       - name: Install CUDA toolkit
         if: ${{ matrix.backend == 'cuda' }}
-        uses: Jimver/cuda-toolkit@v0.2.35
+        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76 # v0.2.35
         with:
           cuda: ${{ env.WINDOWS_CUDA_VERSION }}
           method: network
@@ -1262,37 +1504,48 @@ jobs:
             throw "CUDA_PATH was not configured by Jimver/cuda-toolkit."
           }
           & nvcc --version
-      - name: Initialize MSVC for CUDA
-        if: ${{ matrix.backend == 'cuda' }}
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install Vulkan SDK
+        if: ${{ matrix.backend == 'vulkan' }}
+        uses: jakoch/install-vulkan-sdk-action@3c53c378c9bfbb2ea122a1cc164a837d4004c871 # v1.5.2
         with:
-          arch: x64
-      - name: Install backend SDK
-        if: ${{ matrix.backend != 'cuda' }}
+          vulkan_version: ${{ env.WINDOWS_VULKAN_SDK_VERSION }}
+          cache: true
+          stripdown: true
+      - name: Verify Vulkan SDK
+        if: ${{ matrix.backend == 'vulkan' }}
         shell: pwsh
         run: |
-          .\scripts\install-windows-sdk.ps1 `
-            -Backend "${{ matrix.backend }}" `
-            -RocmHipSdkFilename "$env:ROCM_HIP_SDK_FILENAME" `
-            -InstallerCacheDir "$HOME\sdk-installer-cache"
+          if (-not $env:VULKAN_SDK -or -not (Test-Path $env:VULKAN_SDK)) {
+            throw "VULKAN_SDK was not configured by jakoch/install-vulkan-sdk-action."
+          }
+          $glslc = Join-Path $env:VULKAN_SDK "Bin\glslc.exe"
+          if (-not (Test-Path $glslc)) {
+            throw "glslc.exe was not found at $glslc"
+          }
+          & $glslc --version
+      - name: Install ROCm HIP SDK
+        if: ${{ matrix.backend == 'rocm' }}
+        uses: ./.github/actions/setup-windows-rocm-sdk
+        with:
+          rocm-hip-sdk-filename: ${{ env.ROCM_HIP_SDK_FILENAME }}
+      - name: Initialize MSVC for native runtime
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
       - name: Package native runtime
-        shell: bash
         env:
           LLAMA_STAGE_BACKEND: ${{ matrix.backend }}
           LLAMA_STAGE_CUDA_ARCHITECTURES: ${{ matrix.cuda_architectures }}
           LLAMA_STAGE_AMDGPU_TARGETS: ${{ matrix.rocm_architectures }}
+          LLAMA_STAGE_USE_SCCACHE: ${{ matrix.use_sccache || '1' }}
           MESH_LLM_CUDA_TOOLKIT_MAJOR: '12'
-        run: |
-          scripts/package-native-runtime.sh \
-            --build \
-            --backend "${{ matrix.backend }}" \
-            --target x86_64-pc-windows-msvc \
-            --out dist/native-runtimes
-      - name: Verify native runtime artifact
-        shell: bash
-        run: scripts/verify-native-runtime-package.sh dist/native-runtimes/*.tar.gz
+        uses: ./.github/actions/prepare-native-runtime-input
+        with:
+          backend: ${{ matrix.backend }}
+          target: x86_64-pc-windows-msvc
+          output_dir: dist/native-runtimes
       - name: Upload native runtime
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ matrix.artifact_name }}
           path: |
@@ -1305,8 +1558,10 @@ jobs:
     needs:
       - metadata
       - build
+      - compose_cpu_products
       - inference_smoke_tests
       - build_native_sdk_runtime
+      - build_node_sdk_addon
       - build_native_runtime
       - build_native_runtime_linux_aarch64_cuda
       - build_native_runtime_linux_x86_64_cuda
@@ -1314,29 +1569,35 @@ jobs:
       - build_native_runtime_linux_x86_64_vulkan
       - build_swift_sdk_artifact
       - build_linux_arm64
+      - compose_linux_arm64_cpu
       - smoke_linux_arm64_artifact
-      - build_linux_aarch64_cuda
-      - build_linux_cuda
-      - build_linux_rocm
-      - build_linux_vulkan
-      - build_windows_cpu
-      - build_windows_gpu
+      - compose_linux_aarch64_cuda
+      - compose_linux_cuda
+      - compose_linux_rocm
+      - compose_linux_vulkan
+      - windows_host_input
+      - compose_windows_cpu
+      - compose_windows_gpu
       - build_native_runtime_windows_cpu
       - build_native_runtime_windows_gpu
-    if: ${{ always() && needs.metadata.result == 'success' && needs.metadata.outputs.canary != 'true' && needs.build.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.build_native_sdk_runtime.result == 'success' && needs.build_native_runtime.result == 'success' && (needs.build_native_runtime_linux_aarch64_cuda.result == 'success' || needs.build_native_runtime_linux_aarch64_cuda.result == 'skipped') && (needs.build_native_runtime_linux_x86_64_cuda.result == 'success' || needs.build_native_runtime_linux_x86_64_cuda.result == 'skipped') && (needs.build_native_runtime_linux_x86_64_rocm.result == 'success' || needs.build_native_runtime_linux_x86_64_rocm.result == 'skipped') && (needs.build_native_runtime_linux_x86_64_vulkan.result == 'success' || needs.build_native_runtime_linux_x86_64_vulkan.result == 'skipped') && needs.build_swift_sdk_artifact.result == 'success' && needs.build_linux_arm64.result == 'success' && needs.smoke_linux_arm64_artifact.result == 'success' && (needs.build_linux_aarch64_cuda.result == 'success' || needs.build_linux_aarch64_cuda.result == 'skipped') && (needs.build_linux_cuda.result == 'success' || needs.build_linux_cuda.result == 'skipped') && (needs.build_linux_rocm.result == 'success' || needs.build_linux_rocm.result == 'skipped') && (needs.build_linux_vulkan.result == 'success' || needs.build_linux_vulkan.result == 'skipped') && needs.build_windows_cpu.result == 'success' && (needs.build_windows_gpu.result == 'success' || needs.build_windows_gpu.result == 'skipped') && needs.build_native_runtime_windows_cpu.result == 'success' && (needs.build_native_runtime_windows_gpu.result == 'success' || needs.build_native_runtime_windows_gpu.result == 'skipped') }}
+    if: ${{ !cancelled() && needs.metadata.result == 'success' && needs.metadata.outputs.canary != 'true' && needs.compose_cpu_products.result == 'success' && needs.inference_smoke_tests.result == 'success' && needs.build_native_sdk_runtime.result == 'success' && needs.build_node_sdk_addon.result == 'success' && needs.build_native_runtime.result == 'success' && (needs.build_native_runtime_linux_aarch64_cuda.result == 'success' || needs.build_native_runtime_linux_aarch64_cuda.result == 'skipped') && (needs.build_native_runtime_linux_x86_64_cuda.result == 'success' || needs.build_native_runtime_linux_x86_64_cuda.result == 'skipped') && (needs.build_native_runtime_linux_x86_64_rocm.result == 'success' || needs.build_native_runtime_linux_x86_64_rocm.result == 'skipped') && (needs.build_native_runtime_linux_x86_64_vulkan.result == 'success' || needs.build_native_runtime_linux_x86_64_vulkan.result == 'skipped') && needs.build_swift_sdk_artifact.result == 'success' && needs.compose_linux_arm64_cpu.result == 'success' && needs.smoke_linux_arm64_artifact.result == 'success' && (needs.compose_linux_aarch64_cuda.result == 'success' || needs.compose_linux_aarch64_cuda.result == 'skipped') && (needs.compose_linux_cuda.result == 'success' || needs.compose_linux_cuda.result == 'skipped') && (needs.compose_linux_rocm.result == 'success' || needs.compose_linux_rocm.result == 'skipped') && (needs.compose_linux_vulkan.result == 'success' || needs.compose_linux_vulkan.result == 'skipped') && needs.compose_windows_cpu.result == 'success' && (needs.compose_windows_gpu.result == 'success' || needs.compose_windows_gpu.result == 'skipped') && needs.build_native_runtime_windows_cpu.result == 'success' && (needs.build_native_runtime_windows_gpu.result == 'success' || needs.build_native_runtime_windows_gpu.result == 'skipped') }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          persist-credentials: true
+          # Archive verification and manifest generation run before any push
+          # credential is exposed to a shell.
+          persist-credentials: false
           fetch-depth: 0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
         if: github.event_name == 'workflow_dispatch'
         with:
           version: 10
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         if: github.event_name == 'workflow_dispatch'
         with:
           node-version: 24
@@ -1345,11 +1606,11 @@ jobs:
             .github/cache-version.txt
             crates/mesh-llm-ui/pnpm-lock.yaml
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
         if: github.event_name == 'workflow_dispatch'
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: release-artifacts
           pattern: release-*
@@ -1398,44 +1659,116 @@ jobs:
 
       - name: Download generated SwiftPM manifest
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: swift-package-manifest
           path: generated-swift-manifest
 
-      - name: Create dispatched release tag
+      - name: Download generated Swift binding
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: generated-swift-binding-release-swift-sdk
+          path: generated-swift-binding
+
+      - name: Prepare dispatched release tag
         if: github.event_name == 'workflow_dispatch'
         env:
           RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
         run: |
           set -euo pipefail
           if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release tag already exists: $RELEASE_TAG; reusing it"
-            exit 0
+            echo "Release tag already exists and cannot be reused: $RELEASE_TAG" >&2
+            exit 1
           fi
           scripts/release-version.sh "$RELEASE_TAG"
           cp generated-swift-manifest/Package.swift Package.swift
+          generated_binding="generated-swift-binding/mesh_ffi.swift"
+          tracked_binding="sdk/swift/Sources/MeshLLM/Generated/mesh_ffi.swift"
+          if [[ ! -f "$generated_binding" || -L "$generated_binding" ]]; then
+            echo "generated Swift binding artifact is missing or unsafe: $generated_binding" >&2
+            exit 1
+          fi
+          install -m 0644 "$generated_binding" "$tracked_binding"
+          cmp "$generated_binding" "$tracked_binding"
           scripts/package-sdk-console-assets.sh --sdk all
           scripts/verify-sdk-console-assets.sh --sdk all
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock crates/*/Cargo.toml tools/*/Cargo.toml sdk/kotlin/build.gradle.kts Package.swift
+          # release-version.sh owns the complete tracked version surface. Stage
+          # all tracked release-preparation changes so this list cannot drift
+          # when another version-bearing file is added to the script.
+          git add --update
           git add -f sdk/node/console sdk/swift/Sources/MeshLLM/Resources/Console sdk/kotlin/src/main/resources/mesh-llm/console
+          if ! git diff --quiet; then
+            echo "Release preparation left unstaged tracked changes:" >&2
+            git status --short >&2
+            exit 1
+          fi
           if git diff --cached --quiet; then
             echo "Release source files already match $RELEASE_TAG"
           else
             git commit -m "$RELEASE_TAG: prepare release source"
           fi
           git tag "$RELEASE_TAG"
-          git push origin "refs/tags/$RELEASE_TAG"
+
+      - name: Push dispatched release tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release_remote="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$release_remote" "refs/tags/$RELEASE_TAG"
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ needs.metadata.outputs.tag }}
           prerelease: ${{ needs.metadata.outputs.prerelease }}
-          overwrite_files: true
+          overwrite_files: false
           files: release-artifacts/*
+
+  dispatch_packaging_release:
+    name: Dispatch package and image publishing
+    needs: [metadata, publish]
+    if: ${{ needs.publish.result == 'success' && needs.metadata.outputs.prerelease != 'true' && needs.metadata.outputs.skip_gpu_bundles != 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Dispatch verified release to mesh-packaging
+        env:
+          GH_TOKEN: ${{ secrets.MESH_AGENT_IMAGES_DISPATCH_TOKEN }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ -n "${GH_TOKEN:-}" ]] || {
+            echo "MESH_AGENT_IMAGES_DISPATCH_TOKEN must grant Contents write access to Mesh-LLM/mesh-packaging for cross-repository dispatch" >&2
+            exit 1
+          }
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$RELEASE_TAG" \
+            --arg version "$RELEASE_VERSION" \
+            '{
+              event_type: "mesh-llm-release",
+              client_payload: {
+                repository: $repository,
+                ref: $ref,
+                version: $version,
+                dry_run: false,
+                publish_images: true,
+                publish_release_assets: true,
+                publish_npm: true
+              }
+            }' |
+            gh api \
+              --method POST \
+              repos/Mesh-LLM/mesh-packaging/dispatches \
+              --input -
 
   publish_crates_preflight:
     name: Preflight crates.io packages
@@ -1443,10 +1776,11 @@ jobs:
     if: ${{ needs.metadata.outputs.prerelease != 'true' && needs.metadata.outputs.canary != 'true' }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          ref: ${{ needs.metadata.outputs.tag }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -1463,10 +1797,11 @@ jobs:
     if: ${{ needs.metadata.outputs.prerelease != 'true' && needs.metadata.outputs.canary != 'true' }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          ref: ${{ needs.metadata.outputs.tag }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable 2026-07-16
       - name: Prepare dispatched release version
         if: github.event_name == 'workflow_dispatch'
         env:

@@ -1,16 +1,22 @@
-use std::{
-    collections::VecDeque,
-    sync::{
-        Arc, Condvar, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
-        mpsc as std_mpsc,
-    },
-    thread::{self, JoinHandle},
-    time::Instant,
-};
-
-use super::*;
+use crate::frontend::generation::PhaseTimer;
+use crate::frontend::util::openai_backend_error;
 use crate::runtime_state::RuntimeDecodeBatchRequest;
+use crate::runtime_state::RuntimeState;
+use openai_frontend::OpenAiError;
+use openai_frontend::OpenAiResult;
+use skippy_runtime::SamplingConfig;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::Weak;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc as std_mpsc;
+use std::thread;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use std::time::Instant;
 
 pub(super) struct DecodeBatcher {
     shared: Arc<DecodeBatcherShared>,
@@ -21,6 +27,7 @@ struct DecodeBatcherShared {
     state: Mutex<DecodeBatcherState>,
     ready: Condvar,
     max_batch_size: usize,
+    collection_window: Duration,
     owner_count: AtomicUsize,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -55,6 +62,7 @@ impl DecodeBatcher {
             state: Mutex::new(DecodeBatcherState::default()),
             ready: Condvar::new(),
             max_batch_size: max_batch_size.max(1),
+            collection_window: crate::decode_batch_policy::collection_window(max_batch_size),
             owner_count: AtomicUsize::new(1),
             worker: Mutex::new(None),
         });
@@ -145,8 +153,33 @@ impl DecodeBatcherShared {
         if state.pending.is_empty() && state.stopping {
             return None;
         }
+        state = self.collect_until_deadline(state);
         let batch_size = self.max_batch_size.min(state.pending.len());
         Some(state.pending.drain(..batch_size).collect())
+    }
+
+    fn collect_until_deadline<'a>(
+        &self,
+        mut state: std::sync::MutexGuard<'a, DecodeBatcherState>,
+    ) -> std::sync::MutexGuard<'a, DecodeBatcherState> {
+        if self.collection_window.is_zero() || state.pending.len() >= self.max_batch_size {
+            return state;
+        }
+        let deadline = Instant::now() + self.collection_window;
+        while !state.stopping && state.pending.len() < self.max_batch_size {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .expect("decode batcher lock poisoned");
+            state = next;
+            if timeout.timed_out() {
+                break;
+            }
+        }
+        state
     }
 
     fn run_batch(&self, batch: Vec<PendingDecode>) {

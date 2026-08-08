@@ -138,6 +138,42 @@ fn build_built_in_config_schema() -> ConfigSchema {
         telemetry_setting("telemetry.metrics.endpoint", ConfigValueSchema::Url),
         startup_runtime_setting("runtime.debug", ConfigValueSchema::Boolean),
         startup_runtime_setting("runtime.listen_all", ConfigValueSchema::Boolean),
+        startup_runtime_setting(
+            "runtime.mode",
+            string_enum(["client", "serve", "on_demand"]),
+        ),
+        startup_runtime_setting(
+            "runtime.startup_failure_policy",
+            string_enum(["best_effort", "fail_fast"]),
+        ),
+        runtime_setting("runtime.drain_timeout_secs", ConfigValueSchema::Integer),
+        runtime_setting("runtime.drain_timeout_max_secs", ConfigValueSchema::Integer),
+        activity_runtime_setting("runtime.activity.enabled", ConfigValueSchema::Boolean),
+        activity_runtime_setting(
+            "runtime.activity.idle_after_secs",
+            ConfigValueSchema::Integer,
+        ),
+        activity_runtime_setting(
+            "runtime.activity.poll_interval_secs",
+            ConfigValueSchema::Integer,
+        ),
+        activity_runtime_setting(
+            "runtime.activity.resume_debounce_secs",
+            ConfigValueSchema::Integer,
+        ),
+        activity_runtime_setting(
+            "runtime.activity.response",
+            string_enum(["pause_remote", "pause_all", "reduce_priority"]),
+        ),
+        activity_runtime_setting(
+            "runtime.activity.advertisement",
+            string_enum([
+                "none",
+                "availability_only",
+                "coarse_state",
+                "private_coarse_state",
+            ]),
+        ),
         runtime_setting(
             "runtime.reconcile_model_targets",
             ConfigValueSchema::Boolean,
@@ -257,6 +293,10 @@ fn plugin_entry_settings() -> Vec<ConfigSettingSchema> {
         plugin_setting(&format!("{plugin_prefix}.name"), ConfigValueSchema::String),
         plugin_setting(
             &format!("{plugin_prefix}.enabled"),
+            ConfigValueSchema::Boolean,
+        ),
+        plugin_setting(
+            &format!("{plugin_prefix}.web_ui_enabled"),
             ConfigValueSchema::Boolean,
         ),
         plugin_setting(
@@ -599,9 +639,10 @@ fn skippy_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
 
 fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
     vec![
+        basic_setting(&format!("{prefix}.strategy"), ConfigValueSchema::String),
         basic_setting(
             &format!("{prefix}.mode"),
-            string_enum(["auto", "disabled", "draft", "ngram"]),
+            string_enum(["auto", "disabled", "draft"]),
         ),
         basic_setting(&format!("{prefix}.draft_model"), ConfigValueSchema::Path),
         basic_setting(
@@ -661,6 +702,42 @@ fn speculative_settings(prefix: &str) -> Vec<ConfigSettingSchema> {
         ),
         basic_setting(&format!("{prefix}.ngram_min"), ConfigValueSchema::Integer),
         basic_setting(&format!("{prefix}.ngram_max"), ConfigValueSchema::Integer),
+        basic_setting(
+            &format!("{prefix}.ngram_proposer"),
+            string_enum(["cache", "suffix"]),
+        ),
+        basic_setting(
+            &format!("{prefix}.ngram_max_proposal_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.extension_max_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.native_mtp_reject_cooldown_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.native_mtp_suppress_cooldown_drafts"),
+            ConfigValueSchema::Boolean,
+        ),
+        basic_setting(
+            &format!("{prefix}.native_mtp_suppress_cooldown_draft_limit"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.verify_window_min_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.verify_window_max_tokens"),
+            ConfigValueSchema::Integer,
+        ),
+        basic_setting(
+            &format!("{prefix}.verify_window_pipeline_depth"),
+            ConfigValueSchema::Integer,
+        ),
         basic_setting(&format!("{prefix}.spec_default"), bool_or_auto_schema()),
     ]
 }
@@ -940,6 +1017,13 @@ fn native_runtime_setting(path: &str, value_schema: ConfigValueSchema) -> Config
 }
 
 fn startup_runtime_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {
+    let mut setting = basic_setting(path, value_schema);
+    setting.control_surfaces = vec![ConfigControlSurface::ConfigFile, ConfigControlSurface::Api];
+    setting.restart_scope = ConfigRestartScope::ProcessRestart;
+    setting
+}
+
+fn activity_runtime_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {
     let mut setting = basic_setting(path, value_schema);
     setting.control_surfaces = vec![ConfigControlSurface::ConfigFile, ConfigControlSurface::Api];
     setting.restart_scope = ConfigRestartScope::ProcessRestart;
@@ -1380,10 +1464,7 @@ mod tests {
         let ngram_max = schema_setting("defaults.speculative.ngram_max");
         let mirostat_entropy = schema_setting("defaults.request_defaults.mirostat_entropy");
 
-        assert_static_choices(
-            "defaults.speculative.mode",
-            &["auto", "disabled", "draft", "ngram"],
-        );
+        assert_static_choices("defaults.speculative.mode", &["auto", "disabled", "draft"]);
         assert_static_choices(
             "defaults.speculative.draft_selection_policy",
             &["manual", "auto"],
@@ -1532,7 +1613,7 @@ mod tests {
             ),
             (
                 "defaults.speculative.mode",
-                vec!["auto", "disabled", "draft", "ngram"],
+                vec!["auto", "disabled", "draft"],
             ),
             (
                 "defaults.speculative.draft_selection_policy",

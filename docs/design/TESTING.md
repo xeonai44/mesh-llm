@@ -43,7 +43,7 @@ mesh-llm serve
 - If `[[models]]` is empty, `mesh-llm serve` should print a `⚠️` warning, show help, and exit cleanly
 - Explicit `--model` or `--gguf` should ignore configured `[[models]]`
 - Explicit `--ctx-size` should override configured `ctx_size`
-- `mesh-llm benchmark tune` is the measured local model-serving tuning companion for these startup configs. It only accepts already-downloaded targets, rejects remote-only or not-downloaded refs without fetching them, and runs isolated throughput trials. For speculative decoding changes, run a small sweep that includes the disabled baseline plus `mtp`, draft, or ngram candidates as applicable, then inspect trial logs/telemetry for native MTP or draft acceptance statistics in addition to decode tok/s.
+- `mesh-llm benchmark tune` is the measured local model-serving tuning companion for these startup configs. It only accepts already-downloaded targets, rejects remote-only or not-downloaded refs without fetching them, and runs isolated throughput trials. For speculative decoding changes, run a small sweep that includes the disabled baseline plus `mtp`, `mtp-ngram`, or draft candidates as applicable, then inspect trial logs/telemetry for native MTP or draft acceptance statistics in addition to decode tok/s.
 
 ### 0b. Pinned startup smoke
 
@@ -216,8 +216,11 @@ The scheduled/manual wrapper calls the reusable `nightly-stability-run.yml`
 workflow so maintainers can reuse the same harness execution from other
 workflows or lab jobs. The job summary includes the timing snapshot from
 `summary.md`, so day-over-day drift can be checked without opening JSONL
-artifacts. It is intentionally evidence-producing and non-required: failed
-nightlies should guide stabilization work, not block unrelated pull requests.
+artifacts. The reusable workflow is fixed to GitHub-hosted Ubuntu; it never
+accepts caller-provided runner labels because it checks out the caller's
+repository content. It is intentionally evidence-producing and non-required:
+failed nightlies should guide stabilization work, not block unrelated pull
+requests.
 
 ### 0f. KV/tool-loop stability certification
 
@@ -357,7 +360,9 @@ mesh-llm serve \
 >
 > Use real flags only: `--split`, `--max-vram`, `--join`, `--bind-port`,
 > `--port`, `--console`. There is no `--layer-range` flag — layer placement
-> is decided by the runtime from advertised VRAM, not pinned by CLI.
+> is normally decided by the runtime from advertised VRAM. Maintainer runs that
+> require exact placement can supply a complete topology manifest with
+> `--split-topology-lock <path>`; see `docs/SKIPPY_SPLITS.md`.
 
 #### Multi-interface Docker/Linux bind-IP validation
 
@@ -511,6 +516,14 @@ just build
 - Wakeable capacity renders in a separate section from topology peers and live nodes
 - Wakeable entries do not appear in the topology peer list
 - Validation uses `npm run test:run`, `npm run typecheck`, and `just build`
+- `just build` must leave `target/debug/mesh-llm` with exactly one adjacent
+  `target/debug/native-runtimes/<runtime-id>/` tree. Validate it with
+  `./target/debug/mesh-llm --log-format json runtime list`; CI also starts the
+  composed client noninteractively, observes either the JSON `Client ready`
+  message or the structured `passive_mode`/`status=ready`/`role=client` event,
+  and requires bounded graceful SIGTERM shutdown on Unix or CTRL_BREAK_EVENT
+  on Windows. Interactive Ctrl-C/SIGINT behavior is tested separately because
+  noninteractive background shell children may inherit SIGINT as ignored.
 
 ## Mesh Identity
 
@@ -660,9 +673,9 @@ python3 scripts/run-openai-guardrail-corpus.py \
   for server-side activation.
 - If the runtime is unavailable, the script falls back to deterministic
   fake-backend mode and still writes the expected JSON artifact.
-- The corpus covers streaming pass-through, tool-call reliability, synthetic
-  `_mesh_respond` rescue, strict structured output, and the unsupported real
-  tools plus strict structured combination.
+- The corpus covers streaming pass-through, native tool-call validation,
+  structured `_mesh_respond` output, strict structured output, and the
+  unsupported real tools plus strict structured combination.
 - The command is a reliability check, not a hard constrained decoding promise.
 
 If a Python sidecar baseline is available, you may optionally run a smoke
@@ -737,8 +750,8 @@ cached and a worker does not:
   to open `skippy-stage/2`, then Skippy artifact-transfer stream 0x03, to
   fetch only its assigned package files before the normal HF fallback path.
 - Current/released mixed mesh: a released coordinator without advertised
-  `skippy-stage/2` `artifact-transfer`, `stage-generation-3`, and
-  `direct-prediction-return` support must not be selected for a generation-3
+  `skippy-stage/2` `artifact-transfer`, `stage-generation-4`, and
+  `direct-prediction-return` support must not be selected for a generation-4
   split topology; the worker must fall back to local/HF package resolution.
 - Default public-mesh safety: with `MESH_LLM_ARTIFACT_TRANSFER` unset, the node
   must advertise no `artifact-transfer` feature, reject inbound artifact
@@ -756,10 +769,14 @@ cached and a worker does not:
 
 ### 13. Mixed-version owner-control coexistence
 
-Owner-control QA needs to prove two things at the same time:
+Owner-control QA needs to prove three things at the same time:
 
 1. Public-mesh join and routed inference still work across released/current binaries.
 2. Explicit endpoint bootstrap and `mesh-llm-control/1` work for current nodes while released peers continue to coexist on the public mesh plane for join, gossip, routing, and inference. Config and inventory mutation stay on owner-control only.
+3. A current same-owner requester can run the public `runtime scan-refresh`
+   command against exactly one current remote target and receive the sorted,
+   metadata-bearing result. Released targets are not expected to return the new
+   private response field.
 
 Use the dedicated harness for the full mixed-version pass:
 
@@ -791,15 +808,15 @@ scripts/qa-control-plane-mixed-version.sh \
   --config-only
 ```
 
-The harness writes a timestamped run directory containing logs, status payloads, owner-control bootstrap evidence, owner-control get-config evidence, and a markdown/json summary.
+The harness writes a timestamped run directory containing logs, status payloads, owner-control bootstrap evidence, owner-control get-config and scan-refresh evidence, and a markdown/json summary.
 It also writes `manifest.json`, `commands.jsonl`, `results.jsonl`, `versions/*.txt`, and grouped `status/`, `models/`, `chat/`, and `control/` payloads so a reviewer can audit which binaries, commands, and local endpoints produced the evidence.
 Use `--print-plan` when CI or review automation needs to validate the planned checks without starting mesh processes or writing evidence; planned check names match the `name` values emitted to `results.jsonl`.
 
 Expected checks:
 
 - Public mode: both binaries must bring up `/api/status`, list at least one model from `/v1/models`, and complete a routed chat request against the public mesh.
-- Loopback mode: the harness runs both mixed-version directions (`current -> released` and `released -> current`) on a private local mesh, waits for peers to appear on both nodes, then runs `mesh-llm runtime bootstrap --json` plus `mesh-llm runtime get-config --json` against the current-version node's explicit endpoint.
-- Config-only mode: the harness skips public probes, runs the same loopback coexistence checks, then executes the compatibility tests that prove new clients require explicit endpoints, use `mesh-llm-control/1`, and reject legacy frames on the owner-control ALPN.
+- Loopback mode: the harness runs both mixed-version directions (`current -> released` and `released -> current`) on a private local mesh, waits for peers to appear on both nodes, then runs `mesh-llm runtime bootstrap --json` plus `mesh-llm runtime get-config --json` against the current-version node's explicit endpoint. When two current same-owner nodes are available, it also records `runtime scan-refresh --json` against the explicitly bootstrapped remote target.
+- Config-only mode: the harness skips public probes, runs the same loopback coexistence checks, then executes the compatibility tests that prove new clients require explicit endpoints, use `mesh-llm-control/1`, reject legacy frames on the owner-control ALPN, and accept a legacy snapshot-only refresh response without claiming rich inventory support.
 - The current-version bootstrap payload must keep `requires_explicit_remote_endpoint=true` and expose an endpoint token when owner-control is enabled.
 - If the bootstrap payload reports `enabled=false`, the harness records a `PREREQ` result showing that a signed same-owner keystore is required before runtime owner-control requests can be proven on that machine.
 
@@ -808,11 +825,49 @@ Manual spot checks if the harness fails:
 ```bash
 mesh-llm runtime bootstrap --port 3131 --json
 mesh-llm runtime get-config --port 3131 --endpoint '<control-endpoint>' --json
+mesh-llm runtime scan-refresh --port 3131 --endpoint '<control-endpoint>' --json
 curl -s localhost:3131/api/runtime/control-bootstrap | jq .
 curl -s -X POST localhost:3131/api/runtime/control/get-config \
   -H 'Content-Type: application/json' \
   -d '{"endpoint":"<control-endpoint>"}' | jq .
+curl -s -X POST localhost:3131/api/runtime/control/scan-refresh \
+  -H 'Content-Type: application/json' \
+  -d '{"endpoint":"<control-endpoint>"}' | jq .
 ```
+
+For a manual current/current scan-refresh check:
+
+1. Start two current nodes with owner-control enabled and signed by the same
+   owner. Obtain the target's endpoint from the target node's loopback
+   `runtime bootstrap --json` output and transfer it to the requester out of
+   band. Do not derive it from public status or a peer ID.
+2. From the requester, run `runtime scan-refresh --endpoint <token> --json`.
+   Assert `target_node_id` is the target, `disposition` is `executed` or
+   `coalesced`, inventory entries are strictly sorted by
+   `canonical_model_ref`, sizes are present, and any compact metadata remains
+   attached to the matching entry.
+3. Start two concurrent scans. Assert one may report `executed` and the joined
+   caller reports `coalesced`, both payloads contain the same entries, and the
+   target performs only one loader scan.
+4. Retry from a requester signed by a different owner and with a request bound
+   to the wrong target ID. Assert structured `unauthorized` and
+   `target_node_mismatch` failures respectively, with no inventory mutation.
+5. Exercise the hidden `runtime refresh-inventory` or
+   `POST /api/runtime/control/refresh-inventory` compatibility alias and assert
+   its snapshot-only response shape is unchanged. Separately decode a frozen
+   snapshot-only wire response with the new client and assert success with
+   `inventory = null` / no disposition.
+6. Force a scan loader error and assert all joined callers fail while the last
+   good runtime inventory and model advertisement remain unchanged.
+7. Inspect logs, `/api/status`, peer state, and public gossip evidence. Endpoint
+   tokens and raw inventory command results must not appear there; only the
+   existing successful available-model projection may change.
+
+Transport-focused evidence must also cover rejection of outbound and inbound
+frames over 8 MiB, 2-second open/handshake/write deadlines, 5-second unary and
+watch-accept deadlines, the 30-second scan deadline, non-zero request IDs after
+wraparound, and the 32-worker per-connection ceiling. An accepted watch must
+remain open rather than inherit a unary timeout.
 
 Failure interpretation:
 
@@ -828,10 +883,195 @@ Config-only result interpretation:
 - `config-missing-endpoint-required`: executable proof that config bootstrap without an explicit owner-control endpoint is rejected when cargo-backed protocol tests run.
 - `config-new-client-owner-control`: executable proof that new clients prefer `mesh-llm-control/1` when cargo-backed protocol tests run.
 - `config-control-rejects-legacy-frames`: executable proof that owner-control does not silently accept legacy frames on the wrong ALPN when cargo-backed protocol tests run.
+- `config-current-scan-refresh`: a same-owner current requester used an
+  explicit current target endpoint and received a sorted private inventory
+  response.
+- `config-current-scan-refresh-wrong-owner`: a requester with a different owner was
+  rejected without changing target inventory state.
+- `config-owner-control-client-hardening`: the new client accepted a frozen
+  snapshot-only response and passed its timeout, framing, and request lifecycle
+  tests; public released/current coexistence is recorded independently.
 - `PREREQ config-cargo-tests`: cargo-backed protocol tests were skipped or cargo was unavailable.
 - `PREREQ config-runtime-bootstrap`: runtime owner-control requests could not be proven because the local node did not expose a signed owner-control endpoint.
 
 Reserved-ID note: mesh-plane stream IDs 0x0b and 0x0c are kept reserved, but current nodes should not advertise or rely on legacy config subscribe/push behavior there.
+
+## Daemon lifecycle certification
+
+The daemon lifecycle harness certifies the runtime model lifecycle rollout:
+zero-model serve, all modes, best-effort/fail-fast, runtime load/unload/ensure/drain,
+activity overrides/admission, and privacy — without downloading models or publishing a mesh.
+
+### Running the harness
+
+```bash
+# Local daemon lifecycle certification
+scripts/qa-runtime-daemon-lifecycle.sh \
+  --current-binary ./target/debug/mesh-llm \
+  --evidence-dir .sisyphus/evidence/task-15-local
+```
+
+The harness uses temporary homes (`$TMP_ROOT/mesh-runtime-daemon-lifecycle.*`) and ports (base `19740+`) with scoped cleanup. Each test scenario isolates a fresh `$HOME` via `MESH_LLM_EPHEMERAL_KEY=1` so multiple nodes coexist on one machine.
+
+### Planned checks
+
+Each check produces a PASS/FAIL/PREREQ record in `results.jsonl`:
+
+| Check | Description |
+|---|---|
+| `prereq.current-binary` | Binary is executable and reports a version string |
+| `prereq.owner-identity` | Temporary owner keystore can be created for authenticated lifecycle checks |
+| `zero_model_serve_ready` | Start the daemon with `--headless` and explicit API, console, and bind ports but no model; verify management API alive, `/v1/models` returns success (empty list acceptable), and the process stays alive |
+| `runtime_mode_serve` | Default serve mode starts and responds on management API within timeout |
+| `runtime_mode_on_demand` | On-demand mode starts idle without a model; if unsupported, records PREREQ |
+| `best_effort_startup` | Start with nonexistent model under explicit best-effort policy — daemon stays alive rather than crashing |
+| `fail_fast_startup` | Start with nonexistent model under explicit fail-fast policy — process exits promptly |
+| `runtime_load_model` | Authenticated owner-control `POST /api/runtime/control/load-model` returns an accepted intent |
+| `runtime_unload_model` | Authenticated owner-control `POST /api/runtime/control/unload-model` returns an accepted intent |
+| `runtime_ensure_model` | Authenticated owner-control `POST /api/runtime/control/ensure-model` returns an accepted intent |
+| `runtime_drain_model` | Authenticated owner-control `POST /api/runtime/control/drain-model` returns an accepted intent |
+| `activity_override` | `PUT /api/runtime/activity/override` with bare JSON string `"active"`, then `DELETE`, round-trips successfully |
+| `privacy_no_raw_data` | Assert `/api/runtime/activity` exposes exactly `effective_state`, `override_mode`, and `detector_category`, each limited to its documented coarse enum |
+| `clean_process_teardown` | After stopping, verify no leaked mesh-llm processes via tracked instance metadata or fallback pkill |
+
+The lifecycle POST checks first read `/api/runtime/control-bootstrap`, then send
+`Content-Type: application/json` requests to `/api/runtime/control/{load,unload,ensure,drain}-model`
+with body `{"endpoint":"<control-endpoint>","model":"qa.invalid/model@main:missing.gguf"}`.
+The harness expects HTTP 200, `accepted=true`, the same `model`, no `instance_id`,
+and `accepted_state` of `present`, `absent`, `present`, and `draining`, respectively.
+
+### Print plan (side-effect-free)
+
+```bash
+scripts/qa-runtime-daemon-lifecycle.sh \
+  --current-binary ./target/debug/mesh-llm \
+  --print-plan
+```
+
+Produces compact JSON without starting any processes:
+
+```json
+{
+  "base_port": 19740,
+  "checks": ["prereq.current-binary", "zero_model_serve_ready", ...],
+  "current_binary": "./target/debug/mesh-llm",
+  "evidence_dir": ".sisyphus/evidence",
+  "max_wait_seconds": 60,
+  "script": "qa-runtime-daemon-lifecycle.sh"
+}
+```
+
+### Evidence directory structure
+
+Each run creates a timestamped directory:
+
+```text
+.sisyphus/evidence/runtime-daemon-lifecycle-20260724T123456Z-1234/
+  manifest.json      Run inputs and mode flags
+  commands.jsonl     Commands executed by the harness and their logs
+  results.jsonl      Machine-readable PASS/FAIL/PREREQ records
+  summary.md         Human-readable final summary
+  summary.json       Machine-readable final summary (overall: pass|fail|prereq)
+  versions/current.txt   Captured binary version string
+  logs/*.log           Per-test process output
+  status/*.json        Collected /api/status payloads
+  control/*.json       Lifecycle command responses
+```
+
+### Prerequisites and failure modes
+
+`PREREQ` is never reported as PASS. Checks that reach execution record missing
+runtime prerequisites as `PREREQ`. An invalid `--current-binary` is rejected
+earlier as a usage error (exit 2), before an evidence directory is created:
+
+```bash
+# Missing binary — exits 2 with an executable-path usage error and no evidence files
+scripts/qa-runtime-daemon-lifecycle.sh \
+  --current-binary /nonexistent/path/mesh-llm \
+  --evidence-dir .sisyphus/evidence/prereq-test
+test "$?" -eq 2
+```
+
+After any run, `pgrep -f 'mesh-runtime-daemon-lifecycle'` must find no leaked processes. The cleanup trap kills all harness-owned process trees and verifies zero survivors.
+
+## Mixed-version lifecycle certification
+
+The mixed-version harness is extended to probe owner lifecycle commands
+(`load-model`, `unload-model`, `ensure-model`, `drain-model`) and typed
+unsupported behavior for new commands on released hosts, while preserving
+all existing scan-refresh/public mesh checks.
+
+### Running the harness
+
+```bash
+# Mixed-version with lifecycle commands (local-only)
+scripts/qa-control-plane-mixed-version.sh \
+  --released-binary ./target/qa/released/mesh-llm \
+  --current-binary ./target/debug/mesh-llm \
+  --local-only \
+  --evidence-dir .sisyphus/evidence/task-15-mixed-local
+
+# Public mesh certification (preserves existing probes)
+scripts/qa-control-plane-mixed-version.sh \
+  --released-binary ./target/qa/released/mesh-llm \
+  --current-binary ./target/debug/mesh-llm \
+  --require-public \
+  --evidence-dir .sisyphus/evidence/task-15-mixed-public
+
+# Inspect planned checks (side-effect-free)
+scripts/qa-control-plane-mixed-version.sh \
+  --released-binary ./target/qa/released/mesh-llm \
+  --current-binary ./target/debug/mesh-llm \
+  --local-only \
+  --print-plan | python3 -c "import json,sys; d=json.load(sys.stdin); [print(c) for c in d['checks'] if 'lifecycle' in c]"
+```
+
+### New lifecycle probes (local mode only)
+
+When `--local-only` is set, the harness adds five new checks after existing
+owner-control bootstrap and scan-refresh tests:
+
+| Check | Description | Expected result |
+|---|---|---|
+| `lifecycle-load-model` | Probe current-host owner lifecycle load command | PASS only when the authenticated command returns HTTP 200 with `accepted=true` |
+| `lifecycle-unload-model` | Probe current-host owner lifecycle unload command | PASS only when the authenticated command returns HTTP 200 with `accepted=true` |
+| `lifecycle-ensure-model` | Probe current-host owner lifecycle ensure command | PASS only when the authenticated command returns HTTP 200 with `accepted=true` |
+| `lifecycle-drain-model` | Probe current-host owner lifecycle drain command | PASS only when the authenticated command returns HTTP 200 with `accepted=true` |
+| `lifecycle-legacy-unsupported` | Send a lifecycle command through the current controller to the released target | PASS only for a structured response that explicitly reports unsupported/unknown command; a generic 404 is a failure |
+
+`run_local_direction` and the `config-current-controller` setup assign the
+available console ports to `CURRENT_HOST_CONSOLE` and `RELEASED_HOST_CONSOLE`;
+the lifecycle probes do not scan ports. When `CURRENT_HOST_CONSOLE` is empty,
+all five checks record `PREREQ`. When only `RELEASED_HOST_CONSOLE` is empty, the
+four current-host lifecycle command probes still run and only
+`lifecycle-legacy-unsupported` records `PREREQ`.
+
+### Existing behavior preserved
+
+`--require-public` continues to produce PASS for existing public mesh probes (status, models, chat) without lifecycle command extensions — the `--local-only` flag gates the new probes so they do not affect public-mesh certification runs.
+
+### Expected outcomes
+
+The local-only run produces PASS for owner-control/scan compatibility and typed unsupported for new lifecycle commands on released hosts. The `--require-public` run produces PASS for existing public mesh probes. Both mixed-version `summary.json` files must contain zero FAIL records when prerequisites are satisfied (PREREQ is acceptable for optional checks).
+
+### Failure mode: prerequisite verification
+
+Run each harness with a nonexistent required binary or documented missing prerequisite:
+
+```bash
+# Missing released binary — exits nonzero with PREREQ in summary.json
+scripts/qa-control-plane-mixed-version.sh \
+  --released-binary /nonexistent/mesh-llm \
+  --current-binary ./target/debug/mesh-llm \
+  --local-only \
+  --evidence-dir .sisyphus/evidence/prereq-test
+
+# Verify summary shows prereq status, not pass
+cat .sisyphus/evidence/control-plane-mixed-version-*/*/summary.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'overall={d[\"overall\"]}, counts={d[\"counts\"]}')"
+
+# No leaked processes after failure
+pgrep -f 'mesh-control-plane-mixed-version|task-15-' || echo "no leaks"
+```
 
 ## Single-machine testing with ephemeral keys
 
@@ -922,6 +1162,39 @@ mesh-llm client --join <TOKEN> --port 9338
 - `/v1/models` returns models from routing table
 - Inference routes through QUIC tunnel to host
 - Host does NOT see client in its peer list (zero per-client state)
+
+### 16. Release host/runtime/product boundary
+
+For release, installer, SDK, or packaging changes, validate the three layers
+without relying on a pre-existing user runtime:
+
+```bash
+just release-host-build
+just release-runtime-build metal # choose the platform backend
+product_out="$(mktemp -d)"
+just release-bundle "v$(./target/release/mesh-llm --version | awk '{print $NF}')" "$product_out"
+```
+
+Required evidence:
+
+- `scripts/verify-host-dependencies.py target/release/mesh-llm` reports no
+  rejected backend imports.
+- Extracting the product archive yields one host, one runtime tree,
+  `product-manifest.json`, and `host-imports.json`; all recorded digests match.
+- With isolated `HOME`, XDG cache, and
+  `MESH_LLM_NATIVE_RUNTIME_CACHE_DIR`, the extracted host passes `--version`,
+  `--help`, and `runtime list`. The adjacent runtime is listed and the isolated
+  cache remains empty.
+- A product with an incompatible MeshLLM version or Skippy ABI is rejected
+  before loading.
+- `client --auto --log-format json --no-console` starts without a native
+  runtime or GPU driver, emits a real ready event, and the noninteractive
+  service probe stops cleanly on SIGTERM (Unix) or CTRL_BREAK_EVENT (Windows).
+
+Run the command-surface smoke on every product platform without device
+passthrough. Separately qualify backend loading and a minimal operation on
+suitable CUDA, ROCm, Vulkan, or Metal hardware. Preserve unique temp paths and
+ports and verify process/listener cleanup.
 
 ## Deploy to remote node
 
