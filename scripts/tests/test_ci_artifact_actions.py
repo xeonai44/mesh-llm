@@ -32,6 +32,10 @@ class CiArtifactActionTests(unittest.TestCase):
         exact_pin = re.compile(
             r"^[^@\s]+@[0-9a-f]{40}\s+#\s+\S",
         )
+        protected_pr_lanes = {
+            f"Mesh-LLM/mesh-llm/.github/workflows/ci-{lane}-lane.yml@main": f"pr_{lane}.yml"
+            for lane in ("quality", "website", "linux", "macos", "windows")
+        }
 
         for path in (*action_files, *workflow_files):
             for line_number, line in enumerate(
@@ -42,6 +46,9 @@ class CiArtifactActionTests(unittest.TestCase):
                     continue
                 value = line.split("uses:", maxsplit=1)[1].strip()
                 if value.startswith("./"):
+                    continue
+                if value in protected_pr_lanes:
+                    self.assertEqual(protected_pr_lanes[value], path.name)
                     continue
                 with self.subTest(
                     path=path.relative_to(ROOT),
@@ -61,14 +68,13 @@ class CiArtifactActionTests(unittest.TestCase):
                     path.read_text(encoding="utf-8"),
                 )
 
-    def test_pr_quality_requires_ci_contract_validation(self) -> None:
+    def test_quality_slice_requires_ci_contract_validation(self) -> None:
         workflow = (
-            ROOT / ".github" / "workflows" / "pr_quality.yml"
+            ROOT / ".github" / "workflows" / "ci-quality-slice.yml"
         ).read_text(encoding="utf-8")
-        contract_start = workflow.index("  ci-contract:")
-        contract_end = workflow.index("\n  rust-fmt:", contract_start)
+        contract_start = workflow.index("  quality_contracts:")
+        contract_end = workflow.index("\n  rust_fmt:", contract_start)
         contract = workflow[contract_start:contract_end]
-        summary = workflow[workflow.index("  summary:") :]
 
         self.assertIn(
             "uses: ./.github/actions/install-actionlint",
@@ -83,8 +89,12 @@ class CiArtifactActionTests(unittest.TestCase):
             "python3 -m unittest discover -s scripts/tests -p 'test_*.py'",
             contract,
         )
-        self.assertIn("ci-contract", summary)
-        self.assertIn("needs.ci-contract.result", summary)
+        self.assertIn(
+            "cargo run -p xtask -- repo-consistency release-targets",
+            contract,
+        )
+        self.assertIn("cargo tree -p mesh-llm-client", contract)
+        self.assertIn("quality_contracts", workflow)
 
     def test_actionlint_installer_verifies_pinned_release_archives(
         self,
@@ -276,6 +286,7 @@ class CiArtifactActionTests(unittest.TestCase):
         ref: str,
         main_enabled: str,
         manual_enabled: str,
+        original_event_name: str = "",
     ) -> dict[str, str]:
         action = self.read_action("select-ci-runners")
         run_block = action.split("      run: |\n", maxsplit=1)[1]
@@ -295,6 +306,7 @@ class CiArtifactActionTests(unittest.TestCase):
                     "INPUT_REF": ref,
                     "INPUT_DEPOT_MAIN_ENABLED": main_enabled,
                     "INPUT_MANUAL_USE_DEPOT": manual_enabled,
+                    "DISPATCH_ORIGINAL_EVENT_NAME": original_event_name,
                 },
                 check=False,
                 capture_output=True,
@@ -436,7 +448,8 @@ class CiArtifactActionTests(unittest.TestCase):
         self.assertIn("package-release", gpu_routing)
         for workflow in (
             "ci",
-            "pr_builds",
+            "main_[a-z]+",
+            "pr_[a-z]+",
             "release",
             "windows-warm-caches",
         ):
@@ -551,11 +564,8 @@ class CiArtifactActionTests(unittest.TestCase):
         self,
     ) -> None:
         resolver = self.read_action("resolve-native-toolchain-epoch")
-        pr_workflow = (
-            ROOT / ".github" / "workflows" / "pr_builds.yml"
-        ).read_text(encoding="utf-8")
-        main_workflow = (
-            ROOT / ".github" / "workflows" / "ci.yml"
+        runtime_workflow = (
+            ROOT / ".github" / "workflows" / "ci-linux-runtime-slice.yml"
         ).read_text(encoding="utf-8")
         release_workflow = (
             ROOT / ".github" / "workflows" / "release.yml"
@@ -577,9 +587,21 @@ class CiArtifactActionTests(unittest.TestCase):
             with self.subTest(contract=contract):
                 self.assertIn(contract, resolver)
 
+        static_workflow = (
+            ROOT / ".github" / "workflows" / "static-abi-artifact.yml"
+        ).read_text(encoding="utf-8")
+        native_sdk_workflow = (
+            ROOT / ".github" / "workflows" / "native-sdk-artifact.yml"
+        ).read_text(encoding="utf-8")
+        swift_workflow = (
+            ROOT / ".github" / "workflows" / "swift-sdk-artifact.yml"
+        ).read_text(encoding="utf-8")
+
         for workflow in (
-            pr_workflow,
-            main_workflow,
+            runtime_workflow,
+            static_workflow,
+            native_sdk_workflow,
+            swift_workflow,
             release_workflow,
             warmer,
         ):
@@ -587,11 +609,13 @@ class CiArtifactActionTests(unittest.TestCase):
                 "uses: ./.github/actions/resolve-native-toolchain-epoch",
                 workflow,
             )
-        for workflow in (pr_workflow, main_workflow):
-            global_env = workflow.split("\npermissions:", maxsplit=1)[0]
-            self.assertNotIn("MESH_LLM_LLAMA_TOOLCHAIN_EPOCH:", global_env)
-
-        for workflow in (pr_workflow, main_workflow, release_workflow):
+        for workflow in (
+            runtime_workflow,
+            static_workflow,
+            native_sdk_workflow,
+            swift_workflow,
+            release_workflow,
+        ):
             for cache_block in re.findall(
                 r"uses: actions/cache@[^\n]+\n"
                 r"(?:[ \t]+[^\n]*\n){1,8}",
@@ -697,11 +721,12 @@ class CiArtifactActionTests(unittest.TestCase):
         for contract_path in (
             ".github/actions/compute-changes/action.yml",
             ".github/workflows/ci.yml",
-            ".github/workflows/pr_builds.yml",
             ".github/workflows/release.yml",
         ):
             with self.subTest(contract_path=contract_path):
                 self.assertRegex(contract_path, direct_sdk_pattern)
+        self.assertIn("pr_[a-z]+", action)
+        self.assertIn("main_[a-z]+", action)
         smoke_scripts = (
             ROOT / "scripts" / "ci-rust-sdk-smoke.sh",
             ROOT / "scripts" / "ci-kotlin-sdk-smoke.sh",
@@ -847,12 +872,6 @@ class CiArtifactActionTests(unittest.TestCase):
         native_sdk_producer = (
             ROOT / ".github" / "workflows" / "native-sdk-artifact.yml"
         ).read_text(encoding="utf-8")
-        pr_workflow = (
-            ROOT / ".github" / "workflows" / "pr_builds.yml"
-        ).read_text(encoding="utf-8")
-        main_workflow = (
-            ROOT / ".github" / "workflows" / "ci.yml"
-        ).read_text(encoding="utf-8")
         routing = self.read_action("compute-changes")
 
         self.assertIn("CACHE_NAMESPACE: mesh-llm", producer)
@@ -887,17 +906,17 @@ class CiArtifactActionTests(unittest.TestCase):
             "mesh-llm-cuda-runner-sha256-"
             "8d93de6ba30173e825a16fdecf011f9c632edc6e1259df7289e491b0a05f829d"
         )
-        for consumer in (native_sdk_producer, pr_workflow, main_workflow):
+        for consumer in (native_sdk_producer,):
             self.assertIn(epoch, consumer)
-        for workflow in (pr_workflow, main_workflow):
-            self.assertNotIn(
-                f"env:\n  MESH_LLM_LLAMA_TOOLCHAIN_EPOCH: {epoch}",
-                workflow,
-            )
-            self.assertIn(
-                "uses: ./.github/actions/resolve-native-toolchain-epoch",
-                workflow,
-            )
+        linux_lane = (
+            ROOT / ".github" / "workflows" / "ci-linux-lane.yml"
+        ).read_text(encoding="utf-8")
+        rust_tests = (
+            ROOT / ".github" / "workflows" / "ci-rust-tests-slice.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ci-static-abi-${{ github.run_id }}", linux_lane)
+        self.assertIn("static_abi_artifact_name", rust_tests)
+        self.assertIn("static_abi_artifact_name", linux_lane)
         self.assertIn(
             "uses: ./.github/actions/prepare-static-abi-input",
             producer,
@@ -1017,8 +1036,7 @@ class CiArtifactActionTests(unittest.TestCase):
                 )
                 self.assertIn(
                     "POLICY_MANUAL_USE_DEPOT: "
-                    "${{ github.event_name == 'workflow_dispatch' "
-                    "&& github.event.inputs.use_depot == 'true' }}",
+                    "${{ inputs.use_depot }}",
                     workflow,
                 )
                 self.assertIn("default|4|8|16", workflow)
@@ -1465,6 +1483,33 @@ class CiArtifactActionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("composed host version mismatch", result.stderr)
 
+    def test_product_composer_accepts_host_build_metadata(self) -> None:
+        """Non-release hosts carry `+g<sha>[.dirty]` build metadata.
+
+        Semver build metadata is not part of version identity, so a debug host
+        stamped with its commit SHA still composes against the runtime's
+        release version.
+        """
+        for host_version in ("1.2.3+gABC123", "1.2.3+gABC123.dirty"):
+            with self.subTest(host_version=host_version):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    result = self.run_product_composer(
+                        Path(temp_dir),
+                        host_version=host_version,
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_product_composer_rejects_drift_despite_build_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.run_product_composer(
+                Path(temp_dir),
+                host_version="9.9.9+gABC123",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("composed host version mismatch", result.stderr)
+
     def test_product_composer_accepts_one_checksums_runtime_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             result = self.run_product_composer(
@@ -1674,7 +1719,11 @@ class CiArtifactActionTests(unittest.TestCase):
         self.assertIn("\n  ref:", action)
 
         runtime = action.split("runs:", maxsplit=1)[1]
-        pull_request_case = runtime.split(
+        effective_event_case = runtime.split(
+            'case "$effective_event_name" in',
+            maxsplit=1,
+        )[1]
+        pull_request_case = effective_event_case.split(
             "pull_request|pull_request_target)",
             maxsplit=1,
         )[1].split(";;", maxsplit=1)[0]
@@ -1684,7 +1733,7 @@ class CiArtifactActionTests(unittest.TestCase):
         self.assertNotIn("INPUT_HEAD_REPOSITORY", runtime)
         self.assertNotIn("INPUT_REPOSITORY", runtime)
 
-        dispatch_case = runtime.split(
+        dispatch_case = effective_event_case.split(
             "workflow_dispatch)",
             maxsplit=1,
         )[1].split(";;", maxsplit=1)[0]
@@ -1693,7 +1742,7 @@ class CiArtifactActionTests(unittest.TestCase):
         self.assertIn('INPUT_REF" == "refs/heads/main"', dispatch_case)
         self.assertIn("depot_enabled=true", dispatch_case)
 
-        push_case = runtime.split(
+        push_case = effective_event_case.split(
             "push)",
             maxsplit=1,
         )[1].split(";;", maxsplit=1)[0]
@@ -1701,7 +1750,7 @@ class CiArtifactActionTests(unittest.TestCase):
         self.assertIn('INPUT_REF" == "refs/heads/main"', push_case)
         self.assertIn("depot_enabled=true", push_case)
 
-        default_case = runtime.split(
+        default_case = effective_event_case.split(
             "*)",
             maxsplit=1,
         )[1].split(";;", maxsplit=1)[0]
@@ -1749,10 +1798,27 @@ class CiArtifactActionTests(unittest.TestCase):
                         expected_sized_arm,
                     )
 
-    def test_pr_caches_rely_on_github_ref_scoping_while_depot_is_blocked(
+        untrusted_dispatch = self.run_runner_selector(
+            event_name="workflow_dispatch",
+            ref="refs/heads/main",
+            main_enabled="true",
+            manual_enabled="true",
+            original_event_name="pull_request_target",
+        )
+        self.assertEqual(untrusted_dispatch["depot_enabled"], "false")
+        self.assertEqual(untrusted_dispatch["runner"], "ubuntu-24.04")
+
+    def test_dispatched_pr_cache_writes_remain_blocked_with_depot(
         self,
     ) -> None:
-        for workflow_name in ("pr_builds.yml", "pr_quality.yml"):
+        workflow_names = (
+            "ci-quality-slice.yml",
+            "ci-rust-tests-slice.yml",
+            "ci-linux-host-slice.yml",
+            "ci-linux-runtime-slice.yml",
+            "static-abi-artifact.yml",
+        )
+        for workflow_name in workflow_names:
             workflow = (
                 ROOT / ".github" / "workflows" / workflow_name
             ).read_text(encoding="utf-8")
@@ -1764,49 +1830,22 @@ class CiArtifactActionTests(unittest.TestCase):
                     'SCCACHE_GHA_ENABLED: "false"',
                     workflow,
                 )
-                self.assertIn(
-                    "save-if: ${{ github.ref == 'refs/heads/main' }}",
-                    workflow,
-                )
+                if "uses: Swatinem/rust-cache@" in workflow:
+                    self.assertIn(
+                        "save-if: ${{ github.ref == 'refs/heads/main' && ",
+                        workflow,
+                    )
+                    self.assertIn(
+                        "github.event.inputs.original_event_name != 'pull_request'",
+                        workflow,
+                    )
+                if "uses: ./.github/actions/configure-sccache-gha" in workflow:
+                    self.assertIn("allow_depot_remote_cache", workflow)
 
-        builds = (
-            ROOT / ".github" / "workflows" / "pr_builds.yml"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "SCCACHE_GHA_RW_MODE: "
-            "${{ github.event_name == 'pull_request' "
-            "&& 'READ_ONLY' || 'READ_WRITE' }}",
-            builds,
-        )
-
-        main = (
-            ROOT / ".github" / "workflows" / "ci.yml"
-        ).read_text(encoding="utf-8")
-        self.assertEqual(main.count('SCCACHE_GHA_ENABLED: "false"'), 1)
-
-        quality = (
-            ROOT / ".github" / "workflows" / "pr_quality.yml"
-        ).read_text(encoding="utf-8")
-        self.assertIn(
-            "shared-key: main-rust-crate-tests-${{ matrix.batch.idx }}",
-            builds,
-        )
-        self.assertIn(
-            "shared-key: main-rust-crate-tests-${{ matrix.batch.idx }}",
-            main,
-        )
-        self.assertIn(
-            "allow_depot_remote_cache: "
-            "${{ needs.changes.outputs.allow_depot_remote_cache }}",
-            builds,
-        )
-        self.assertIn(
-            "allow_depot_remote_cache: "
-            "${{ needs.changes.outputs.allow_depot_remote_cache }}",
-            quality,
-        )
-        self.assertIn("${{ env.CACHE_NAMESPACE }}-pnpm-", quality)
-        self.assertNotIn("cache: pnpm", quality)
+        for pr_path in (ROOT / ".github" / "workflows").glob("pr_*.yml"):
+            pr = pr_path.read_text(encoding="utf-8")
+            self.assertNotIn("depot-ubuntu", pr)
+            self.assertNotIn("SCCACHE_GHA_ENABLED: \"false\"", pr)
 
 
 if __name__ == "__main__":

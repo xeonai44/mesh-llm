@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use skippy_runtime::{
-    ChatTemplateMessage, ChatTemplateOptions, RuntimeConfig, RuntimeLoadMode, StageModel,
-    suppress_native_logs,
+    ChatTemplateMessage, ChatTemplateOptions, MtpSource, RuntimeConfig, RuntimeLoadMode,
+    StageModel, suppress_native_logs,
 };
 
 use crate::cli::TokenLengthsArgs;
@@ -91,6 +91,7 @@ pub fn token_lengths(args: TokenLengthsArgs) -> Result<()> {
             projector_path: None,
             include_embeddings: true,
             include_output: false,
+            mtp_source: MtpSource::Disabled,
             filter_tensors_on_load: true,
         },
     )
@@ -105,6 +106,7 @@ pub fn token_lengths(args: TokenLengthsArgs) -> Result<()> {
                     add_assistant: true,
                     enable_thinking: Some(args.enable_thinking),
                     reasoning_format: None,
+                    ..ChatTemplateOptions::default()
                 },
             )
             .with_context(|| {

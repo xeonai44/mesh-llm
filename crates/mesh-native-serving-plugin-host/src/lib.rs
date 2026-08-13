@@ -3,6 +3,7 @@
 mod plugin_dispatch;
 #[cfg(test)]
 mod test_support;
+mod tokenizer_capability;
 
 use std::{
     collections::HashMap,
@@ -17,6 +18,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use libloading::Library;
 use mesh_native_serving_plugin_api as abi;
+use plugin_dispatch::{PluginCommand, PluginDriver};
 use skippy_server::frontend::{
     GenerationAbort, GenerationCommit, GenerationLifecycleIngress, GenerationLifecycleObservation,
     GenerationReceipt, GenerationReceiptConfig, GenerationStart, LinearProposal,
@@ -26,12 +28,16 @@ use skippy_server::frontend::{
 };
 use skippy_server::serving_hooks::{ModelServingHooks, ModelServingHooksFactory};
 use skippy_server::tokenizer::TokenizerCapability;
-
-use plugin_dispatch::{PluginCommand, PluginDriver};
+use tokenizer_capability::HostTokenizerCapability;
 
 const ERROR_BUFFER_BYTES: usize = 2_048;
 const MAX_NATIVE_PLUGIN_PROPOSAL_TOKENS: usize = 4_096;
 const PROPOSAL_POLL_INTERVAL: Duration = Duration::from_micros(50);
+
+const _: () = assert!(
+    abi::MAX_TOKENIZER_INPUT_PIECES == skippy_tokenizer::MAX_TOKENIZE_PIECES,
+    "ABI and tokenizer piece bounds must match",
+);
 
 /// Mesh-owned factory for one independently built native serving plugin.
 #[derive(Clone)]
@@ -86,13 +92,8 @@ impl NativeServingPluginFactory {
 
 impl ModelServingHooksFactory for NativeServingPluginFactory {
     fn create(&self, tokenizer: TokenizerCapability) -> Result<ModelServingHooks> {
-        let identity = tokenizer.identity();
-        let inventory = ActivationInventory::from_inventory(
-            tokenizer
-                .inventory()
-                .context("bound model does not expose a tokenizer inventory")?,
-        )?;
-        let inventory_view = inventory.view();
+        let tokenizer_capability = HostTokenizerCapability::new(tokenizer)?;
+        let identity = tokenizer_capability.tokenizer.identity();
         let context = abi::ActivationContext {
             struct_size: size_of::<abi::ActivationContext>(),
             model_id: abi::ByteSlice::from_bytes(identity.model_id.as_bytes()),
@@ -100,7 +101,7 @@ impl ModelServingHooksFactory for NativeServingPluginFactory {
                 identity.source_model_sha256.as_bytes(),
             ),
             tokenizer_id: abi::ByteSlice::from_bytes(identity.tokenizer_id.as_bytes()),
-            tokenizer_inventory: &raw const inventory_view,
+            tokenizer_capability: &tokenizer_capability.abi,
             config_path: path_slice(&self.config_path),
             state_directory: path_slice(&self.state_directory),
             proposal_deadline_ns: u64::try_from(self.proposal_deadline.as_nanos())
@@ -125,6 +126,7 @@ impl ModelServingHooksFactory for NativeServingPluginFactory {
         let active = ActivePlugin {
             definition: Arc::clone(&self.definition),
             instance: Some(instance),
+            _tokenizer_capability: Some(tokenizer_capability),
             proposal_token_buffer: Mutex::new(vec![0; MAX_NATIVE_PLUGIN_PROPOSAL_TOKENS]),
             committed_generated_tokens: Mutex::new(HashMap::new()),
         };
@@ -144,52 +146,9 @@ impl ModelServingHooksFactory for NativeServingPluginFactory {
     }
 }
 
-struct ActivationInventory {
-    entries: Vec<abi::TokenizerInventoryEntry>,
-}
-
-impl ActivationInventory {
-    fn from_inventory(inventory: &abi::TokenizerInventory) -> Result<Self> {
-        if inventory.schema_version != abi::TOKENIZER_INVENTORY_SCHEMA
-            || inventory.tokens.is_empty()
-        {
-            bail!("bound model exposes an unsupported or empty tokenizer inventory");
-        }
-        let entries = inventory
-            .tokens
-            .iter()
-            .map(|entry| {
-                let (piece_kind, bytes) = match &entry.piece {
-                    abi::TokenizerInventoryPiece::Bytes { bytes } => {
-                        (abi::TokenizerPieceKind::BYTES, bytes.as_slice())
-                    }
-                    abi::TokenizerInventoryPiece::Control { identity } => {
-                        (abi::TokenizerPieceKind::CONTROL, identity.as_bytes())
-                    }
-                };
-                abi::TokenizerInventoryEntry {
-                    id: entry.id,
-                    piece_kind,
-                    bytes: abi::ByteSlice::from_bytes(bytes),
-                }
-            })
-            .collect();
-        Ok(Self { entries })
-    }
-
-    fn view(&self) -> abi::TokenizerInventoryView {
-        abi::TokenizerInventoryView {
-            struct_size: size_of::<abi::TokenizerInventoryView>(),
-            schema_version: abi::TOKENIZER_INVENTORY_SCHEMA,
-            entries: self.entries.as_ptr(),
-            entry_count: self.entries.len(),
-        }
-    }
-}
-
 struct LoadedDefinition {
     _library: Option<Library>,
-    api: NonNull<abi::NativeServingPluginV1>,
+    api: NonNull<abi::NativeServingPluginV2>,
     name: String,
 }
 
@@ -204,7 +163,7 @@ impl LoadedDefinition {
         let library = unsafe { Library::new(path) }
             .with_context(|| format!("load native serving plugin {}", path.display()))?;
         let entry = unsafe {
-            library.get::<abi::NativeServingPluginEntryV1>(abi::NATIVE_SERVING_PLUGIN_ENTRY_V1)
+            library.get::<abi::NativeServingPluginEntryV2>(abi::NATIVE_SERVING_PLUGIN_ENTRY_V2)
         }
         .with_context(|| {
             format!(
@@ -222,7 +181,7 @@ impl LoadedDefinition {
         })
     }
 
-    fn api(&self) -> &abi::NativeServingPluginV1 {
+    fn api(&self) -> &abi::NativeServingPluginV2 {
         unsafe { self.api.as_ref() }
     }
 
@@ -246,19 +205,19 @@ impl LoadedDefinition {
     }
 }
 
-fn validate_table(table: &abi::NativeServingPluginV1) -> Result<String> {
-    if table.abi_version != abi::NATIVE_SERVING_PLUGIN_ABI_V1 {
+fn validate_table(table: &abi::NativeServingPluginV2) -> Result<String> {
+    if table.abi_version != abi::NATIVE_SERVING_PLUGIN_ABI_V2 {
         bail!(
             "native serving plugin ABI {} is incompatible with host ABI {}",
             table.abi_version,
-            abi::NATIVE_SERVING_PLUGIN_ABI_V1
+            abi::NATIVE_SERVING_PLUGIN_ABI_V2
         );
     }
-    if table.struct_size != size_of::<abi::NativeServingPluginV1>() {
+    if table.struct_size != size_of::<abi::NativeServingPluginV2>() {
         bail!(
             "native serving plugin table size {} does not match host size {}",
             table.struct_size,
-            size_of::<abi::NativeServingPluginV1>()
+            size_of::<abi::NativeServingPluginV2>()
         );
     }
     let name = unsafe { read_utf8(table.plugin_name, "plugin name") }?;
@@ -271,6 +230,7 @@ fn validate_table(table: &abi::NativeServingPluginV1) -> Result<String> {
 struct ActivePlugin {
     definition: Arc<LoadedDefinition>,
     instance: Option<NonNull<c_void>>,
+    _tokenizer_capability: Option<Arc<HostTokenizerCapability>>,
     proposal_token_buffer: Mutex<Vec<i32>>,
     committed_generated_tokens: Mutex<HashMap<(u64, u64), usize>>,
 }
@@ -469,13 +429,35 @@ impl ActivePlugin {
         if !query.pending_token_ids.is_empty() {
             let generated_token_count = query
                 .committed_token_count
-                .saturating_sub(query.prompt_token_count);
-            self.commit_tokens(
-                query.request_id,
-                query.session_id,
-                generated_token_count,
-                &query.pending_token_ids,
-            )?;
+                .checked_sub(query.prompt_token_count)
+                .context(
+                    "native serving plugin proposal committed token count precedes prompt token count",
+                )?;
+            let key = (query.request_id, query.session_id);
+            let tracked_generated_token_count = self
+                .committed_generated_tokens
+                .lock()
+                .map_err(|_| anyhow!("native serving plugin commit state lock poisoned"))?
+                .get(&key)
+                .copied()
+                .context("native serving plugin proposal has no active generation state")?;
+            if generated_token_count < tracked_generated_token_count {
+                bail!("native serving plugin proposal rewound the tracked generated-token prefix");
+            }
+            if generated_token_count > tracked_generated_token_count {
+                let delta = generated_token_count - tracked_generated_token_count;
+                if delta != query.pending_token_ids.len() {
+                    bail!(
+                        "native serving plugin proposal pending-token count does not match the uncommitted suffix"
+                    );
+                }
+                self.commit_tokens(
+                    query.request_id,
+                    query.session_id,
+                    generated_token_count,
+                    &query.pending_token_ids,
+                )?;
+            }
         }
         let event = abi::ProposalQuery {
             struct_size: size_of::<abi::ProposalQuery>(),
@@ -819,32 +801,6 @@ mod tests {
     use crate::test_support::fake_table;
 
     #[test]
-    fn tokenizer_inventory_view_borrows_host_owned_bytes_for_activation() {
-        let inventory = abi::TokenizerInventory {
-            schema_version: abi::TOKENIZER_INVENTORY_SCHEMA,
-            model_id: "glm".to_string(),
-            source_model_sha256: "a".repeat(64),
-            tokenizer_id: "gguf-source-sha256:test".to_string(),
-            tokens: vec![abi::TokenizerInventoryToken {
-                id: 0,
-                piece: abi::TokenizerInventoryPiece::Bytes {
-                    bytes: b"hello".to_vec(),
-                },
-            }],
-        };
-        let activation = ActivationInventory::from_inventory(&inventory).unwrap();
-        let view = activation.view();
-        assert_eq!(view.schema_version, abi::TOKENIZER_INVENTORY_SCHEMA);
-        assert_eq!(view.entry_count, 1);
-        let entry = unsafe { &*view.entries };
-        assert_eq!(entry.piece_kind, abi::TokenizerPieceKind::BYTES);
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts(entry.bytes.pointer, entry.bytes.length) },
-            b"hello"
-        );
-    }
-
-    #[test]
     fn output_validation_is_fail_closed() {
         let decision = [1_u8; abi::MAX_DECISION_ID_BYTES];
         let tokens = [7_i32; 8_192];
@@ -886,7 +842,7 @@ mod tests {
                 .to_string()
                 .contains("incompatible")
         );
-        table.abi_version = abi::NATIVE_SERVING_PLUGIN_ABI_V1;
+        table.abi_version = abi::NATIVE_SERVING_PLUGIN_ABI_V2;
         table.struct_size -= 1;
         assert!(
             validate_table(&table)
@@ -894,5 +850,130 @@ mod tests {
                 .to_string()
                 .contains("table size")
         );
+    }
+
+    #[test]
+    fn proposal_does_not_recommit_tokens_already_delivered_by_lifecycle() {
+        let (active, events) = test_support::fake_active_with_events(Duration::ZERO);
+        active
+            .begin(&GenerationStart {
+                request_id: 1,
+                session_id: 2,
+                agent_session_id: None,
+                prompt_token_ids: Arc::from([3]),
+            })
+            .unwrap();
+        active
+            .committed(&GenerationCommit {
+                request_id: 1,
+                session_id: 2,
+                generated_token_count: 1,
+                token_ids: vec![4].into_boxed_slice(),
+            })
+            .unwrap();
+
+        let result = active
+            .propose(
+                LinearProposalQuery::new(
+                    1,
+                    2,
+                    1,
+                    2,
+                    1,
+                    8,
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .with_pending_token_ids(vec![4].into_boxed_slice()),
+            )
+            .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(*events.lock().unwrap(), ["begin", "commit", "proposal"]);
+    }
+
+    #[test]
+    fn proposal_rejects_missing_generation_state() {
+        let (active, _) = test_support::fake_active_with_events(Duration::ZERO);
+        let error = active
+            .propose(
+                LinearProposalQuery::new(
+                    1,
+                    2,
+                    1,
+                    2,
+                    1,
+                    8,
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .with_pending_token_ids(vec![4].into_boxed_slice()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("no active generation state"));
+    }
+
+    #[test]
+    fn proposal_rejects_a_rewound_generation_prefix() {
+        let (active, _) = test_support::fake_active_with_events(Duration::ZERO);
+        active
+            .begin(&GenerationStart {
+                request_id: 1,
+                session_id: 2,
+                agent_session_id: None,
+                prompt_token_ids: Arc::from([3]),
+            })
+            .unwrap();
+        active
+            .committed(&GenerationCommit {
+                request_id: 1,
+                session_id: 2,
+                generated_token_count: 2,
+                token_ids: vec![4, 5].into_boxed_slice(),
+            })
+            .unwrap();
+
+        let error = active
+            .propose(
+                LinearProposalQuery::new(
+                    1,
+                    2,
+                    1,
+                    2,
+                    1,
+                    8,
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .with_pending_token_ids(vec![4].into_boxed_slice()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("rewound"));
+    }
+
+    #[test]
+    fn proposal_rejects_an_inconsistent_pending_suffix() {
+        let (active, _) = test_support::fake_active_with_events(Duration::ZERO);
+        active
+            .begin(&GenerationStart {
+                request_id: 1,
+                session_id: 2,
+                agent_session_id: None,
+                prompt_token_ids: Arc::from([3]),
+            })
+            .unwrap();
+
+        let error = active
+            .propose(
+                LinearProposalQuery::new(
+                    1,
+                    2,
+                    1,
+                    3,
+                    1,
+                    8,
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .with_pending_token_ids(vec![4].into_boxed_slice()),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("pending-token count"));
     }
 }
