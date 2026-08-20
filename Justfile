@@ -186,9 +186,11 @@ release-build-aarch64: release-host-build
     @scripts/package-native-runtime.sh --build --backend cpu --target aarch64-unknown-linux-gnu
 
 # Build a Linux aarch64 CUDA release artifact (Jetson/Orin).
-# SM arches selected by MESH_CUDA_VERSION env (set by CI matrix).
+# SM arches selected by MESH_CUDA_VERSION env (set by CI matrix); a bare
+# `just` invocation with the var unset detects the installed toolkit instead
+# of assuming one (see scripts/detect-cuda-toolkit-version.sh).
 release-build-aarch64-cuda: release-host-build
-    @cuda_version="${MESH_CUDA_VERSION:-12}"; \
+    @cuda_version="${MESH_CUDA_VERSION:-$(scripts/detect-cuda-toolkit-version.sh)}"; \
       MESH_LLM_CUDA_TOOLKIT_MAJOR="${MESH_LLM_CUDA_TOOLKIT_MAJOR:-${cuda_version%%.*}}" \
       LLAMA_STAGE_CUDA_ARCHITECTURES="$(if [[ "$cuda_version" == 13.* ]]; then echo '75;80;86;87;89;90;110'; else echo '61;75;80;86;87;89;90'; fi)" \
       scripts/package-native-runtime.sh --build --backend cuda --target aarch64-unknown-linux-gnu
@@ -212,11 +214,26 @@ release-host-build-windows:
     @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1 -BuildProfile release -HostOnly
 
 # Build a Linux CUDA release artifact.
-# SM arches selected by MESH_CUDA_VERSION env (set by CI matrix).
+# SM arches selected by MESH_CUDA_VERSION env (set by CI matrix); a bare
+# `just` invocation with the var unset detects the installed toolkit instead
+# of assuming one (see scripts/detect-cuda-toolkit-version.sh). Blackwell
+# (sm_100/103/120/121) needs toolkit >= 12.8, the first release that shipped
+# support for it -- gate on that boundary, not on the CUDA major alone.
 release-build-cuda: release-host-build
-    @cuda_version="${MESH_CUDA_VERSION:-12}"; \
-      MESH_LLM_CUDA_TOOLKIT_MAJOR="${MESH_LLM_CUDA_TOOLKIT_MAJOR:-${cuda_version%%.*}}" \
-      LLAMA_STAGE_CUDA_ARCHITECTURES="$(if [[ "$cuda_version" == 13.* ]]; then echo '75;80;86;87;89;90;100;103;120;121'; else echo '61;75;80;86;87;89;90'; fi)" \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cuda_version="${MESH_CUDA_VERSION:-$(scripts/detect-cuda-toolkit-version.sh)}"
+    major="${cuda_version%%.*}"
+    minor="${cuda_version#*.}"
+    [[ "$minor" == "$cuda_version" ]] && minor=0
+    minor="${minor%%.*}"
+    if [[ "$major" -gt 12 || ("$major" -eq 12 && "$minor" -ge 8) ]]; then
+      arches='75;80;86;87;89;90;100;103;120;121'
+    else
+      arches='61;75;80;86;87;89;90'
+    fi
+    MESH_LLM_CUDA_TOOLKIT_MAJOR="${MESH_LLM_CUDA_TOOLKIT_MAJOR:-$major}" \
+      LLAMA_STAGE_CUDA_ARCHITECTURES="$arches" \
       scripts/package-native-runtime.sh --build --backend cuda --target x86_64-unknown-linux-gnu
 
 release-build-cuda-windows cuda_arch="61;75;80;86;87;89;90":
@@ -454,6 +471,7 @@ ci-validate:
     python3 -m unittest discover -s scripts/tests -p 'test_*.py'
     just ci-crate-lists
     just check-release
+    just no-console-print
     just publish-crates
 
 # Run CI/workspace crate-list consistency checks.
@@ -463,6 +481,12 @@ ci-crate-lists:
 # Run crates.io publish-chain consistency checks.
 publish-crates:
     just with-lld cargo run -p xtask -- repo-consistency publish-crates
+
+# Ratchet on println!/eprintln!/print!/eprint! in Rust files under crates/
+# (including crate test targets; build.rs is skipped): every occurrence must be
+# explicitly listed in tools/xtask/data/console_print_allowlist.json.
+no-console-print:
+    cargo run -p xtask -- repo-consistency no-console-print
 
 # Shellcheck the explicitly supplied changed shell scripts.
 ci-shellcheck *scripts:

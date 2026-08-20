@@ -16,6 +16,7 @@ evals/results/
 !.omo/specs/
 .omo/specs/*
 !.omo/specs/pr-ci-optimization.md
+.impeccable
 .playwright-mcp/
 .envrc
 .moe-cache/
@@ -27,6 +28,7 @@ dist/MeshLLMFFI.xcframework.zip
 dist/native-sdk/
 dist/native-sdk-static/
 dist/llama-stage-static/
+dist/native-runtimes/
 sdk/kotlin/src/main/kotlin/uniffi/
 sdk/kotlin/example/example-jvm/src/main/kotlin/uniffi/
 sdk/node/native/

@@ -5,13 +5,10 @@
 //! mixed-version compatibility. Skippy activation transport remains on the
 //! latency-sensitive `skippy-stage/2` ALPN.
 
-#[cfg(test)]
-pub(crate) use mesh_llm_types::mesh::MAX_SPLIT_RTT_MS;
 pub use mesh_llm_types::mesh::{
     ModelDemand, ModelRuntimeDescriptor, ModelSourceKind, ServedModelDescriptor,
     ServedModelIdentity, ServedModelMetadata, infer_available_model_descriptors,
-    infer_local_served_model_descriptor, infer_served_model_descriptors, max_split_rtt_ms,
-    split_allow_relay_paths,
+    infer_local_served_model_descriptor, infer_served_model_descriptors,
 };
 
 use anyhow::{Context, Result};
@@ -82,6 +79,7 @@ mod artifact_transfer_io;
 mod capacity;
 mod connection_reservation;
 mod connections;
+mod connectivity;
 mod direct_path;
 mod gossip;
 mod heartbeat;
@@ -127,6 +125,7 @@ use stage_transport::*;
 use stun::*;
 
 pub use connections::{QuicBindSelection, RelayConfig, RelayPolicy};
+pub(crate) use connectivity::MeshConnectivitySnapshot;
 pub use gossip::backfill_legacy_descriptors;
 #[expect(
     unused_imports,
@@ -165,7 +164,7 @@ pub(crate) use stage_transport::{
     unused_imports,
     reason = "public compatibility re-export for existing split-stage routing callers"
 )]
-pub use stage_transport::{InflightRequestGuard, SplitStagePathRejection, SplitStagePathSnapshot};
+pub use stage_transport::{InflightRequestGuard, SplitStagePathSnapshot};
 pub use stage_transport::{
     StageAssignment, StageEndpoint, StageRuntimeStatus, StageTopologyInstance, TunnelChannels,
 };
