@@ -19,7 +19,7 @@ use crate::{
         StageModelReport,
     },
     support::{
-        ChildGuard, activation_width, connect_ready, generate_run_id, parse_wire_dtype,
+        ChildGuard, activation_width, connect_ready_child, generate_run_id, parse_wire_dtype,
         temp_config_path_for,
     },
 };
@@ -259,6 +259,7 @@ pub fn dtype_matrix(args: DtypeMatrixArgs) -> Result<()> {
     ensure_matches(mismatch_count == 0, args.allow_mismatch)?;
     Ok(())
 }
+
 fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
     if args.split_layer_1 == 0
         || args.split_layer_1 >= args.split_layer_2
@@ -487,10 +488,14 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
         &args.max_inflight.to_string(),
     ]);
     configure_child_logs(&mut stage2_command, args.child_logs);
-    let _stage2 = ChildGuard::spawn(stage2_command)?;
+    let mut stage2 = ChildGuard::spawn(stage2_command)?;
     drop(
-        connect_ready(args.stage2_bind_addr, args.startup_timeout_secs)
-            .context("stage 2 binary server did not become ready")?,
+        connect_ready_child(
+            args.stage2_bind_addr,
+            args.startup_timeout_secs,
+            &mut stage2,
+        )
+        .context("stage 2 binary server did not become ready")?,
     );
 
     let mut stage1_command = Command::new(&args.stage_server_bin);
@@ -512,10 +517,14 @@ fn run_binary_chain(args: BinaryChainConfig) -> Result<BinaryChainResult> {
         &args.max_inflight.to_string(),
     ]);
     configure_child_logs(&mut stage1_command, args.child_logs);
-    let _stage1 = ChildGuard::spawn(stage1_command)?;
+    let mut stage1 = ChildGuard::spawn(stage1_command)?;
 
-    let mut stream = connect_ready(args.stage1_bind_addr, args.startup_timeout_secs)
-        .context("stage 1 binary server did not become ready")?;
+    let mut stream = connect_ready_child(
+        args.stage1_bind_addr,
+        args.startup_timeout_secs,
+        &mut stage1,
+    )
+    .context("stage 1 binary server did not become ready")?;
     let request_id = 2;
     let session_id = 2;
     send_generation_config(&mut stream, wire_dtype, request_id, session_id, 1)

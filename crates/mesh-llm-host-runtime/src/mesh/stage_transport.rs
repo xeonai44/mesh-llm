@@ -367,7 +367,11 @@ pub(crate) fn artifact_transfer_allowed_by_topology(
 /// Channels returned by Node::start for inbound tunnel streams.
 pub struct TunnelChannels {
     pub rpc: tokio::sync::mpsc::Receiver<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
-    pub http: tokio::sync::mpsc::Receiver<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
+    pub http: tokio::sync::mpsc::Receiver<(
+        EndpointId,
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+    )>,
     pub stage: tokio::sync::mpsc::Receiver<(
         EndpointId,
         iroh::endpoint::SendStream,
@@ -684,6 +688,15 @@ impl Node {
         self.inflight_change_tx.subscribe()
     }
 
+    pub(crate) async fn set_stage_control_handle(
+        &self,
+        lifecycle: crate::inference::skippy::StageControlHandle,
+    ) {
+        *self.stage_control_tx.lock().await = Some(lifecycle.sender());
+        *self.stage_control_lifecycle.lock().await = Some(lifecycle);
+    }
+
+    #[cfg(test)]
     pub(crate) async fn set_stage_control_sender(
         &self,
         tx: tokio::sync::mpsc::UnboundedSender<crate::inference::skippy::StageControlCommand>,

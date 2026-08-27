@@ -1,12 +1,12 @@
 mod activation_cache;
 mod binary_kv;
 mod binary_messaging;
-mod decode_batcher;
 pub(crate) mod direct_return;
 pub(crate) mod forwarding;
 mod kv_eviction;
 mod options;
 mod preconnect;
+mod prefill_execution;
 mod restore_prefill_decode;
 mod socket;
 mod stage_execution;
@@ -16,7 +16,6 @@ pub(crate) use self::binary_messaging::async_forwarder::{AsyncForwardReceipt, As
 pub use self::binary_messaging::{
     serve_binary, serve_binary_stage, serve_binary_stage_with_shutdown,
 };
-pub(crate) use self::decode_batcher::DecodeFrameBatcher;
 pub use self::direct_return::PredictionReturnHub;
 pub use self::direct_return::PredictionReturnListener;
 pub(crate) use self::direct_return::PredictionReturnReceiver;

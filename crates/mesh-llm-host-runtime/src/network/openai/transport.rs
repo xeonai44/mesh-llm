@@ -5,17 +5,18 @@
 
 use crate::inference::election;
 use crate::logging::{
-    OpenAiLifecycleAttachment, OpenAiRouteAttempt, OpenAiRouteObserver, ProxyAttemptFinish,
+    CallerPathType, OpenAiLifecycleAttachment, OpenAiRouteAttempt, OpenAiRouteObserver,
+    ProxyAttemptFinish,
 };
 use crate::mesh;
 use crate::network::affinity::{
     AffinityRouter, PreparedTargets, TargetSelection, prepare_remote_targets_for_request,
 };
 use crate::network::openai::auto_route;
+use crate::network::openai::client_stream::ClientStream;
 use crate::network::openai::response_quality::ResponseQualityFailure;
 use crate::network::router;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 
 pub use super::request_normalize::{ResponseAdapter, release_request_objects};
 pub(crate) use super::request_parse::read_http_request_with_plugin_manager_with_context;
@@ -153,7 +154,7 @@ const LEGACY_LIFECYCLE_ROUTE_MESSAGE: &str =
     "model lifecycle routes moved to the trusted local management API at :3131/api/runtime/models";
 
 pub(crate) async fn reject_legacy_lifecycle_request(
-    tcp_stream: TcpStream,
+    tcp_stream: ClientStream,
     route_observer: OpenAiRouteObserver<'_>,
 ) -> RouteDispatchOutcome {
     response_outcome(
@@ -216,7 +217,7 @@ enum MeshAttemptDisposition {
 }
 
 enum MeshRouteResult {
-    Exhausted(TcpStream),
+    Exhausted(ClientStream),
     Finished(RouteAttemptResult),
 }
 
@@ -234,11 +235,20 @@ fn capture_path_for_request(request: &BufferedHttpRequest) -> &str {
     &request.client_path
 }
 
-fn attach_request_logging(request: &mut BufferedHttpRequest) -> OpenAiLifecycleAttachment {
+fn attach_request_logging(
+    request: &mut BufferedHttpRequest,
+    source_addr: Option<std::net::SocketAddr>,
+) -> OpenAiLifecycleAttachment {
+    let caller_addr = source_addr.map(|addr| addr.to_string());
     let metadata =
         crate::logging::RequestSummaryMetadata::from_openai_ingress_path(&request.client_path)
             .with_source(Some("mesh_forwarded"))
-            .with_method(Some(&request.method));
+            .with_method(Some(&request.method))
+            .with_caller_identity(
+                None,
+                caller_addr.as_deref(),
+                caller_addr.as_ref().map(|_| CallerPathType::LocalHttp),
+            );
     let lifecycle = crate::logging_runtime_state()
         .map(|state| state.openai_ingress_attachment(request.request_id, metadata))
         .unwrap_or_else(OpenAiLifecycleAttachment::unowned);
@@ -253,10 +263,10 @@ fn attach_request_logging(request: &mut BufferedHttpRequest) -> OpenAiLifecycleA
 
 async fn handle_mesh_control_request(
     node: &mesh::Node,
-    tcp_stream: TcpStream,
+    tcp_stream: ClientStream,
     request: &BufferedHttpRequest,
     lifecycle: &mut OpenAiLifecycleAttachment,
-) -> Option<TcpStream> {
+) -> Option<ClientStream> {
     if is_legacy_lifecycle_path(&request.path) {
         let outcome = reject_legacy_lifecycle_request(tcp_stream, lifecycle.route_observer()).await;
         lifecycle.terminal(outcome.terminal_outcome());
@@ -289,7 +299,7 @@ async fn handle_mesh_control_request(
 /// Set `track_demand` to record requests for demand-based rebalancing.
 pub async fn handle_mesh_request(
     node: mesh::Node,
-    tcp_stream: TcpStream,
+    tcp_stream: ClientStream,
     track_demand: bool,
     affinity: AffinityRouter,
 ) {
@@ -310,7 +320,7 @@ pub async fn handle_mesh_request(
     };
     // The parsed host ingress owns the parent. Downstream route code receives
     // only the attachment's metadata observer and cannot terminalize it.
-    let mut lifecycle = attach_request_logging(&mut request);
+    let mut lifecycle = attach_request_logging(&mut request, source_addr);
     if node.swarm_capture_enabled() {
         node.capture_http_request(crate::mesh::HttpCaptureEvent {
             event: "openai_ingress_http_request",
@@ -406,10 +416,10 @@ pub async fn handle_mesh_request(
 
 async fn route_mesh_moa_or_passthrough(
     node: &mesh::Node,
-    tcp_stream: TcpStream,
+    tcp_stream: ClientStream,
     request: &mut BufferedHttpRequest,
     route_observer: OpenAiRouteObserver<'_>,
-) -> Result<TcpStream, RouteDispatchOutcome> {
+) -> Result<ClientStream, RouteDispatchOutcome> {
     if request.is_tokenize_request() {
         return Ok(tcp_stream);
     }
@@ -607,7 +617,7 @@ async fn order_mesh_target_hosts(
 
 async fn handle_mesh_request_failure(
     node: &mesh::Node,
-    tcp_stream: TcpStream,
+    tcp_stream: ClientStream,
     request: &BufferedHttpRequest,
     failure: MeshRequestFailure,
     route_observer: OpenAiRouteObserver<'_>,
@@ -660,7 +670,7 @@ async fn handle_mesh_request_failure(
 
 async fn route_mesh_request_attempts(
     node: &mesh::Node,
-    mut tcp_stream: TcpStream,
+    mut tcp_stream: ClientStream,
     request: &BufferedHttpRequest,
     plan: &MeshRequestPlan,
     affinity: &AffinityRouter,
@@ -1037,7 +1047,7 @@ fn spawn_mesh_refresh_once(node: &mesh::Node, refreshed: &mut bool) {
 
 async fn finish_exhausted_mesh_request(
     node: &mesh::Node,
-    tcp_stream: TcpStream,
+    tcp_stream: ClientStream,
     effective_model: Option<&str>,
     total_targets: usize,
     affinity: &AffinityRouter,
@@ -1232,7 +1242,7 @@ async fn resolve_mesh_target_hosts(
 
 async fn route_attempt_for_target(
     node: &mesh::Node,
-    tcp_stream: &mut TcpStream,
+    tcp_stream: &mut ClientStream,
     target: &election::InferenceTarget,
     prefetched: &[u8],
     retry_policy: ResponseRetryPolicy,
@@ -1283,7 +1293,7 @@ async fn route_attempt_for_target(
 
 async fn route_local_transport_attempt(
     node: &mesh::Node,
-    tcp_stream: &mut TcpStream,
+    tcp_stream: &mut ClientStream,
     port: u16,
     prefetched: &[u8],
     retry_policy: ResponseRetryPolicy,
@@ -1308,7 +1318,7 @@ async fn route_local_transport_attempt(
 
 async fn route_remote_attempt_with_retry(
     node: &mesh::Node,
-    tcp_stream: &mut TcpStream,
+    tcp_stream: &mut ClientStream,
     host_id: iroh::EndpointId,
     prefetched: &[u8],
     retry_policy: ResponseRetryPolicy,
@@ -1348,7 +1358,7 @@ async fn route_remote_attempt_with_retry(
 
 async fn route_remote_transport_attempt(
     node: &mesh::Node,
-    tcp_stream: &mut TcpStream,
+    tcp_stream: &mut ClientStream,
     host_id: iroh::EndpointId,
     prefetched: &[u8],
     retry_policy: ResponseRetryPolicy,
@@ -1421,7 +1431,7 @@ pub(crate) struct RouteTargetContext<'a> {
 
 pub async fn route_to_target(
     node: mesh::Node,
-    tcp_stream: TcpStream,
+    tcp_stream: ClientStream,
     model: Option<&str>,
     target: election::InferenceTarget,
     prefetched: &[u8],
@@ -1506,7 +1516,7 @@ pub async fn route_http_endpoint_request(
     node: &mesh::Node,
     model: Option<&str>,
     route_metadata: RouteSelectionMetadata<'_>,
-    tcp_stream: &mut TcpStream,
+    tcp_stream: &mut ClientStream,
     base_url: &str,
     request: &BufferedHttpRequest,
     route_observer: OpenAiRouteObserver<'_>,

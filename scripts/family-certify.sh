@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/family-outcome.sh
+source "$ROOT/scripts/lib/family-outcome.sh"
 
 usage() {
   cat >&2 <<'EOF'
@@ -35,10 +37,18 @@ Correctness options:
   --skip-correctness          skip all correctness/state lanes
   --skip-dtype                skip dtype matrix
   --skip-state                skip state handoff
+  --skip-speculative          skip llama-spec-bench by explicit cohort policy
+  --require-native-mtp-draft fail unless staged correctness returns a native
+                              MTP draft sideband
+  --require-lanes             fail if any correctness/speculative lane is
+                              skipped (a skipped lane means required
+                              inputs were not supplied); the build lane is
+                              exempt because --skip-build is a deliberate
+                              caller decision
 
 Speculative options:
   --draft-model GGUF          draft GGUF for draft speculative lanes
-  --corpus JSONL              corpus path; default: target/bench-corpora/smoke/corpus.jsonl
+  --corpus JSONL              corpus path; default: checked-in speculative coding corpus
   --corpus-limit N            prompt limit for llama-spec-bench
   --spec-window N             speculative window; default: 8
   --max-tokens N              max new tokens per prompt; default: 24
@@ -47,7 +57,9 @@ Speculative options:
   --state-reject-ratio N      reject exact state mobility over Nx baseline; default: 100
   --state-payload-kind KIND   state payload for handoff; default: full-state
   --prefix-token-count N      prefix length for state/cache smoke
-  --cache-hit-repeats N       repeated cache hits for state/cache smoke; default: 1
+  --cache-hit-repeats N       repeated cache hits for state/cache smoke; default: 2
+                              (first inference + 1 cached repeat; the cached
+                              pass must be token-exact vs the uncached one)
   --borrow-resident-hits      borrow resident KV sessions for ResidentKv hits
   --cache-decoded-result-hits reuse decoded-result hits where supported
   --recurrent-ranges CSV      recurrent ranges, for example 0..12,16..24
@@ -117,7 +129,10 @@ SKIP_BUILD=0
 SKIP_CORRECTNESS=0
 SKIP_DTYPE=0
 SKIP_STATE=0
-CORPUS="target/bench-corpora/smoke/corpus.jsonl"
+SKIP_SPECULATIVE=0
+REQUIRE_NATIVE_MTP_DRAFT=0
+REQUIRE_LANES=0
+CORPUS="crates/skippy-bench/corpora/speculative_coding_prompts.jsonl"
 CORPUS_LIMIT=""
 SPEC_WINDOW="8"
 MAX_TOKENS="24"
@@ -126,7 +141,7 @@ QWEN_STATE_BASELINE_BYTES="115388"
 STATE_REJECT_RATIO="100"
 STATE_PAYLOAD_KIND="full-state"
 PREFIX_TOKEN_COUNT=""
-CACHE_HIT_REPEATS="1"
+CACHE_HIT_REPEATS="2"
 BORROW_RESIDENT_HITS=0
 CACHE_DECODED_RESULT_HITS=0
 RECURRENT_RANGES=""
@@ -158,6 +173,9 @@ while [[ $# -gt 0 ]]; do
     --skip-correctness) SKIP_CORRECTNESS=1; shift ;;
     --skip-dtype) SKIP_DTYPE=1; shift ;;
     --skip-state) SKIP_STATE=1; shift ;;
+    --skip-speculative) SKIP_SPECULATIVE=1; shift ;;
+    --require-native-mtp-draft) REQUIRE_NATIVE_MTP_DRAFT=1; shift ;;
+    --require-lanes) REQUIRE_LANES=1; shift ;;
     --corpus) CORPUS="$2"; shift 2 ;;
     --corpus-limit) CORPUS_LIMIT="$2"; shift 2 ;;
     --spec-window) SPEC_WINDOW="$2"; shift 2 ;;
@@ -186,6 +204,10 @@ if [[ -z "$FAMILY" || -z "$TARGET_MODEL" ]]; then
   usage
   exit 2
 fi
+
+# Reserved flags captured above for forward compatibility with the mesh-llm
+# import; referenced here so their capture is deliberate.
+: "${DECODE_TIMEOUT}" "${EXTRA_ARGS[*]:-}"
 
 TARGET_MODEL_PATH="$(abs_path "$TARGET_MODEL")"
 if [[ ! -f "$TARGET_MODEL_PATH" ]]; then
@@ -223,6 +245,8 @@ record_event() {
   local log="$4"
   local report="$5"
   local note="$6"
+  local outcome
+  outcome="$(classify_family_outcome "$status" "$log" "$note")"
   jq -n \
     --arg name "$name" \
     --arg status "$status" \
@@ -230,9 +254,11 @@ record_event() {
     --arg log "$log" \
     --arg report "$report" \
     --arg note "$note" \
+    --arg outcome "$outcome" \
     '{
       name:$name,
       status:$status,
+      outcome:$outcome,
       exit_code:$exit_code,
       log:($log | if length > 0 then . else null end),
       report:($report | if length > 0 then . else null end),
@@ -324,7 +350,12 @@ correctness_common=(
   --n-gpu-layers "$N_GPU_LAYERS"
   --prompt "$PROMPT"
   --stage-server-bin "$ROOT/target/debug/skippy-server"
+  --child-logs
 )
+native_mtp_args=()
+if (( REQUIRE_NATIVE_MTP_DRAFT != 0 )); then
+  native_mtp_args+=(--require-native-mtp-draft)
+fi
 if [[ -n "$MODEL_ID" ]]; then
   correctness_common+=(--model-id "$MODEL_ID")
 fi
@@ -352,6 +383,7 @@ else
       --stage1-bind-addr "127.0.0.1:$((PORT_BASE + 1))"
       --activation-wire-dtype "$WIRE_DTYPE"
       --report-out "$REPORT_DIR/single-step.json"
+      "${native_mtp_args[@]}"
     )
     if (( ALLOW_MISMATCH != 0 )); then
       single_args+=(--allow-mismatch)
@@ -376,6 +408,7 @@ else
         --stage2-bind-addr "127.0.0.1:$((PORT_BASE + 12))"
         --activation-wire-dtype "$WIRE_DTYPE"
         --report-out "$REPORT_DIR/chain.json"
+        "${native_mtp_args[@]}"
       )
       if (( ALLOW_MISMATCH != 0 )); then
         chain_args+=(--allow-mismatch)
@@ -397,6 +430,7 @@ else
       --stage1-bind-addr "127.0.0.1:$((PORT_BASE + 21))"
       --dtypes "$WIRE_DTYPES"
       --report-out "$REPORT_DIR/dtype-matrix.json"
+      "${native_mtp_args[@]}"
     )
     if (( STRICT_DTYPE == 0 )); then
       dtype_args+=(--allow-mismatch)
@@ -404,6 +438,13 @@ else
     run_logged "dtype-matrix" "$REPORT_DIR/dtype-matrix.json" "${dtype_args[@]}"
   else
     record_event "dtype-matrix" "skipped" 0 "" "" "requires --split-layer and --layer-end"
+  fi
+
+  # The state-handoff lane (which carries the in-run KV cache-hit oracle)
+  # needs the hidden activation width. Backfill it from the single-step report
+  # when not passed explicitly, so battery runs do not silently skip the lane.
+  if [[ -z "$ACTIVATION_WIDTH" && -f "$REPORT_DIR/single-step.json" ]]; then
+    ACTIVATION_WIDTH="$(jq -r '.split.activation_width // empty' "$REPORT_DIR/single-step.json")"
   fi
 
   if (( SKIP_STATE != 0 )); then
@@ -436,7 +477,9 @@ else
   fi
 fi
 
-if [[ -n "$DRAFT_MODEL_PATH" ]]; then
+if (( SKIP_SPECULATIVE != 0 )); then
+  record_event "llama-spec-bench" "skipped" 0 "" "" "--skip-speculative"
+elif [[ -n "$DRAFT_MODEL_PATH" ]]; then
   SPEC_DIR="$OUT_DIR/speculative"
   mkdir -p "$SPEC_DIR"
   spec_args=(
@@ -640,6 +683,9 @@ jq -n \
   --arg state_payload_kind "$STATE_PAYLOAD_KIND" \
   --arg prefix_token_count "$PREFIX_TOKEN_COUNT" \
   --arg cache_hit_repeats "$CACHE_HIT_REPEATS" \
+  --arg startup_timeout_secs "$STARTUP_TIMEOUT_SECS" \
+  --argjson require_native_mtp_draft "$REQUIRE_NATIVE_MTP_DRAFT" \
+  --argjson skip_speculative "$SKIP_SPECULATIVE" \
   --arg corpus "$(abs_path "$CORPUS")" \
   --arg capability_draft "$CAPABILITY_DRAFT_JSON" \
   --argjson commands "$(jq -s '.' "$COMMANDS_JSONL")" \
@@ -663,9 +709,14 @@ jq -n \
       wire_dtypes:$wire_dtypes,
       state_payload_kind:$state_payload_kind,
       prefix_token_count:($prefix_token_count | if length > 0 then . else null end),
-      cache_hit_repeats:$cache_hit_repeats
+      cache_hit_repeats:$cache_hit_repeats,
+      startup_timeout_secs:($startup_timeout_secs | if length > 0 then tonumber else null end),
+      require_native_mtp_draft:($require_native_mtp_draft == 1)
     },
-    speculative:{corpus:$corpus},
+    speculative:{
+      corpus:$corpus,
+      skipped_by_policy:($skip_speculative == 1)
+    },
     capability_draft:$capability_draft,
     commands:$commands
   }' > "$MANIFEST_JSON"
@@ -686,11 +737,11 @@ jq -n \
   echo
   echo "## Command Results"
   echo
-  echo "| Lane | Status | Exit | Report | Log | Note |"
-  echo "| --- | --- | ---: | --- | --- | --- |"
+  echo "| Lane | Status | Outcome | Exit | Report | Log | Note |"
+  echo "| --- | --- | --- | ---: | --- | --- | --- |"
   jq -r '
     . |
-    "| \(.name) | \(.status) | \(.exit_code) | " +
+    "| \(.name) | \(.status) | \(.outcome) | \(.exit_code) | " +
     (if .report then "`\(.report)`" else "" end) + " | " +
     (if .log then "`\(.log)`" else "" end) + " | " +
     (if .note then .note else "" end) + " |"
@@ -718,4 +769,24 @@ FAILED_COUNT="$(jq -s '[.[] | select(.status == "fail")] | length' "$COMMANDS_JS
 if (( FAILED_COUNT > 0 )); then
   echo "failed lanes: $FAILED_COUNT"
   exit 1
+fi
+
+if (( REQUIRE_LANES != 0 )); then
+  mapfile -t SKIPPED_LANES < <(
+    jq -sr \
+      --argjson skip_speculative "$SKIP_SPECULATIVE" \
+      '.[]
+       | select(
+           .status == "skipped"
+           and .name != "build"
+           and (($skip_speculative == 0) or .name != "llama-spec-bench")
+         )
+       | .name' \
+      "$COMMANDS_JSONL"
+  )
+  if (( ${#SKIPPED_LANES[@]} > 0 )); then
+    echo "promised certification lanes were skipped (missing required inputs):" >&2
+    printf '  %s\n' "${SKIPPED_LANES[@]}" >&2
+    exit 1
+  fi
 fi
