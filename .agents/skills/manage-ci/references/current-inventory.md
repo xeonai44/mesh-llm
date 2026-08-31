@@ -37,12 +37,13 @@ default-branch content only on the persistent self-hosted `family-certify`
 runner group (tools come from the runner image; no GitHub Actions model
 caching). Before native compilation,
 `scripts/plan-family-battery.py` validates the versioned JSON family policy,
-the mandatory four-lane contract for every certified profile, and every exact
+the mandatory three-lane contract for every certified profile, and every exact
 artifact revision/file in the immutable local cache. It reads only GGUF
 metadata headers, requires each artifact to have at least one metadata-bearing
 shard, and requires every shard that carries `*.block_count` and
 `*.embedding_length` to equal the planned runtime range and activation width
-before compilation. It emits
+before compilation; Qwen4 experimental artifacts derive their wider boundary
+from `hyper_connection.count * embedding_length`. It emits
 deterministic bounded GitHub matrix shards; the current one-runner topology consumes one
 all-family shard while retaining the plan as evidence. The runner's `.env` exports
 `HF_CACHE` pointing at a pre-warmed HF cache that lives on the lab NFS models
@@ -69,16 +70,24 @@ each complete certification has
 a portable process-group wall-clock limit, and the workflow's outer battery
 ceiling is 12 hours. On a
 patch-apply failure it hands the queue to a non-interactive `opencode` agent
-(`LLAMA_CANARY_AGENT_MODEL`, default `Nemotron 3 Ultra Free`) which rebases
+(`CANARY_AGENT_MODEL`, default `zai-coding-plan/glm-5.3-flash`, overridable
+via the `LLAMA_CANARY_AGENT_MODEL` repository variable) which rebases
 `third_party/llama.cpp/patches`, runs the supported-families certification
 battery (`scripts/skippy-family-battery.sh`), and opens or reuses the repair PR
-on `llama-canary/patch-queue-fix`. After each agent turn the repair script
+on `llama-canary/patch-queue-fix`. The same repair loop also runs when the
+queue applies but a certification lane fails (`battery` mode). After each agent
+turn the repair script
 itself runs the battery and, on failure, loops certify -> agent fix ->
-recertify up to `CANARY_REPAIR_MAX_TURNS` (default 2) turns; the job only
+recertify up to `CANARY_REPAIR_MAX_TURNS` (default 2) turns; the script only
 succeeds when the wrapper's own battery run passes. Every outcome (battery
 green, queue still broken, battery exhausted) posts a status comment on the
 repair PR — creating the PR (or a fallback issue) itself if the agent did
-not. The upstream pin commit to
+not — and an agent turn writes the PR description (key upstream changes,
+patch-queue evolution, risks) with a deterministic fallback. Repair pushes and
+PR operations authenticate with the `CANARY_REPAIR_TOKEN` fine-grained PAT;
+the canary job itself remains `contents: read`. Any repair outcome keeps the
+canary run red: the certified fix must be merged from the repair PR before
+trusted main can certify. The upstream pin commit to
 `main` is gated on the battery passing.
 
 For a non-canary manual dispatch, `release.yml` runs the checked-in
@@ -116,7 +125,7 @@ removable after this branch's runner contract is active on protected main.
 | `ci-web-slice.yml` | Console quality, console Playwright E2E, and public website build |
 | `ci-ui-artifact-slice.yml` | Immutable console distribution producer |
 | `static-abi-artifact.yml` | Typed static llama ABI producer with internal runner policy and an exact toolchain-epoch output |
-| `ci-rust-tests-slice.yml` | Typed deterministic Cargo test batches that verify the producer-owned static ABI toolchain epoch |
+| `ci-rust-tests-slice.yml` | Typed deterministic Cargo test batches that verify the producer-owned static ABI toolchain epoch and a pinned, digest-verified Skippy correctness fixture |
 | `ci-{linux,macos,windows}-host-slice.yml` | Platform-pure neutral host producers; no empty cross-platform jobs |
 | `ci-{linux,macos,windows}-runtime-slice.yml` | Platform-pure native runtime producers |
 | `ci-{linux,macos,windows}-product-slice.yml` | Platform-pure composition-only product consumers |
@@ -429,7 +438,7 @@ fail-open policy.
 - `select-ci-runners`: provider labels, cache permissions, and the
   provider-derived `allow_native_github_cache` / `allow_depot_remote_cache`
   outputs. Depot selections disable both cache paths by default. During the
-  bounded approved exception, the exact PR revision and eligible trusted-main
+  bounded approved exception, eligible same-repository PR and trusted-main
   Depot jobs enable the GitHub Actions cache API while direct Depot remote
   cache remains disabled. Hosted PR, release, and cache-warmer selections
   retain native GitHub cache behavior.
@@ -438,6 +447,14 @@ fail-open policy.
   central runner policy permits it only for GitHub-hosted selections, and
   runtime rows must match the seed's container image and toolchain epoch.
 - `capture-sccache-stats`: machine-readable cache evidence.
+
+Rust-test batches that contain `skippy-runtime` or `skippy-model-package`
+restore the pinned Qwen correctness fixture from one exact GitHub Actions cache
+key containing its file SHA-256 and `.github/cache-version.txt`. Every use is
+verified against the pinned digest before tests. Cache publication is limited
+to the exhaustive trusted-main batch containing `skippy-runtime`; PR jobs are
+restore-only and jobs for which central runner policy denies native GitHub
+cache access download and verify the immutable revision without publishing.
 
 `scripts/collect-ci-metrics.py` is the read-only timing evidence collector. Its
 schema-v3 report keeps workflow wall/queue, job runner queue, measured
@@ -451,7 +468,7 @@ under `ci/` or this inventory.
 Artifacts are correctness boundaries; caches only accelerate regeneration.
 PR artifacts generally retain for one day. Fork lanes cannot publish shared
 trusted-main caches. Same-repository PRs normally use GitHub's ref-scoped cache;
-an exact approved revision may temporarily use Depot's shared cross-branch
+eligible PR jobs may temporarily use Depot's shared cross-branch
 namespace under `ci/DEPOT_PR_RISK_EXCEPTION.md`. That namespace is treated as
 untrusted input, not an authority or correctness boundary. Linux Clippy,
 Rust-test, host, and runtime jobs restore one bounded trusted sccache seed
@@ -482,9 +499,8 @@ permission.
 GitHub-hosted labels are `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15`, and
 `windows-2022`. Depot labels are selected only by `select-ci-runners`; no
 workflow accepts a raw provider label. Trusted main Linux requires
-`DEPOT_RUNNERS_ENABLED=true`. An exact same-repository PR revision may use the
-time-bounded exception only when `DEPOT_PR_RUNNERS_ENABLED=true` and both
-`DEPOT_PR_APPROVED_REF` and `DEPOT_PR_APPROVED_SHA` match; it expires on
+`DEPOT_RUNNERS_ENABLED=true`. Eligible same-repository PR jobs may use the
+time-bounded exception when `DEPOT_PR_RUNNERS_ENABLED=true`; it expires on
 2026-09-14 UTC. Forks remain hosted. The intended permanent gate
 may cover eligible build/test rows across Linux, Depot macOS 15 and Windows
 2022 when equivalent images/architectures exist; planning/required summaries,
@@ -519,7 +535,7 @@ the enclosing PR run was later cancelled during cleanup. Trusted-main verify
 restored and exactly validated that poison, then failed its intended expected-
 miss gate. This proves unsafe repository-scoped cross-trust authority, so it is
 not a successful isolation result. The bounded exception knowingly accepts
-that risk for exact ref/SHA-approved same-repository revisions to gain CI
+that risk for eligible same-repository PRs to gain CI
 iteration speed; it is not permanent-isolation evidence. The exact-SHA
 five-lane candidate, provider comparison, and identical-SHA hosted rollback
 are recorded in `.omo/specs/depot-pr-rollout-evidence.md`; Quality and Linux
@@ -561,8 +577,6 @@ on malformed or missing backend data.
 
 Relevant repository variable names include `DEPOT_RUNNERS_ENABLED`,
 `DEPOT_PR_RUNNERS_ENABLED` (global temporary exception gate),
-`DEPOT_PR_APPROVED_REF` (one exact merge ref), `DEPOT_PR_APPROVED_SHA` (the
-exact lowercase PR head SHA; refresh after every push),
 `DEPOT_PR_CANARY_REF` (absent by default; one exact
 `refs/pull/<number>/merge` ref only), `DEPOT_PR_SENTINEL_REF` (absent by
 default; one exact same-repository merge ref used only by the protected
@@ -573,8 +587,8 @@ not cache-isolation proofs or replacements for the global PR gate. The normal
 Quality runner policy continues to use `DEPOT_PR_CANARY_REF`; the sentinel
 uses a separate selector output and cannot move the normal build jobs.
 The eligible five-lane Depot graph disables every native GitHub cache consumer
-when `allow_native_github_cache=false`. During the bounded exception the exact
-approved PR and eligible trusted-main Depot jobs set that output true for
+when `allow_native_github_cache=false`. During the bounded exception eligible
+same-repository PR and trusted-main Depot jobs set that output true for
 cross-branch Depot Actions-cache reuse; direct Depot remote cache remains
 false. This checked-in mode does not
 prove the absence of ambient Depot/WebDAV authority, so the runtime sentinel

@@ -438,7 +438,6 @@ impl StageControlState {
             topology: None,
             bind_addr,
             activation_width: effective_load.activation_width,
-            wire_dtype: effective_load.wire_dtype.into(),
             metrics_otlp_grpc: self.telemetry.metrics_otlp_grpc.clone(),
             telemetry_queue_capacity: self.telemetry.queue_capacity,
             telemetry_level: self.telemetry.level,
@@ -448,6 +447,7 @@ impl StageControlState {
             downstream_wire_condition: super::benchmark_downstream_wire_condition()?,
             downstream_connect_timeout_secs: 30,
             native_mtp_enabled: effective_load.native_mtp_enabled,
+            continuous_batching: effective_load.continuous_batching,
             openai: None,
         });
         self.stages.insert(
@@ -814,6 +814,13 @@ fn stage_config(
         materialized_pinned: materialized.is_some(),
         model_path: load.model_path.clone(),
         projector_path: load.projector_path.clone(),
+        projector_use_gpu: load.projector_use_gpu,
+        media_marker: load.media_marker.clone(),
+        image_min_tokens: load.image_min_tokens,
+        image_max_tokens: load.image_max_tokens,
+        batch_max_tokens: load.batch_max_tokens,
+        glm_dsa_policy: load.glm_dsa_policy,
+        generation_signal_window: load.generation_signal_window,
         stage_id: load.stage_id.clone(),
         stage_index: load.stage_index,
         layer_start: load.layer_start,
@@ -825,9 +832,20 @@ fn stage_config(
         n_gpu_layers: load.n_gpu_layers,
         mmap: load.mmap,
         mlock: load.mlock,
+        repack: load.runtime_settings.repack,
+        op_offload: load.runtime_settings.op_offload,
+        no_host_buffer: load.runtime_settings.no_host_buffer,
+        check_tensors: load.runtime_settings.check_tensors,
+        direct_io: load.runtime_settings.direct_io,
+        main_gpu: load.runtime_settings.main_gpu,
+        split_mode: load.runtime_settings.split_mode,
         cache_type_k: empty_to_default(&load.cache_type_k, "f16"),
         cache_type_v: empty_to_default(&load.cache_type_v, "f16"),
         flash_attn_type: load.flash_attn_type,
+        kv_offload: load.runtime_settings.kv_offload,
+        kv_unified: load.runtime_settings.kv_unified,
+        swa_full: load.runtime_settings.swa_full,
+        cache_idle_slots: load.runtime_settings.cache_idle_slots,
         filter_tensors_on_load: matches!(
             load.load_mode,
             LoadMode::RuntimeSlice | LoadMode::LayerPackage
@@ -927,7 +945,6 @@ fn status_from_running(stage: &RunningStage) -> StageStatusSnapshot {
         state,
         bind_addr: server.bind_addr.to_string(),
         activation_width: stage.load.activation_width.max(0) as u32,
-        wire_dtype: stage.load.wire_dtype,
         selected_device: stage.load.selected_device.clone(),
         ctx_size: stage.load.ctx_size,
         lane_count: stage.load.lane_count,
@@ -963,7 +980,6 @@ fn stopped_status(stop: &StageStopRequest) -> StageStatusSnapshot {
         state: StageRuntimeState::Stopped,
         bind_addr: String::new(),
         activation_width: 0,
-        wire_dtype: StageWireDType::F32,
         selected_device: None,
         ctx_size: 0,
         lane_count: 0,
@@ -999,7 +1015,6 @@ fn failed_status_from_load(load: &StageLoadRequest, error: String) -> StageStatu
         state: StageRuntimeState::Failed,
         bind_addr: load.bind_addr.clone(),
         activation_width: load.activation_width.max(0) as u32,
-        wire_dtype: load.wire_dtype,
         selected_device: load.selected_device.clone(),
         ctx_size: load.ctx_size,
         lane_count: load.lane_count,
@@ -1063,15 +1078,5 @@ fn preparation_status_from_cancel(cancel: StageCancelPrepareRequest) -> StagePre
         coordinator_term: 0,
         coordinator_id: None,
         lease_until_unix_ms: 0,
-    }
-}
-
-impl From<StageWireDType> for skippy_protocol::binary::WireActivationDType {
-    fn from(value: StageWireDType) -> Self {
-        match value {
-            StageWireDType::F32 => Self::F32,
-            StageWireDType::F16 => Self::F16,
-            StageWireDType::Q8 => Self::Q8,
-        }
     }
 }

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 mod fused_decode;
 mod lifecycle;
+mod speculative_policy;
 
 use super::*;
 use crate::binary_transport::{
@@ -11,7 +12,7 @@ use crate::binary_transport::{
 use crate::frontend::embedded_execution::VerifyRetirement;
 use crate::frontend::request::wire_sampling_config;
 use crate::frontend::speculative::{
-    OpenAiSpeculativeStats, classify_verify_window, propose_configured_ngram_tokens,
+    OpenAiSpeculativeStats, classify_verify_window_with_threshold, propose_configured_ngram_tokens,
     verify_checkpoint_no_longer_needed, verify_inputs_for_proposals,
 };
 use crate::frontend::util::{ms_to_us, openai_backend_error, openai_io_error, saturating_u32};
@@ -232,17 +233,14 @@ impl StageOpenAiBackend {
                     let chunk = &prefill_tokens[pos_start..end];
                     prefill_min_chunk_size = prefill_min_chunk_size.min(chunk.len());
                     prefill_max_chunk_size = prefill_max_chunk_size.max(chunk.len());
-                    let message = embedded_prefill_message(
-                        request.wire_dtype,
-                        OpenAiPrefillChunk {
-                            seq_id: chunk_index,
-                            pos_start,
-                            prefill_token_count,
-                            tokens: chunk,
-                            request_id,
-                            session_id,
-                        },
-                    )?;
+                    let message = embedded_prefill_message(OpenAiPrefillChunk {
+                        seq_id: chunk_index,
+                        pos_start,
+                        prefill_token_count,
+                        tokens: chunk,
+                        request_id,
+                        session_id,
+                    })?;
                     let stage0_timer = PhaseTimer::start();
                     let pending_prefill_replies_before = pending_prefill_replies;
                     let mut output = if prefix_restore_allowed {
@@ -343,7 +341,6 @@ impl StageOpenAiBackend {
                         request.config,
                         &message,
                         &output,
-                        request.wire_dtype,
                         request.activation_width,
                     )
                     .map_err(openai_backend_error)?;
@@ -355,7 +352,6 @@ impl StageOpenAiBackend {
                     write_stage_message_conditioned(
                         &mut *downstream,
                         &forwarded,
-                        request.wire_dtype,
                         request.downstream_wire_condition,
                     )
                     .map_err(openai_io_error)?;
@@ -635,7 +631,6 @@ impl StageOpenAiBackend {
                 super::prefix_cache::chain_prefix_cache_savings(
                     &prefill_chain_cache_stats,
                     prefill_chain_restored_tokens,
-                    request.wire_dtype,
                     request.activation_width,
                 ),
             );
@@ -643,7 +638,6 @@ impl StageOpenAiBackend {
             self.emit_openai_phase("stage.openai_prefill", prefill_timer, prefill_attrs);
 
             let message = generation_config_message(
-                request.wire_dtype,
                 request_id,
                 session_id,
                 request.prompt_token_ids.len(),
@@ -653,7 +647,6 @@ impl StageOpenAiBackend {
             write_stage_message_conditioned(
                 &mut *downstream,
                 &message,
-                request.wire_dtype,
                 request.downstream_wire_condition,
             )
             .map_err(openai_io_error)?;
@@ -689,17 +682,14 @@ impl StageOpenAiBackend {
                 .expect("checked non-empty prompt");
             let mut context_tokens = request.prompt_token_ids.to_vec();
             let mut exact_replay_tokens = Vec::new();
-            let mut decode_message = ReusableDecodeMessage::new(
-                request.wire_dtype,
-                ReusableDecodeMessageArgs {
-                    request_id,
-                    session_id,
-                    prompt_token_count: request.prompt_token_ids.len(),
-                    base_pos_start: prefill_token_count,
-                    sampling: wire_sampling.clone(),
-                    sideband_capacity: skippy_protocol::binary::MAX_STAGE_SIDEBAND_VALUES,
-                },
-            )?;
+            let mut decode_message = ReusableDecodeMessage::new(ReusableDecodeMessageArgs {
+                request_id,
+                session_id,
+                prompt_token_count: request.prompt_token_ids.len(),
+                base_pos_start: prefill_token_count,
+                sampling: wire_sampling.clone(),
+                sideband_capacity: skippy_protocol::binary::MAX_STAGE_SIDEBAND_VALUES,
+            })?;
             let mut native_mtp = NativeMtpVerifier::default();
             let effective_speculative =
                 speculation_after_prefix_restore(request.speculative, prefill_chain_cache_restored);
@@ -983,7 +973,13 @@ impl StageOpenAiBackend {
                     }
                     if let Some(pipeline) = pipelined.as_mut() {
                         let pipeline_in_flight_limit = verify_window_scheduler.depth();
-                        let chunk_width = native_mtp_options.verify_window_max_tokens.max(1);
+                        let chunk_width = speculative_policy::pipeline_chunk_width(
+                            native_mtp_options.verify_window_max_tokens,
+                            effective_speculative.draft_split_probability,
+                            decoded_tokens.saturating_add(
+                                usize::try_from(pipeline_epoch).unwrap_or(usize::MAX),
+                            ),
+                        );
                         while verify_window_scheduler.has_capacity()
                             && verify_window_scheduler.in_flight_len() < pipeline_in_flight_limit
                             && decoded_tokens + queued_active_tokens(&pipelined_windows)
@@ -1027,9 +1023,8 @@ impl StageOpenAiBackend {
                             let window = verify_window_scheduler
                                 .open(layout.pos_start, layout.decode_step)?;
                             let input_tokens = layout.input_tokens;
-                            let message = embedded_verify_window_message(
-                                request.wire_dtype,
-                                VerifyWindowMessageArgs {
+                            let message =
+                                embedded_verify_window_message(VerifyWindowMessageArgs {
                                     window_id: window.id,
                                     request_id,
                                     session_id,
@@ -1038,8 +1033,7 @@ impl StageOpenAiBackend {
                                     decode_step: window.decode_step,
                                     tokens: &input_tokens,
                                     sampling: wire_sampling.clone(),
-                                },
-                            )?;
+                                })?;
                             let dispatched = self.dispatch_embedded_stage_message(
                                 &request,
                                 downstream,
@@ -1132,12 +1126,15 @@ impl StageOpenAiBackend {
                                 )
                             },
                         )?;
-                        let fully_accepted_window = !native_mtp_verify_decision.rejected
-                            && native_mtp_verify_decision.accepted_proposal_tokens
-                                == window.proposal_tokens.len();
+                        let acceptance = speculative_policy::pipeline_acceptance_policy(
+                            native_mtp_verify_decision.accepted_proposal_tokens,
+                            window.proposal_tokens.len(),
+                            native_mtp_verify_decision.rejected,
+                            effective_speculative.draft_acceptance_threshold,
+                        );
+                        let fully_accepted_window = acceptance.fully_accepted;
                         let pipeline_continues = fully_accepted_window;
-                        let accepted_candidate_tokens =
-                            native_mtp_verify_decision.accepted_proposal_tokens;
+                        let accepted_candidate_tokens = acceptance.accepted_candidate_tokens;
                         if window.native_mtp_token_count > 0 {
                             let pipeline = pipelined.as_ref().expect("pipeline retained");
                             let span = native_mtp.observe_taken_draft_span(
@@ -1228,9 +1225,10 @@ impl StageOpenAiBackend {
                         let undispatched_candidates = pipelined
                             .as_ref()
                             .is_some_and(CompositeProposalPipeline::has_remaining_candidates);
-                        let commit_count = pipelined_target_commit_count(
+                        let commit_count = speculative_policy::pipeline_commit_count(
                             window.planned_advance_tokens,
                             native_mtp_verify_decision.commit_count,
+                            acceptance.threshold_met,
                             fully_accepted_window,
                             later_active_window || undispatched_candidates,
                         );
@@ -1398,21 +1396,24 @@ impl StageOpenAiBackend {
                     let draft_propose_ms = propose_timer.elapsed_ms();
                     speculative_stats.draft_propose_ms += draft_propose_ms;
                     if !draft_tokens.is_empty() {
+                        let split_len = speculative_policy::draft_split_len(
+                            draft_tokens.len(),
+                            effective_speculative.draft_split_probability,
+                            decoded_tokens,
+                        );
+                        draft_tokens.truncate(split_len);
                         let verify_inputs = verify_inputs_for_proposals(current, &draft_tokens);
-                        let message = embedded_verify_window_message(
-                            request.wire_dtype,
-                            VerifyWindowMessageArgs {
-                                window_id: i32::try_from(decoded_tokens)
-                                    .map_err(|_| OpenAiError::backend("decode step exceeds i32"))?,
-                                request_id,
-                                session_id,
-                                prompt_token_count: request.prompt_token_ids.len(),
-                                pos_start: prefill_token_count + decoded_tokens,
-                                decode_step: decoded_tokens,
-                                tokens: &verify_inputs,
-                                sampling: wire_sampling.clone(),
-                            },
-                        )?;
+                        let message = embedded_verify_window_message(VerifyWindowMessageArgs {
+                            window_id: i32::try_from(decoded_tokens)
+                                .map_err(|_| OpenAiError::backend("decode step exceeds i32"))?,
+                            request_id,
+                            session_id,
+                            prompt_token_count: request.prompt_token_ids.len(),
+                            pos_start: prefill_token_count + decoded_tokens,
+                            decode_step: decoded_tokens,
+                            tokens: &verify_inputs,
+                            sampling: wire_sampling.clone(),
+                        })?;
                         let verify = self.execute_embedded_stage_message(
                             &request,
                             downstream,
@@ -1461,11 +1462,12 @@ impl StageOpenAiBackend {
                             .saturating_add(verify.stats.forward_activation_bytes);
                         decode_forward_write_ms += verify.stats.forward_write_ms;
                         decode_downstream_wait_ms += verify.stats.downstream_wait_ms;
-                        let decision = classify_verify_window(
+                        let decision = classify_verify_window_with_threshold(
                             &draft_tokens,
                             &verify.reply.predicted_tokens,
                             decoded_tokens,
                             request.max_tokens as usize,
+                            effective_speculative.draft_acceptance_threshold,
                             |token| {
                                 self.iteration_scheduler.execute_runtime(
                                     "embedded-token-eog",
@@ -1668,7 +1670,6 @@ impl StageOpenAiBackend {
                     request.config,
                     message,
                     &output,
-                    request.wire_dtype,
                     request.activation_width,
                 )
                 .map_err(openai_backend_error)?;
@@ -1681,7 +1682,6 @@ impl StageOpenAiBackend {
                 write_stage_message_conditioned(
                     &mut *downstream,
                     &forwarded.message,
-                    request.wire_dtype,
                     request.downstream_wire_condition,
                 )
                 .map_err(openai_io_error)?;

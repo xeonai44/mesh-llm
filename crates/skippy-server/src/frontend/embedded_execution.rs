@@ -76,7 +76,6 @@ impl StageOpenAiBackend {
                     .map_err(openai_backend_error)
             })?;
         let message = retire_verify_window_message(
-            request.wire_dtype,
             retirement.request_id,
             retirement.session_id,
             retirement.token_start,
@@ -86,7 +85,6 @@ impl StageOpenAiBackend {
             forwarder
                 .send_tracked(
                     message,
-                    request.wire_dtype,
                     request.downstream_wire_condition,
                     self.openai_attrs(request.ids),
                 )
@@ -97,7 +95,6 @@ impl StageOpenAiBackend {
             write_stage_message_conditioned(
                 downstream,
                 &message,
-                request.wire_dtype,
                 request.downstream_wire_condition,
             )
             .map_err(openai_io_error)?;
@@ -221,7 +218,6 @@ impl StageOpenAiBackend {
             request.config,
             message,
             &output.output,
-            request.wire_dtype,
             request.activation_width,
         )
         .map_err(openai_backend_error)?;
@@ -232,7 +228,6 @@ impl StageOpenAiBackend {
                 forwarder
                     .send_tracked(
                         forwarded.message,
-                        request.wire_dtype,
                         request.downstream_wire_condition,
                         self.openai_attrs(request.ids),
                     )
@@ -242,7 +237,6 @@ impl StageOpenAiBackend {
             write_stage_message_conditioned(
                 &mut *downstream,
                 &forwarded.message,
-                request.wire_dtype,
                 request.downstream_wire_condition,
             )
             .map_err(openai_io_error)?;
@@ -506,7 +500,7 @@ fn receive_downstream_stage_reply_one_of(
 mod tests {
     use super::*;
     use crate::binary_transport::PredictionReturnHub;
-    use skippy_protocol::binary::{StageStateHeader, WireActivationDType};
+    use skippy_protocol::binary::StageStateHeader;
     use std::net::TcpListener;
     use std::sync::Arc;
 
@@ -545,10 +539,7 @@ mod tests {
                         kind: WireMessageKind::PredictionReturnOpen,
                         pos_start: 0,
                         token_count: 0,
-                        state: StageStateHeader::new(
-                            WireMessageKind::PredictionReturnOpen,
-                            WireActivationDType::F32,
-                        ),
+                        state: StageStateHeader::new(WireMessageKind::PredictionReturnOpen),
                         request_id,
                         session_id,
                         sampling: None,
@@ -597,18 +588,24 @@ mod tests {
     #[test]
     fn direct_return_fallback_timeout_restores_on_drop_after_early_exit() {
         let (stream, _peer) = connected_stream_pair();
-        let original = Some(Duration::from_millis(123));
-        stream.set_read_timeout(original).unwrap();
+        // Socket timeout readback may be rounded to the OS timer granularity.
+        // Capture the effective values so the test verifies install and restore
+        // without assuming the kernel preserves the requested duration exactly.
+        stream
+            .set_read_timeout(Some(DIRECT_RETURN_FALLBACK_POLL))
+            .unwrap();
+        let effective_poll = stream.read_timeout().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(123)))
+            .unwrap();
+        let effective_original = stream.read_timeout().unwrap();
 
         {
             let _restore = DirectReturnFallbackTimeout::install(&stream).unwrap();
-            assert_eq!(
-                stream.read_timeout().unwrap(),
-                Some(DIRECT_RETURN_FALLBACK_POLL)
-            );
+            assert_eq!(stream.read_timeout().unwrap(), effective_poll);
         }
 
-        assert_eq!(stream.read_timeout().unwrap(), original);
+        assert_eq!(stream.read_timeout().unwrap(), effective_original);
     }
 
     #[test]
