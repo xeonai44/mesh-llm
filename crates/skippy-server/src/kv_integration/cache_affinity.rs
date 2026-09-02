@@ -66,7 +66,7 @@ mod tests {
         StageConfig {
             run_id: "run".to_string(),
             topology_id: "topology".to_string(),
-            model_id: "org/model:Q4_K_M".to_string(),
+            model_id: "hugging-quants/Llama-3.2-1B-Instruct-GGUF:Q4_K_M".to_string(),
             package_ref: None,
             manifest_sha256: None,
             source_model_path: None,
@@ -124,7 +124,10 @@ mod tests {
     #[test]
     fn busy_radix_returns_cold_affinity_without_waiting() {
         let config = test_config();
-        let integration = KvStageIntegration::from_config(&config).unwrap().unwrap();
+        let integration =
+            KvStageIntegration::from_config(&config, skippy_runtime::ModelStateKind::Dense)
+                .unwrap()
+                .unwrap();
         let radix = Arc::clone(&integration.radix);
         let (locked_tx, locked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();

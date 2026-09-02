@@ -192,11 +192,6 @@ pub fn materialize_stage_config(
 }
 
 fn stage_package_info(package_ref: &str, info: LayerPackageInfo) -> Result<StagePackageInfo> {
-    let activation_width = info.activation_width.with_context(|| {
-        format!(
-            "layer package {package_ref} is missing activation_width; rebuild the package manifest"
-        )
-    })?;
     Ok(StagePackageInfo {
         package_ref: package_ref.to_string(),
         package_dir: info.package_dir,
@@ -206,7 +201,7 @@ fn stage_package_info(package_ref: &str, info: LayerPackageInfo) -> Result<Stage
         source_model_sha256: info.source_model_sha256,
         source_model_bytes: info.source_model_bytes,
         layer_count: info.layer_count,
-        activation_width,
+        activation_width: 0,
         generation: info.generation,
         projector_path: info
             .projectors
@@ -278,7 +273,6 @@ mod tests {
             },
             "format": "layer-package",
             "layer_count": 1,
-            "activation_width": 4096,
             "shared": {
                 "metadata": {
                     "path": "shared/metadata.gguf",
@@ -328,6 +322,7 @@ mod tests {
             topology_id: "topology-a".to_string(),
             run_id: "run-a".to_string(),
             model_id: "model-a".to_string(),
+            runtime_profile: Some(String::new()),
             backend: "skippy".to_string(),
             package_ref: package_dir.to_string_lossy().to_string(),
             manifest_sha256,
@@ -337,6 +332,8 @@ mod tests {
             layer_end: 1,
             model_path: Some(package_dir.to_string_lossy().to_string()),
             source_model_bytes: None,
+            source_model_sha256: None,
+            local_source_required: false,
             projector_path: None,
             projector_use_gpu: None,
             media_marker: None,
@@ -347,7 +344,6 @@ mod tests {
             generation_signal_window: None,
             selected_device: None,
             bind_addr: "127.0.0.1:0".to_string(),
-            activation_width: 4096,
             ctx_size: 8192,
             lane_count: 1,
             continuous_batching: true,
@@ -394,7 +390,6 @@ mod tests {
                 },
                 "format": "layer-package",
                 "layer_count": 1,
-                "activation_width": 4096,
                 "shared": {
                     "metadata": {
                         "path": "shared/metadata.gguf",
@@ -468,6 +463,7 @@ mod tests {
             topology_id: "topology-a".to_string(),
             run_id: "run-a".to_string(),
             model_id: "model-a".to_string(),
+            runtime_profile: Some(String::new()),
             backend: "skippy".to_string(),
             package_ref: dir.path().to_string_lossy().to_string(),
             manifest_sha256,
@@ -477,6 +473,8 @@ mod tests {
             layer_end: 1,
             model_path: None,
             source_model_bytes: None,
+            source_model_sha256: None,
+            local_source_required: false,
             projector_path: None,
             projector_use_gpu: None,
             media_marker: None,
@@ -487,7 +485,6 @@ mod tests {
             generation_signal_window: None,
             selected_device: None,
             bind_addr: "127.0.0.1:0".to_string(),
-            activation_width: 4096,
             ctx_size: 512,
             lane_count: 1,
             continuous_batching: true,

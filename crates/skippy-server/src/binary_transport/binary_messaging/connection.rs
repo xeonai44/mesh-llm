@@ -1,3 +1,4 @@
+use super::ConnectionWorkerControl;
 use super::async_forwarder::AsyncForwarder;
 use super::control_messages::{
     handle_generation_control, handle_prefix_cache_control, handle_session_control, handle_stop,
@@ -8,7 +9,7 @@ use super::reply::reply_window_for_message;
 use super::reply::send_stage_reply;
 use super::session_lifecycle::align_session_to_message;
 use super::session_tracker::{
-    ConnectionSessionTracker, combine_connection_and_cleanup_results,
+    ConnectionSessionOwnership, ConnectionSessionTracker, combine_connection_and_cleanup_results,
     release_tracked_connection_sessions,
 };
 use super::summary::BinaryMessageObservation;
@@ -17,7 +18,7 @@ use super::telemetry::UpstreamReplyWriteSpan;
 use super::telemetry::{
     BinaryMessageTiming, emit_binary_message_received, emit_binary_message_timing,
     emit_upstream_reply_write_span, insert_runtime_session_stats, record_prefill_edge_transport,
-    record_verify_window_timing,
+    record_prefill_stage_compute, record_verify_window_timing,
 };
 use crate::binary_transport::BinaryStageExecutionOptions;
 use crate::binary_transport::WireCondition;
@@ -78,7 +79,8 @@ pub(super) fn handle_binary_connection(
     telemetry: &Telemetry,
     upstream: &mut TcpStream,
     downstream: Option<TcpStream>,
-    activation_width: i32,
+    input_activation_width: i32,
+    output_activation_width: i32,
     max_inflight: usize,
     reply_credit_limit: Option<usize>,
     async_prefill_forward: bool,
@@ -86,9 +88,12 @@ pub(super) fn handle_binary_connection(
     downstream_connect_timeout_secs: u64,
     native_mtp_enabled: bool,
     prediction_return_sinks: &PredictionReturnSinks,
+    session_ownership: Arc<ConnectionSessionOwnership>,
+    worker_control: &ConnectionWorkerControl,
     first_message: StageWireMessage,
 ) -> Result<()> {
-    let mut session_tracker = ConnectionSessionTracker::default();
+    let mut session_tracker =
+        ConnectionSessionTracker::new(next_connection_session_id(), session_ownership);
     let result = handle_binary_connection_messages(
         config,
         topology,
@@ -97,7 +102,8 @@ pub(super) fn handle_binary_connection(
         telemetry,
         upstream,
         downstream,
-        activation_width,
+        input_activation_width,
+        output_activation_width,
         max_inflight,
         reply_credit_limit,
         async_prefill_forward,
@@ -105,12 +111,14 @@ pub(super) fn handle_binary_connection(
         downstream_connect_timeout_secs,
         native_mtp_enabled,
         prediction_return_sinks,
+        worker_control,
         first_message,
         &mut session_tracker,
     );
     let cleanup_result = release_tracked_connection_sessions(
         config,
         iteration_scheduler,
+        kv,
         telemetry,
         &mut session_tracker,
     );
@@ -126,7 +134,8 @@ fn handle_binary_connection_messages(
     telemetry: &Telemetry,
     upstream: &mut TcpStream,
     mut downstream: Option<TcpStream>,
-    activation_width: i32,
+    input_activation_width: i32,
+    output_activation_width: i32,
     max_inflight: usize,
     reply_credit_limit: Option<usize>,
     async_prefill_forward: bool,
@@ -134,10 +143,11 @@ fn handle_binary_connection_messages(
     downstream_connect_timeout_secs: u64,
     native_mtp_enabled: bool,
     prediction_return_sinks: &PredictionReturnSinks,
+    worker_control: &ConnectionWorkerControl,
     first_message: StageWireMessage,
     session_tracker: &mut ConnectionSessionTracker,
 ) -> Result<()> {
-    let connection_session_id = next_connection_session_id();
+    let connection_session_id = session_tracker.connection_id;
     let max_deferred_prefill_replies =
         reply_credit_limit.unwrap_or_else(|| max_inflight.saturating_sub(1));
     let mut pending_prefill_replies = 0usize;
@@ -162,7 +172,8 @@ fn handle_binary_connection_messages(
         let recv_started = Instant::now();
         let Some(mut message) = receive_next_message(
             upstream,
-            activation_width,
+            worker_control,
+            input_activation_width,
             next_message.take(),
             pending_prefill_replies,
             request_summary.message_count,
@@ -268,7 +279,7 @@ fn handle_binary_connection_messages(
                 downstream.as_mut(),
                 downstream_wire_condition,
                 downstream_connect_timeout_secs,
-                activation_width,
+                output_activation_width,
                 native_mtp_enabled,
                 message,
                 &session_key,
@@ -356,7 +367,7 @@ fn handle_binary_connection_messages(
                     &lookup_session_key,
                     &lookup_message,
                     &lookup_token_ids,
-                    activation_width,
+                    output_activation_width,
                 ))
             })
             .map_err(|error| anyhow::anyhow!(format!("{error:#}")))?;
@@ -455,7 +466,7 @@ fn handle_binary_connection_messages(
                     let output_capacity = stage_output_activation_capacity(
                         config,
                         message.token_count,
-                        activation_width,
+                        output_activation_width,
                     )?;
                     let sample_prefill_final =
                         message.kind == WireMessageKind::PrefillFinalEmbd && downstream.is_none();
@@ -500,7 +511,19 @@ fn handle_binary_connection_messages(
                             Ok((sessions_before, sessions_after, eviction, result))
                         })
                         .map_err(|error| anyhow::anyhow!(format!("{error:#}")))
-                        .context("execute scheduler-owned binary stage message")?;
+                        .with_context(|| {
+                            format!(
+                                "execute scheduler-owned binary stage message \
+                                 kind={:?} pos_start={} token_count={} tokens={} \
+                                 executable_tokens={} activation_bytes={}",
+                                message.kind,
+                                message.pos_start,
+                                message.token_count,
+                                message.tokens.len(),
+                                executable_token_ids.len(),
+                                input_activation_bytes,
+                            )
+                        })?;
                     runtime_lock_wait_ms = outcome.runtime_lock_wait_ms;
                     runtime_lock_hold_ms = outcome.runtime_lock_hold_ms;
                     runtime_lock_acquires = 1;
@@ -514,6 +537,7 @@ fn handle_binary_connection_messages(
                 compute_end_unix_nanos = now_unix_nanos() as u64;
                 (result.0, result.1, result.2, result.3, compute_ms)
             };
+        record_prefill_stage_compute(&mut message_reply_stats, config, &message, compute_ms);
         if telemetry.is_debug_enabled() {
             let mut decode_attrs = binary_message_attrs(config, session_id, &message);
             decode_attrs.insert(
@@ -614,7 +638,7 @@ fn handle_binary_connection_messages(
                         record_accumulated_prefill_tokens.as_deref(),
                         &record_token_ids,
                         restored_tokens,
-                        activation_width,
+                        output_activation_width,
                         &output,
                     );
                     Ok((record, output))
@@ -681,7 +705,7 @@ fn handle_binary_connection_messages(
                 bail!("stage has downstream but produced an empty activation payload");
             }
             let forwarded =
-                forwarded_stage_message_timed(config, &message, &output, activation_width)?;
+                forwarded_stage_message_timed(config, &message, &output, output_activation_width)?;
             forward_activation_encode_ms += forwarded.activation_encode_ms;
             forward_activation_bytes = forwarded.message.activation.len();
             let mut downstream_write_attrs = BTreeMap::new();

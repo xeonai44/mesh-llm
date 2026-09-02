@@ -6,6 +6,7 @@ mod family_policy;
 mod hash_cache;
 mod hooks;
 mod kv_cache;
+mod local_source;
 mod materialization;
 pub(crate) mod metal_pipeline_cache;
 mod package;
@@ -52,6 +53,12 @@ pub(crate) use family_policy::{
 };
 pub(crate) use hooks::MeshAutoHookPolicy;
 pub(crate) use kv_cache::KvCachePolicy;
+#[cfg(test)]
+pub(crate) use local_source::local_source_required_for_model;
+pub(crate) use local_source::{
+    apply_verified_local_source, effective_local_source_required, is_content_addressed_gguf_ref,
+    register_local_source_policy, unregister_local_source_policy, verify_registered_content_source,
+};
 pub use materialization::{
     configure_materialized_stage_cache, is_layer_package_ref, materialize_stage_config,
     materialized_stage_cache_dir, materialized_stages_for_sources,
@@ -60,7 +67,8 @@ pub use materialization::{
 };
 pub(crate) use package::direct_gguf_source_paths;
 pub use package::{
-    SkippyPackageIdentity, identity_from_layer_package, synthetic_direct_gguf_package,
+    SkippyPackageIdentity, identity_from_layer_package, synthetic_content_addressed_gguf_package,
+    synthetic_direct_gguf_package,
 };
 pub(crate) use resolver::{
     ResolvedEmbeddedOpenAiArgs, ResolvedSkippyConfig, SkippyConfigResolveRequest,
@@ -513,6 +521,16 @@ fn embedded_openai_args_from(
     hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
     serving_hooks: &ModelServingHooks,
 ) -> Result<EmbeddedOpenAiArgs> {
+    let activation_width = if config.downstream.is_some() {
+        let descriptor = runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?
+            .output_activation_boundary()
+            .context("stage 0 graph did not expose its output activation boundary")?;
+        descriptor.raw_f32_width("output")?
+    } else {
+        embedded_args.activation_width
+    };
     Ok(EmbeddedOpenAiArgs {
         bind_addr: "127.0.0.1:0"
             .parse()
@@ -524,12 +542,19 @@ fn embedded_openai_args_from(
         request_defaults: embedded_args.request_defaults,
         generation_concurrency: embedded_args.generation_concurrency,
         continuous_batching: embedded_args.continuous_batching,
+        adaptive_generation_min_concurrency: None,
+        generation_queue_capacity: embedded_args
+            .generation_concurrency
+            .saturating_mul(8)
+            .clamp(16, 256),
+        generation_admission_timeout_secs: 60,
         prefill_chunk_size: embedded_args.prefill_chunk_size,
         prefill_chunk_policy: embedded_args.prefill_chunk_policy,
         prefill_chunk_schedule: embedded_args.prefill_chunk_schedule,
         prefill_adaptive_start: embedded_args.prefill_adaptive_start,
         prefill_adaptive_step: embedded_args.prefill_adaptive_step,
         prefill_adaptive_max: embedded_args.prefill_adaptive_max,
+        prefill_adaptive_target_ms: embedded_args.prefill_adaptive_target_ms,
         draft_model_path: embedded_args.draft_model_path,
         speculative_window: embedded_args.speculative_window,
         adaptive_speculative_window: embedded_args.adaptive_speculative_window,
@@ -539,7 +564,7 @@ fn embedded_openai_args_from(
         native_mtp_draft_model_path: embedded_args.native_mtp_draft_model_path,
         native_mtp_max_tokens: embedded_args.native_mtp_max_tokens,
         native_mtp_min_tokens: embedded_args.native_mtp_min_tokens,
-        activation_width: embedded_args.activation_width,
+        activation_width,
         reply_credit_limit: embedded_args.reply_credit_limit,
         downstream_connect_timeout_secs: embedded_args.downstream_connect_timeout_secs,
         downstream_wire_condition: benchmark_downstream_wire_condition()?,
@@ -594,6 +619,12 @@ impl Drop for NativeSkippyStartupAudit {
 }
 
 impl SkippyModelHandle {
+    pub(crate) fn output_activation_boundary(
+        &self,
+    ) -> Option<skippy_runtime::ActivationBoundaryDesc> {
+        self.runtime.output_activation_boundary()
+    }
+
     fn resolved_mtp_source(
         native_mtp_enabled: bool,
         native_mtp_draft_model_path: Option<&Path>,
@@ -835,7 +866,7 @@ impl SkippyModelHandle {
 
     pub(crate) fn load_stage0_runtime_options_with_openai_args(
         mut runtime_options: EmbeddedRuntimeOptions,
-        embedded_args: resolver::ResolvedEmbeddedOpenAiArgs,
+        mut embedded_args: resolver::ResolvedEmbeddedOpenAiArgs,
         hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
         telemetry: SkippyTelemetryOptions,
         guardrails: SkippyOpenAiGuardrailOptions,
@@ -885,6 +916,14 @@ impl SkippyModelHandle {
                 runtime_config.model_id, runtime_config.model_path
             )
         })?;
+        embedded_args.activation_width = if runtime_config.downstream.is_some() {
+            runtime
+                .output_activation_boundary()
+                .context("stage 0 graph did not expose its output activation boundary")?
+                .raw_f32_width("output")?
+        } else {
+            0
+        };
         let telemetry = Telemetry::new(
             telemetry.metrics_otlp_grpc.clone(),
             telemetry.queue_capacity,
@@ -937,7 +976,7 @@ impl SkippyModelHandle {
 
     pub(crate) fn load_stage0_runtime_options_with_openai_args_and_open_events(
         mut runtime_options: EmbeddedRuntimeOptions,
-        embedded_args: resolver::ResolvedEmbeddedOpenAiArgs,
+        mut embedded_args: resolver::ResolvedEmbeddedOpenAiArgs,
         hook_policy: Option<Arc<dyn OpenAiHookPolicy>>,
         telemetry: SkippyTelemetryOptions,
         model_open_event_reporter: Option<NativeModelOpenEventReporter>,
@@ -990,6 +1029,14 @@ impl SkippyModelHandle {
                         runtime_config.model_id, runtime_config.model_path
                     )
                 })?;
+        embedded_args.activation_width = if runtime_config.downstream.is_some() {
+            runtime
+                .output_activation_boundary()
+                .context("stage 0 graph did not expose its output activation boundary")?
+                .raw_f32_width("output")?
+        } else {
+            0
+        };
         let telemetry = Telemetry::new(
             telemetry.metrics_otlp_grpc.clone(),
             telemetry.queue_capacity,
@@ -1213,7 +1260,7 @@ pub(crate) fn single_stage_config(options: &SkippyModelLoadOptions) -> Result<St
         "skippy stage layer range must satisfy layer_start < layer_end"
     );
     let run_id = format!("mesh-skippy-{}", now_unix_nanos());
-    let family_policy = family_policy_for_model_path(&options.model_path, Some(&options.model_id));
+    let family_policy = family_policy_for_model_path(&options.model_path);
     let mut config = StageConfig {
         run_id: run_id.clone(),
         topology_id: format!("topology-{run_id}"),
