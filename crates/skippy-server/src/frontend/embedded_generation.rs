@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 mod fused_decode;
 mod lifecycle;
+mod prefix_restore;
 mod speculative_policy;
 
 use super::*;
@@ -40,8 +41,26 @@ use lifecycle::{
     queued_active_tokens, refill_pipeline_ngram_candidates, speculation_after_prefix_restore,
 };
 use openai_frontend::{OpenAiError, OpenAiResult};
+use prefix_restore::EmbeddedPrefixRestore;
 use serde_json::json;
 use skippy_protocol::binary::{StageReplyStats, WireReplyKind, recv_reply};
+
+fn prefill_chunk_end(
+    pos_start: usize,
+    chunk_size: usize,
+    prefill_token_count: usize,
+    exact_checkpoint_boundary: Option<usize>,
+) -> usize {
+    let mut end = pos_start
+        .saturating_add(chunk_size)
+        .min(prefill_token_count);
+    if let Some(boundary) = exact_checkpoint_boundary
+        && pos_start < boundary
+    {
+        end = end.min(boundary);
+    }
+    end
+}
 
 impl StageOpenAiBackend {
     pub(super) fn generate_embedded_stage_zero_tokens(
@@ -116,110 +135,27 @@ impl StageOpenAiBackend {
                         "miss"
                     };
                 }
-                let prefix_restore_allowed = !request.native_mtp_enabled;
-                if !prefix_restore_allowed && self.kv.is_some() {
-                    let mut attrs = self.openai_attrs(request.ids);
-                    attrs.insert(
-                        "skippy.kv.decision".to_string(),
-                        json!("bypass_native_mtp_sidecar"),
-                    );
-                    attrs.insert(
-                        "skippy.kv.prompt_token_count".to_string(),
-                        json!(prefill_token_count),
-                    );
-                    self.telemetry
-                        .emit("stage.openai_kv_lookup_decision", attrs);
-                }
-                if prefix_restore_allowed && request.max_tokens > 0 && request.draft.is_none() {
-                    let current = *request
-                        .prompt_token_ids
-                        .last()
-                        .expect("checked non-empty prompt");
-                    if let Some(cached) = self.try_restore_embedded_split_exact_replay(
-                        &request,
-                        &session_key,
-                        downstream,
-                    )? {
-                        prefill_chain_cache_restored = true;
-                        prefill_chain_restored_tokens = request
-                            .prompt_token_ids
-                            .len()
-                            .saturating_add(cached.predicted_tokens.len().saturating_sub(1));
-                        prefill_chain_cache_stats = cached.reply_stats;
-                        cache_stats.cached_prompt_tokens =
-                            saturating_u32(request.prompt_token_ids.len());
-                        cache_stats.matched_prefix_tokens =
-                            saturating_u32(request.prompt_token_ids.len());
-                        cache_stats.suffix_prefill_tokens = 0;
-                        cache_stats.status = "hit";
-                        cache_stats.hit_kind = Some("chain_exact_replay");
-                        fused_first_decode = Some(cached);
-                    } else if let Some(cached) = self
-                        .try_restore_embedded_split_full_prompt_first_token(
-                            &request,
-                            &session_key,
-                            downstream,
-                        )?
-                    {
-                        prefill_chain_cache_restored = true;
-                        prefill_chain_restored_tokens = request.prompt_token_ids.len();
-                        prefill_chain_cache_stats = cached.reply_stats;
-                        cache_stats.cached_prompt_tokens =
-                            saturating_u32(request.prompt_token_ids.len());
-                        cache_stats.matched_prefix_tokens =
-                            saturating_u32(request.prompt_token_ids.len());
-                        cache_stats.suffix_prefill_tokens = 0;
-                        cache_stats.status = "hit";
-                        cache_stats.hit_kind = Some("chain_full_prompt_first_token");
-                        fused_first_decode = Some(cached);
-                    } else if let Some(fused) = self.try_restore_embedded_split_prefill_and_decode(
-                        &request,
-                        &session_key,
-                        downstream,
-                        prefill_tokens,
-                        current,
-                        wire_sampling.clone(),
-                    )? {
-                        prefill_chain_cache_restored = true;
-                        prefill_chain_restored_tokens = prefill_token_count;
-                        prefill_chain_cache_stats = fused.reply_stats;
-                        cache_stats.cached_prompt_tokens = saturating_u32(prefill_token_count);
-                        cache_stats.matched_prefix_tokens = saturating_u32(prefill_token_count);
-                        cache_stats.suffix_prefill_tokens = 0;
-                        cache_stats.status = "hit";
-                        cache_stats.hit_kind = Some("chain_fused_exact_prefix");
-                        fused_first_decode = Some(fused);
-                    }
-                }
-                let split_prefill_restore =
-                    if prefill_chain_cache_restored || !prefix_restore_allowed {
-                        None
-                    } else {
-                        self.try_restore_embedded_split_prefill(
-                            &request,
-                            &session_key,
-                            downstream,
-                            prefill_tokens,
-                        )?
-                    };
-                if let Some(restore) = split_prefill_restore {
-                    prefill_chain_restored_tokens = restore.restored_tokens;
-                    prefill_chain_cache_restored =
-                        prefill_chain_restored_tokens >= prefill_tokens.len();
-                    prefill_chain_cache_stats = restore.stats;
-                    cache_stats.cached_prompt_tokens =
-                        saturating_u32(prefill_chain_restored_tokens);
-                    cache_stats.matched_prefix_tokens =
-                        saturating_u32(prefill_chain_restored_tokens);
-                    cache_stats.suffix_prefill_tokens = saturating_u32(
-                        prefill_tokens
-                            .len()
-                            .saturating_sub(prefill_chain_restored_tokens),
-                    );
-                    cache_stats.status = "hit";
-                    cache_stats.hit_kind = Some("chain_prefix");
-                }
+                let EmbeddedPrefixRestore {
+                    allowed: prefix_restore_allowed,
+                    chain_cache_restored,
+                    chain_restored_tokens,
+                    chain_cache_stats,
+                    fused_first_decode: restored_first_decode,
+                } = self.restore_embedded_prefix(
+                    &request,
+                    &session_key,
+                    downstream,
+                    prefill_tokens,
+                    wire_sampling.clone(),
+                    &mut cache_stats,
+                )?;
+                prefill_chain_cache_restored = chain_cache_restored;
+                prefill_chain_restored_tokens = chain_restored_tokens;
+                prefill_chain_cache_stats = chain_cache_stats;
+                fused_first_decode = restored_first_decode;
                 let mut pos_start = prefill_chain_restored_tokens.min(prefill_tokens.len());
+                let exact_checkpoint_boundary =
+                    self.embedded_exact_checkpoint_boundary(&request, prefill_tokens, pos_start);
                 let mut chunk_index = 0usize;
                 while pos_start < prefill_tokens.len() {
                     if request
@@ -235,9 +171,12 @@ impl StageOpenAiBackend {
                     }
                     let chunk_size =
                         prefill_planner.chunk_size_for(chunk_index, prefill_token_count);
-                    let end = pos_start
-                        .saturating_add(chunk_size)
-                        .min(prefill_tokens.len());
+                    let end = prefill_chunk_end(
+                        pos_start,
+                        chunk_size,
+                        prefill_tokens.len(),
+                        exact_checkpoint_boundary,
+                    );
                     let chunk = &prefill_tokens[pos_start..end];
                     prefill_min_chunk_size = prefill_min_chunk_size.min(chunk.len());
                     prefill_max_chunk_size = prefill_max_chunk_size.max(chunk.len());
@@ -342,6 +281,14 @@ impl StageOpenAiBackend {
                         );
                         self.telemetry
                             .emit("stage.openai_kv_record_decision", attrs);
+                    }
+                    if exact_checkpoint_boundary == Some(end) {
+                        prefill_stage0_full_recorded |= self
+                            .record_embedded_stage0_exact_checkpoint(
+                                &session_key,
+                                request.ids,
+                                &prefill_tokens[..end],
+                            )?;
                     }
                     let chunk_stage0_compute_ms = stage0_timer.elapsed_ms();
                     prefill_stage0_compute_ms += chunk_stage0_compute_ms;
@@ -483,7 +430,7 @@ impl StageOpenAiBackend {
                 prefill_downstream_wait_ms += drained.downstream_wait_ms;
                 prefill_downstream_wait_max_ms =
                     prefill_downstream_wait_max_ms.max(drained.downstream_wait_max_ms);
-                if !prefill_chain_cache_restored {
+                if !prefill_chain_cache_restored && !prefill_stage0_full_recorded {
                     prefill_stage0_full_recorded = self.record_embedded_stage0_full_prefill(
                         &session_key,
                         request.ids,
@@ -1993,5 +1940,23 @@ impl StageOpenAiBackend {
         self.finish_embedded_generation_session(&request, lane_pool, lane, &result, &session_key)?;
         result?;
         Ok(cache_stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefill_chunk_end;
+
+    #[test]
+    fn exact_checkpoint_splits_prefill_at_the_native_state_boundary() {
+        assert_eq!(prefill_chunk_end(0, 1024, 1400, Some(768)), 768);
+        assert_eq!(prefill_chunk_end(768, 1024, 1400, Some(768)), 1400);
+    }
+
+    #[test]
+    fn exact_checkpoint_preserves_earlier_adaptive_chunks() {
+        assert_eq!(prefill_chunk_end(0, 256, 1400, Some(768)), 256);
+        assert_eq!(prefill_chunk_end(256, 256, 1400, Some(768)), 512);
+        assert_eq!(prefill_chunk_end(512, 512, 1400, Some(768)), 768);
     }
 }

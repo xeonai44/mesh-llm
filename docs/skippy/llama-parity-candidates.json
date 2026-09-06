@@ -110,6 +110,7 @@
     {
       "llama_model": "llama",
       "family": "llama",
+      "artifact_id": "llama-q4-parity-radix",
       "status": "certified",
       "repo": "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF",
       "include": "*.gguf",
@@ -126,6 +127,7 @@
     {
       "llama_model": "qwen3",
       "family": "qwen3_dense",
+      "artifact_id": "qwen3-q8-parity",
       "status": "certified",
       "repo": "meshllm/qwen3-0.6b-parity-q8_0-gguf",
       "include": "*.gguf"
@@ -242,7 +244,7 @@
       "status": "certified",
       "repo": "bartowski/Phi-3.5-MoE-instruct-GGUF",
       "include": "Phi-3.5-MoE-instruct-Q4_K_M.gguf",
-      "notes": "text lane passed in llama-parity-phimoe-runtime-slice-2 after adding PhiMoE to the runtime-slice ABI allowlist; q8 activation wire validated; ResidentKv native-sequence remap cache smoke passed"
+      "notes": "text lane passed in llama-parity-phimoe-runtime-slice-2 after adding PhiMoE staged-graph support; q8 activation wire validated; ResidentKv native-sequence remap cache smoke passed"
     },
     {
       "llama_model": "gemma",
@@ -255,6 +257,7 @@
     {
       "llama_model": "gemma2",
       "family": "gemma2",
+      "artifact_id": "gemma2-q4-parity-radix",
       "status": "certified",
       "repo": "bartowski/gemma-2-2b-it-GGUF",
       "include": "*Q4_K_M.gguf",
@@ -305,6 +308,7 @@
     {
       "llama_model": "deepseek2",
       "family": "deepseek2",
+      "artifact_id": "family-deepseek2",
       "status": "certified",
       "repo": "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
       "include": "*Q4_K_M.gguf",
@@ -363,7 +367,7 @@
       "status": "certified",
       "repo": "mradermacher/tiny-random-granite-moe-GGUF",
       "include": "tiny-random-granite-moe.Q4_K_M.gguf",
-      "notes": "text lane passed in llama-parity-granite-moe-runtime-slice-2 after adding Granite-MoE to the skippy ABI allowlist; tiny random GGUF certifies graph/tensor layout only, so replace with a real small artifact when available"
+      "notes": "text lane passed in llama-parity-granite-moe-runtime-slice-2 after adding Granite-MoE staged-graph support; tiny random GGUF certifies graph/tensor layout only, so replace with a real small artifact when available"
     },
     {
       "llama_model": "gptneox",
@@ -463,6 +467,7 @@
     {
       "llama_model": "falcon-h1",
       "family": "falcon_h1",
+      "artifact_id": "family-falcon-h1",
       "status": "certified",
       "repo": "tiiuae/Falcon-H1-1.5B-Instruct-GGUF",
       "include": "*Q4_K_M.gguf",
@@ -740,7 +745,7 @@
         "DeepSeek-OCR-Q8_0.gguf",
         "mmproj-DeepSeek-OCR-Q8_0.gguf"
       ],
-      "notes": "OCR multimodal/MLA family; text split, chain, dtype matrix, ResidentKv handoff, and split multimodal serving passed on ggml-org/DeepSeek-OCR-GGUF:Q8_0 plus mmproj-DeepSeek-OCR-Q8_0.gguf after adding runtime-slice ABI allowlist coverage and media activation position sideband forwarding; q8 activation wire rejected, default f16 is the support target"
+      "notes": "OCR multimodal/MLA family; text split, chain, dtype matrix, ResidentKv handoff, and split multimodal serving passed on ggml-org/DeepSeek-OCR-GGUF:Q8_0 plus mmproj-DeepSeek-OCR-Q8_0.gguf after adding staged-graph support and media activation position sideband forwarding; q8 activation wire rejected, default f16 is the support target"
     },
     {
       "llama_model": "delta-net-base",

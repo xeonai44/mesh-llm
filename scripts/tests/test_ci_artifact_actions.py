@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from fnmatch import fnmatch
 from pathlib import Path
 import re
 import shutil
@@ -1210,7 +1211,7 @@ class CiArtifactActionTests(unittest.TestCase):
         )
         self.assertIn(
             "actions/download-artifact@"
-            "37930b1c2abaa49bbe596cd826c3c89aef350131",
+            "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
             consumer_workflow,
         )
         self.assertIn(
@@ -1671,6 +1672,29 @@ class CiArtifactActionTests(unittest.TestCase):
             producer,
         )
         self.assertIn("sdk/swift/scripts/build-xcframework.sh", producer)
+        self.assertIn("max-parallel: ${{ inputs.max_parallel }}", producer)
+        self.assertEqual(producer.count("- aarch64-apple-ios\n"), 1)
+        self.assertIn(
+            'build-xcframework.sh --target "${{ matrix.target }}"',
+            producer,
+        )
+        self.assertIn(
+            "name: swift-sdk-target-${{ matrix.target }}-"
+            "${{ github.run_attempt }}",
+            producer,
+        )
+        self.assertIn(
+            "pattern: swift-sdk-target-*",
+            producer,
+        )
+        self.assertNotIn(
+            "pattern: swift-sdk-target-*-${{ github.run_attempt }}",
+            producer,
+        )
+        self.assertIn(
+            "build-xcframework.sh --assemble-from dist/swift-targets",
+            producer,
+        )
         self.assertIn(
             "scripts/verify-swift-release-artifact.sh",
             producer,
@@ -1734,6 +1758,33 @@ class CiArtifactActionTests(unittest.TestCase):
             producer,
         )
 
+        targets = (
+            "aarch64-apple-ios",
+            "aarch64-apple-ios-sim",
+            "x86_64-apple-ios",
+            "aarch64-apple-ios-macabi",
+            "x86_64-apple-ios-macabi",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+        )
+        assembly_only_retry = [
+            f"swift-sdk-target-{target}-1" for target in targets
+        ]
+        self.assertEqual(
+            {name.rsplit("-", maxsplit=1)[0] for name in assembly_only_retry
+             if fnmatch(name, "swift-sdk-target-*")},
+            {f"swift-sdk-target-{target}" for target in targets},
+        )
+        partial_matrix_retry = [
+            f"swift-sdk-target-{target}-{2 if index == 3 else 1}"
+            for index, target in enumerate(targets)
+        ]
+        self.assertEqual(
+            {name.rsplit("-", maxsplit=1)[0] for name in partial_matrix_retry
+             if fnmatch(name, "swift-sdk-target-*")},
+            {f"swift-sdk-target-{target}" for target in targets},
+        )
+
         self.assertIn(
             "name: ${{ inputs.swift_artifact_name }}",
             consumer_workflow,
@@ -1745,7 +1796,7 @@ class CiArtifactActionTests(unittest.TestCase):
         )
         self.assertIn(
             "actions/download-artifact@"
-            "37930b1c2abaa49bbe596cd826c3c89aef350131",
+            "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
             consumer_workflow,
         )
         self.assertIn("persist-credentials: false", consumer_workflow)
@@ -1753,6 +1804,13 @@ class CiArtifactActionTests(unittest.TestCase):
             "if: ${{ inputs.sdk_kind == 'rust' }}",
             consumer_workflow,
         )
+        self.assertNotIn("pnpm/action-setup@", consumer_workflow)
+        self.assertNotIn("actions/setup-node@", consumer_workflow)
+        self.assertIn(
+            'LEGACY_PNPM_STORE="$(pnpm store path --silent)"',
+            consumer_script,
+        )
+        self.assertIn('mkdir -p "$LEGACY_PNPM_STORE"', consumer_script)
 
         for forbidden in (
             "cargo ",
@@ -1810,10 +1868,19 @@ class CiArtifactActionTests(unittest.TestCase):
             / "build-host-macos-xcframework.sh"
         ).read_text(encoding="utf-8")
 
+        exact_key = "format('mesh-llm-swift-sdk-target-{0}-{1}-{2}-{3}-{4}'"
+        self.assertEqual(producer.count(exact_key), 2)
         self.assertIn(
-            "format('mesh-llm-swift-sdk-{0}-{1}-{2}-{3}', "
-            "runner.os, runner.arch, "
-            "steps.native_toolchain.outputs.epoch, hashFiles(",
+            "shared-key: swift-sdk-${{ matrix.target }}",
+            producer,
+        )
+        self.assertIn(
+            "shared-key: ${{ format('swift-sdk-{0}', runner.arch == 'ARM64' "
+            "&& 'aarch64-apple-darwin' || 'x86_64-apple-darwin') }}",
+            producer,
+        )
+        self.assertIn(
+            "path: ${{ format('.deps/llama-build/build-stage-abi-{0}-metal'",
             producer,
         )
         self.assertNotIn("runner.arch, inputs.mode, hashFiles(", producer)
@@ -1823,10 +1890,16 @@ class CiArtifactActionTests(unittest.TestCase):
         )
         self.assertIn('include_tool_versions: "true"', producer)
         self.assertNotIn("SWIFT_NATIVE_XCODE_CACHE_EPOCH", producer)
-        self.assertIn("trusted main full build", producer)
+        self.assertIn("Trusted main can", producer)
         self.assertNotIn("build-stage-abi-host-metal", producer)
         self.assertIn(
             ".deps/llama-build/build-stage-abi-$RUST_TARGET-metal",
+            host_builder,
+        )
+        self.assertIn("-DCMAKE_OSX_SYSROOT=macosx", host_builder)
+        self.assertIn('-DCMAKE_OSX_ARCHITECTURES="$CMAKE_ARCH"', host_builder)
+        self.assertIn(
+            '-DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET"',
             host_builder,
         )
 
@@ -2041,10 +2114,26 @@ class CiArtifactActionTests(unittest.TestCase):
     def test_smoke_restore_model_is_optional(self) -> None:
         action = self.read_action("restore-smoke-inputs")
         model_inputs_present = (
-            "inputs.model_url != '' && inputs.model_file != ''"
+            "steps.resolve-model.outputs.url != '' && "
+            "steps.resolve-model.outputs.file != ''"
         )
 
         self.assertEqual(action.count(model_inputs_present), 4)
+        self.assertIn("model_manifest:", action)
+        self.assertIn("model_cadence:", action)
+        self.assertIn("scripts/resolve-test-model-manifest.py", action)
+        self.assertIn('--cadence "$MODEL_CADENCE"', action)
+        self.assertIn("--require-single-file", action)
+        self.assertIn('^[A-Za-z0-9][A-Za-z0-9._-]*$', action)
+        self.assertIn("--verify-root \"$HOME/.models\"", action)
+        self.assertIn("MODEL_MANIFEST: ${{ inputs.model_manifest }}", action)
+        self.assertIn("MODEL_CADENCE: ${{ inputs.model_cadence }}", action)
+        self.assertIn("MODEL_URL: ${{ steps.resolve-model.outputs.url }}", action)
+        self.assertIn("MODEL_FILE: ${{ steps.resolve-model.outputs.file }}", action)
+        self.assertNotIn('"${{ inputs.model_manifest }}"', action)
+        self.assertNotIn('"${{ inputs.model_cadence }}"', action)
+        self.assertNotIn('"${{ steps.resolve-model.outputs.url }}"', action)
+        self.assertNotIn('"${{ steps.resolve-model.outputs.file }}"', action)
         self.assertIn(
             f"if: ${{{{ {model_inputs_present} }}}}\n"
             "      id: cache-model",
@@ -2742,13 +2831,21 @@ class CiArtifactActionTests(unittest.TestCase):
             "ci-ui-artifact-slice.yml": {"runner_policy", "ui_artifact"},
             "ci-linux-host-slice.yml": {"runner_policy", "linux_host"},
             "ci-linux-runtime-slice.yml": {"runner_policy", "linux_runtime"},
-            "ci-rust-tests-slice.yml": {"runner_policy", "rust_tests"},
+            "ci-rust-tests-slice.yml": {
+                "runner_policy",
+                "rust_tests",
+                "safetensors_runtime_smoke",
+            },
             "ci-macos-host-slice.yml": {"runner_policy", "macos_host"},
             "ci-platform-checks-slice.yml": {"runner_policy", "platform_checks"},
             "ci-windows-host-slice.yml": {"runner_policy", "windows_host"},
             "ci-windows-runtime-slice.yml": {"runner_policy", "windows_runtime"},
             "static-abi-artifact.yml": {"runner_policy", "static_abi_artifact"},
-            "swift-sdk-artifact.yml": {"runner_policy", "swift_sdk_artifact"},
+            "swift-sdk-artifact.yml": {
+                "runner_policy",
+                "swift_sdk_target",
+                "swift_sdk_artifact",
+            },
         }
 
         def step_block(workflow: str, marker: str) -> str:

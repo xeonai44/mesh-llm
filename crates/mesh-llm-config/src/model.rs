@@ -398,6 +398,12 @@ pub struct HardwareConfig {
     pub control_vectors: Vec<String>,
     #[serde(default)]
     pub check_tensors: Option<bool>,
+    /// Tensor type policy applied while opening a SafeTensors checkpoint.
+    #[serde(default)]
+    pub checkpoint_quantization: Option<String>,
+    /// Importance matrix used by low-bit SafeTensors checkpoint quantization.
+    #[serde(default)]
+    pub checkpoint_imatrix: Option<String>,
     #[serde(default)]
     pub mmap: Option<BoolOrAuto>,
     #[serde(default)]
@@ -1398,8 +1404,8 @@ pub struct LoggingConfig {
     #[serde(default)]
     pub webhook: LoggingWebhookConfig,
 
-    /// Security audit stream configuration. Nested under [logging] so the
-    /// logging master switch (logging.enabled) gates the audit stream too.
+    /// Security audit stream configuration. Nested under `[logging]` so the
+    /// logging master switch (`logging.enabled`) gates the audit stream too.
     #[serde(default)]
     pub audit: AuditConfig,
 }

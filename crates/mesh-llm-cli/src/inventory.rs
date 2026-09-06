@@ -209,6 +209,9 @@ pub fn build_cli_inventory() -> CliInventory {
     ));
 
     for subcommand in command.get_subcommands() {
+        if subcommand.get_name() == "serve" || subcommand.get_name() == "client" {
+            continue;
+        }
         children.push(build_command_node(subcommand, &root_path, &root_global_ids));
     }
 
@@ -475,6 +478,8 @@ fn client_excluded_arg(id: &str) -> bool {
         "model"
             | "gguf"
             | "mmproj"
+            | "checkpoint_quantization"
+            | "checkpoint_imatrix"
             | "local_model_only"
             | "native_serving_plugin"
             | "native_serving_plugin_config"
@@ -732,6 +737,12 @@ mod tests {
         assert!(find_child(serve, "--model").global == Some(false));
         assert!(serve.children.iter().all(|child| child.name != "--plugin"));
         assert!(client.children.iter().all(|child| child.name != "--model"));
+        assert!(
+            client
+                .children
+                .iter()
+                .all(|child| child.name != "--checkpoint-quantization")
+        );
         assert!(client.children.iter().all(|child| child.name != "--client"));
         assert!(client.children.iter().all(|child| child.name != "--plugin"));
         assert!(find_child(client, "--auto").path == "mesh-llm client --auto");
@@ -774,5 +785,25 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn inventory_contains_exactly_one_serve_and_client_surface_node() {
+        let inventory = build_cli_inventory();
+        let serve_count = inventory
+            .root
+            .children
+            .iter()
+            .filter(|child| child.name == "serve")
+            .count();
+        let client_count = inventory
+            .root
+            .children
+            .iter()
+            .filter(|child| child.name == "client")
+            .count();
+
+        assert_eq!(serve_count, 1, "serve should appear exactly once");
+        assert_eq!(client_count, 1, "client should appear exactly once");
     }
 }

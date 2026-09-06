@@ -14,14 +14,12 @@ Read it with `../SKILL.md` and `ci/ci.md` before editing CI.
 | `pr_macos.yml` (`PR · macOS`) | PR lifecycle | Canonical PR planning plus the protected reusable macOS lane |
 | `pr_windows.yml` (`PR · Windows`) | PR lifecycle | Canonical PR planning plus the protected reusable Windows lane |
 | `pr-cancel-sibling-runs.yml` (`PR · Cancel sibling lanes`) | protected `workflow_run` on `PR · Quality` entering progress | No-PR-checkout monitor that cancels other exact-revision PR validation lanes after the first definitive job failure |
-| `pr_builds.yml` | `workflow_call` only | Inert migration shim for the pre-merge protected runner-contract filename check; no PR event trigger |
-| `ci-orchestrator.yml` | `workflow_call` only | Inert migration shim for the pre-merge protected runner-contract filename check; no PR event trigger or lane calls |
 | `main_quality.yml` (`Main · Quality`) | push to `main` | Exhaustive main planning plus the same-commit reusable Quality lane |
 | `main_website.yml` (`Main · Website`) | push to `main` | Exhaustive main planning plus the same-commit reusable Website lane |
 | `main_linux.yml` (`Main · Linux`) | push to `main` | Exhaustive main planning plus the same-commit reusable Linux lane |
 | `main_macos.yml` (`Main · macOS`) | push to `main` | Exhaustive main planning plus the same-commit reusable macOS lane |
 | `main_windows.yml` (`Main · Windows`) | push to `main` | Exhaustive main planning plus the same-commit reusable Windows lane |
-| `ci.yml` | `workflow_call` only | Inert migration shim for the former main ingress filename; no push trigger or dispatch |
+| `ci.yml` | `workflow_call` only | Temporary inert shim for the former main ingress filename; pending protected-main runner-contract update; no push trigger or dispatch |
 | `ci-control.yml` (`CI · Manual Full`) | dispatch on default branch | Explicit operator-only full plan, bounded lane dispatch and correlated diagnostic checks |
 | `release.yml` | release tags, dispatch | Canonical version synchronization, release-only signing, assets and publication |
 | `website-pages.yml` | main website paths, dispatch | Public website deployment |
@@ -100,10 +98,13 @@ patch-apply failure it hands the queue to a non-interactive `opencode` agent
 via the `LLAMA_CANARY_AGENT_MODEL` repository variable) which rebases
 `third_party/llama.cpp/patches`, runs the supported-families certification
 battery (`scripts/skippy-family-battery.sh`), and opens or reuses the repair PR
-on `llama-canary/patch-queue-fix`. The same repair loop also runs when the
-queue applies but a certification lane fails (`battery` mode). After each agent
-turn the repair script
-itself runs the battery and, on failure, loops certify -> agent fix ->
+on `llama-canary/patch-queue-fix`. The deterministic wrapper writes the sole
+upstream selector, `third_party/llama.cpp/upstream.txt`, to the resolved repair
+target, prepares through the checked-in `pinned`
+selector, and verifies the prepared-upstream stamp before any repair branch is
+published or certified. The same repair loop also runs when the queue applies
+but a certification lane fails (`battery` mode). After each agent turn the
+repair script itself runs the battery and, on failure, loops certify -> agent fix ->
 recertify up to `CANARY_REPAIR_MAX_TURNS` (default 2) turns; the script only
 succeeds when the wrapper's own battery run passes. Every outcome (battery
 green, queue still broken, battery exhausted) posts a status comment on the
@@ -114,7 +115,8 @@ PR operations authenticate with the `CANARY_REPAIR_TOKEN` fine-grained PAT;
 the canary job itself remains `contents: read`. Any repair outcome keeps the
 canary run red: the certified fix must be merged from the repair PR before
 trusted main can certify. The upstream pin commit to
-`main` is gated on the battery passing.
+`main` is gated on the battery passing and writes the sole upstream pin from
+the validated SHA.
 
 For a non-canary manual dispatch, `release.yml` runs the checked-in
 `scripts/release-version.sh`, creates one linear release-source commit when the
@@ -133,10 +135,9 @@ The five PR lifecycle rows and five main push rows above are the complete
 allowed routine validation entry sets. The protected sibling monitor is
 metadata/control infrastructure, not a sixth validation entrypoint or required
 check. Their separation and direct GitHub log visibility are contractual, not
-a presentation preference. `pr_builds.yml`,
-`ci-orchestrator.yml`, and `ci.yml` are reusable-only migration scaffolding;
-they must never regain event triggers or call the five lanes. They are
-removable after this branch's runner contract is active on protected main.
+a presentation preference. The retained `ci.yml` is reusable-only migration
+scaffolding and must never regain event triggers or call the five lanes; remove
+it after the protected-main runner-contract update is active.
 
 ## Reusable workflows and slices
 
@@ -151,18 +152,18 @@ removable after this branch's runner contract is active on protected main.
 | `ci-web-slice.yml` | Console quality, console Playwright E2E, public website build, and CLI explorer browser validation |
 | `ci-ui-artifact-slice.yml` | Immutable console distribution producer |
 | `static-abi-artifact.yml` | Typed static llama ABI producer with internal runner policy and an exact toolchain-epoch output |
-| `ci-rust-tests-slice.yml` | Typed deterministic Cargo test batches that verify the producer-owned static ABI toolchain epoch and a pinned, digest-verified Skippy correctness fixture |
+| `ci-rust-tests-slice.yml` | Typed deterministic Cargo test batches that verify the producer-owned static ABI toolchain epoch and a pinned, digest-verified Skippy correctness fixture; related PR changes additionally compile one asserted, fully qualified runtime test and smoke an immutable SmolLM2 SafeTensors checkpoint through the complete Mesh config/resolver/server/native path to sampled prefill and decode with every supported load-time quantization |
 | `ci-{linux,macos,windows}-host-slice.yml` | Platform-pure neutral host producers; no empty cross-platform jobs |
 | `ci-{linux,macos,windows}-runtime-slice.yml` | Platform-pure native runtime producers |
 | `ci-{linux,macos,windows}-product-slice.yml` | Platform-pure composition-only product consumers |
 | `ci-platform-checks-slice.yml` | macOS portable/unit, Windows portable, and Windows log-store privacy ACL checks |
-| `ci-linux-product-smoke-slice.yml`, `ci-macos-product-smoke-slice.yml` | Platform-local CPU, CUDA (`gpu-nvidia` self-hosted), two-node, Metal and model-download consumers; ROCm/Vulkan products remain package-verified pending eligible inference runners |
+| `ci-linux-product-smoke-slice.yml`, `ci-macos-product-smoke-slice.yml` | Platform-local CPU, CUDA (`gpu-nvidia` self-hosted), two-node, Metal and model-download consumers; one Linux KV caching smoke job runs pinned dense SmolLM2 then recurrent Qwen3.5 legs and requires both to pass; ROCm/Vulkan products remain package-verified pending eligible inference runners |
 | `ci-linux-sdk-slice.yml`, `ci-macos-sdk-slice.yml` | Platform-local Rust/Kotlin/Swift smoke consumers; SDK producers are independent top-level calls and each smoke receives the lane-local immutable UI artifact |
 | `ci-runner-contract-slice.yml` | Provider/cache/plan trust and main runner-image checks |
 | `native-sdk-artifact.yml` | Typed native SDK producer |
-| `swift-sdk-artifact.yml` | Host-only/full XCFramework producer; trusted main remains `macos-15`, while eligible same-repository PRs follow the protected Depot macOS 15 gate |
+| `swift-sdk-artifact.yml` | Host-only/full XCFramework producer; full mode builds the seven Apple Rust targets as a bounded matrix (maximum four concurrent macOS runners) and joins their immutable libraries in one assembly job, while host-only remains a single producer. Trusted main remains `macos-15`, while eligible same-repository PRs follow the protected Depot macOS 15 gate |
 | `smoke.yml` | Artifact-based inference/OpenAI/split smoke |
-| `scripted-binary-smoke.yml` | Artifact-based scripted product smoke |
+| `scripted-binary-smoke.yml` | Artifact-based scripted product smoke with optional typed model context-size and recurrent-model inputs; recurrent models restore and save through a dedicated trust-scoped cache before the smoke runs |
 | `sdk-smoke.yml` | Artifact-based SDK consumers; all SDK rows consume the lane's immutable console UI artifact, while Rust smoke restores the main-seeded, target/profile/image/toolchain/recipe-bound Cargo/target cache through `Swatinem/rust-cache` |
 | `hf-download-smoke.yml` | Hugging Face download smoke |
 
@@ -237,11 +238,15 @@ class is invisible to `actionlint`.
 
 ### `job.container.id == ''` gating
 
-When a job has both a containerized and a bare-metal row (the two rows
-above), `actions/setup-python`, `actions/setup-node`, and
-`pnpm/action-setup` steps are gated `if: job.container.id == ''` rather than
-deleted, because the bare-metal row still needs them -- the image is not
-present there. **Deliberate exception: `actions/setup-java` in
+When a job has both a containerized and a bare-metal row, setup actions needed
+only by the bare-metal row are gated `if: job.container.id == ''` rather than
+allowed to shadow tools from the image. `sdk-smoke.yml`'s bare-metal Swift row
+consumes the immutable UI artifact with `--skip-build`, so it needs neither
+Node nor pnpm; those setup actions and their unused package cache are absent.
+Its smoke script temporarily creates the legacy protected-main workflow's
+computed pnpm store when that older workflow installed pnpm, preventing the
+setup-node post-job cache hook from failing before this workflow change lands
+on `main`. **Deliberate exception: `actions/setup-java` in
 `sdk-smoke.yml` is never gated.** `verify-runner-image`'s asserted tool list
 has no JDK, so the image provides nothing for it to shadow; gating it would
 break the Kotlin SDK smoke on the containerized row instead of protecting it.
@@ -461,7 +466,13 @@ fail-open policy.
   manifest.
 - `prepare-static-abi-input`: portable static ABI archive.
 - `compose-product-input`: exact host/runtime verification and composition.
-- `restore-smoke-inputs`: product/model extraction for consumers.
+- `ci/model-artifacts/registry.json`: canonical immutable model identities,
+  integrity, family capability tags, and allowed suite/cadence membership.
+  `scripts/generate-test-model-manifests.py` owns the family battery and
+  suite-specific projections; CI contract tests reject stale projections.
+- `restore-smoke-inputs`: product/model extraction for consumers. Model
+  restores resolve generated suite manifests, use exact digest-bearing cache
+  keys, and stream-verify size and SHA-256 before use.
 - `select-ci-runners`: provider labels, cache permissions, and the
   provider-derived `allow_native_github_cache` / `allow_depot_remote_cache`
   outputs. Depot selections disable both cache paths by default. During the
@@ -473,12 +484,17 @@ fail-open policy.
 - `restore-sccache-seed`: exact-key restore of the trusted 2 GiB Linux seed;
   central runner policy permits it only for GitHub-hosted selections, and
   runtime rows must match the seed's container image and toolchain epoch.
-- `capture-sccache-stats`: machine-readable cache evidence.
+- `capture-sccache-stats`: machine-readable cache evidence. Warm consumers with
+  a positive floor fail when no cache requests are observable; the zero-floor
+  SafeTensors observation remains non-failing and emits a wiring warning.
 
 Rust-test batches that contain `skippy-runtime` or `skippy-model-package`
-restore the pinned Qwen correctness fixture from one exact GitHub Actions cache
-key containing its file SHA-256 and `.github/cache-version.txt`. Every use is
-verified against the pinned digest before tests. Cache publication is limited
+resolve the generated Skippy correctness manifest, then restore the pinned Qwen
+fixture from one exact GitHub Actions cache key containing its file SHA-256 and
+`.github/cache-version.txt`. Every use is verified against the pinned size and
+digest before tests. The SafeTensors smoke resolves its repository, revision,
+complete file set, per-file integrity, and quantization sweep from the same
+registry. Cache publication is limited
 to the exhaustive trusted-main batch containing `skippy-runtime`; PR jobs are
 restore-only and jobs for which central runner policy denies native GitHub
 cache access download and verify the immutable revision without publishing.
@@ -499,7 +515,10 @@ eligible PR jobs may temporarily use Depot's shared cross-branch
 namespace under `ci/DEPOT_PR_RISK_EXCEPTION.md`. That namespace is treated as
 untrusted input, not an authority or correctness boundary. Linux Clippy,
 Rust-test, host, and runtime jobs restore one bounded trusted sccache seed
-instead of per-row Cargo target archives. Depot selections cannot restore that
+instead of per-row Cargo target archives. The protected warmer's
+`just ci-sccache-seed-build` recipe covers the dominant `mesh-llm` Clippy graph
+and the isolated `mesh-llm-cli` test graph used by the Rust-test matrix. Depot
+selections cannot restore that
 seed through their cross-trust cache proxy. Its exact key fingerprints the
 warmer image and toolchain epoch, so mismatched native-runtime rows are cold and
 do not restore it. These four high-fanout families disable per-object GHA
@@ -509,8 +528,9 @@ scope for same-PR reruns. UI installs (`ui_quality`, `ui_e2e`, `ui_artifact`) po
 image's baked store instead of an Actions cache — there is no shared pnpm
 key or publisher to race. Trusted main owns shared publication.
 
-PR Rust-test, host, native-runtime, product, and platform-check matrices receive
-`fail_fast: true`; main/manual pass `false`. Quality matrices remain
+PR Rust-test, host, native-runtime, product, platform-check, and full Swift
+target matrices receive `fail_fast: true`; main/manual and release pass
+`false`. Quality matrices remain
 non-fail-fast and failed producers suppress impossible consumers through
 `needs`. One protected, default-branch `workflow_run` monitor starts with
 `PR · Quality`, polls the five exact-PR/exact-SHA validation runs, preserves the
