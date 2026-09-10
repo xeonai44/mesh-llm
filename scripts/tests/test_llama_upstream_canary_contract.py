@@ -13,6 +13,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "llama-upstream-canary.yml"
+PARITY = ROOT / "scripts" / "skippy-llama-parity.py"
 UPDATE_PIN = ROOT / "scripts" / "update-llama-pin.sh"
 BATTERY = ROOT / "scripts" / "skippy-family-battery.sh"
 BATTERY_PLANNER = ROOT / "scripts" / "plan-family-battery.py"
@@ -26,6 +27,73 @@ def _step_block(workflow: str, name: str) -> str:
     start = workflow.index(marker)
     end = workflow.find("\n      - name: ", start + len(marker))
     return workflow[start:] if end == -1 else workflow[start:end]
+
+
+class ParityCliInvocationTests(unittest.TestCase):
+    """Executable contract: the exact parity invocations the workflow and
+    repair wrapper use must parse (argparse rejects a global option placed
+    after the subcommand — seen live as exit 2)."""
+
+    def _temp_llama_src(self) -> tempfile.TemporaryDirectory:
+        # Hermetic: CI's quality job has no .deps/llama.cpp checkout. A minimal
+        # source tree with real boundary hooks is enough — argparse errors
+        # precede any source validation, so the global-first property under
+        # test is unchanged.
+        tmp = tempfile.TemporaryDirectory(prefix="parity-cli-src-")
+        models = Path(tmp.name) / "src" / "models"
+        models.mkdir(parents=True)
+        (models / "llama.cpp").write_text(
+            "void f() {\n"
+            "    begin_block(x, 0);\n"
+            "    end_block(y, 0);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self.addCleanup(tmp.cleanup)
+        return tmp
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(PARITY), *args],
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+            check=False,
+        )
+
+    def test_validate_global_llama_src_before_subcommand(self) -> None:
+        tmp = self._temp_llama_src()
+        result = self._run("--llama-src", tmp.name, "validate")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_next_boundary_target_global_llama_src_before_subcommand(self) -> None:
+        tmp = self._temp_llama_src()
+        result = self._run(
+            "--llama-src", tmp.name, "next-boundary-target", "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # Valid single-target JSON (or null), not an argparse usage error.
+        payload = json.loads(result.stdout.strip() or "null")
+        self.assertTrue(payload is None or "llama_model" in payload)
+
+    def test_workflow_and_wrapper_use_valid_invocations(self) -> None:
+        # The exact command strings embedded in the workflow and wrapper
+        # must be the valid global-first form, never the rejected
+        # subcommand-first form.
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        wrapper = (ROOT / "scripts" / "llama-canary-agent-repair.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "skippy-llama-parity.py --llama-src .deps/llama.cpp validate", workflow
+        )
+        self.assertNotIn("next-boundary-target", workflow)
+        self.assertIn(
+            "skippy-llama-parity.py --llama-src .deps/llama.cpp validate", wrapper
+        )
+        for text in (workflow, wrapper):
+            self.assertNotIn("validate --llama-src", text)
+            self.assertNotIn("--json --llama-src", text)
 
 
 class LlamaUpstreamCanaryWorkflowTests(unittest.TestCase):
@@ -67,6 +135,7 @@ class LlamaUpstreamCanaryWorkflowTests(unittest.TestCase):
         self.assertIn("--check-cache", family_plan)
         self.assertIn('--cache-root "$HF_CACHE"', family_plan)
         self.assertIn('--github-output "$GITHUB_OUTPUT"', family_plan)
+        self.assertNotIn("--families", family_plan)
         self.assertLess(workflow.index(family_plan), workflow.index(native_build))
 
         build = _step_block(workflow, "Build stage runtime crates")
@@ -77,7 +146,6 @@ class LlamaUpstreamCanaryWorkflowTests(unittest.TestCase):
             "skippy-correctness",
             "skippy-server",
             "skippy-model-package",
-            "llama-spec-bench",
         ):
             self.assertIn(f"-p {package}", build)
 
@@ -99,13 +167,14 @@ class LlamaUpstreamCanaryWorkflowTests(unittest.TestCase):
         self.assertIn("target/family-battery/", upload)
         self.assertIn("retention-days: 14", upload)
 
-        capture = _step_block(workflow, "Capture upstream SHAs")
-        self.assertIn('"$FORCE_CERTIFY" == "true"', capture)
-        self.assertIn('echo "certify=true"', capture)
-        self.assertIn('echo "cadence=manual-full"', capture)
-        self.assertIn('echo "cadence=llama-bump"', capture)
-        self.assertIn('"$GITHUB_EVENT_NAME" == "schedule"', capture)
-        self.assertIn('echo "cadence=nightly"', capture)
+        resolve = _step_block(workflow, "Resolve requested llama.cpp upstream")
+        self.assertIn('new_sha="$(git ls-remote', resolve)
+        self.assertIn('"$FORCE_CERTIFY" == "true"', resolve)
+        self.assertIn('echo "certify=true"', resolve)
+        self.assertIn('echo "cadence=manual-full"', resolve)
+        self.assertIn('echo "cadence=llama-bump"', resolve)
+        self.assertIn('"$GITHUB_EVENT_NAME" == "schedule"', resolve)
+        self.assertIn('echo "cadence=nightly"', resolve)
 
         forced_report = _step_block(workflow, "Report forced certification result")
         self.assertIn("steps.sha.outputs.cadence == 'manual-full'", forced_report)
@@ -116,26 +185,23 @@ class LlamaUpstreamCanaryWorkflowTests(unittest.TestCase):
 
     def test_persistent_runner_executes_only_trusted_main_with_read_access(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        latest_job = workflow[workflow.index("  latest-upstream:") : workflow.index("  update-pin:")]
-        update_job = workflow[workflow.index("  update-pin:") :]
-        self.assertIn("runs-on: [self-hosted, family-certify]", latest_job)
-        self.assertIn("permissions:\n      contents: read", latest_job)
-        self.assertIn("ref: main", latest_job)
+        self.assertIn("runs-on: [self-hosted, family-certify]", workflow)
+        self.assertIn("permissions:\n      contents: read", workflow)
+        self.assertIn("ref: main", workflow)
+        self.assertIn("fetch-depth: 1", workflow)
         self.assertNotIn("queue_ref", workflow)
-        self.assertNotIn("github.token", latest_job)
-        self.assertIn("runs-on: ubuntu-latest", update_job)
-        self.assertIn("permissions:\n      contents: write", update_job)
-        self.assertIn("trusted_queue_sha", update_job)
+        self.assertNotIn("github.token", workflow)
+        self.assertNotIn("contents: write", workflow)
 
-    def test_update_job_writes_the_single_upstream_pin(self) -> None:
+    def test_changed_pin_never_pushes_directly_to_main(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        update_step = _step_block(workflow, "Commit validated upstream pin to main")
-        self.assertIn('scripts/update-llama-pin.sh "$VALIDATED_SHA"', update_step)
-        self.assertIn(
-            "git add third_party/llama.cpp/upstream.txt",
-            update_step,
-        )
-        self.assertNotIn("LLAMA_CPP_SHA", update_step)
+        changed = _step_block(workflow, "Changed-pin prepare, build, certify, and publish")
+        self.assertIn("steps.sha.outputs.changed == 'true'", changed)
+        self.assertIn("scripts/llama-canary-agent-repair.sh", changed)
+        self.assertIn("CANARY_REPAIR_TOKEN:", changed)
+        self.assertIn("UPSTREAM_SHA_INPUT:", changed)
+        self.assertNotIn("update-pin:", workflow)
+        self.assertNotIn("HEAD:refs/heads/main", workflow)
 
     def test_update_pin_script_writes_pin_and_rejects_invalid_sha(self) -> None:
         updater = UPDATE_PIN.read_text(encoding="utf-8")
@@ -190,71 +256,54 @@ class LlamaUpstreamCanaryWorkflowTests(unittest.TestCase):
             self.assertEqual(0, prepared.returncode, prepared.stderr)
             self.assertEqual(prepared_target + "\n", pin.read_text(encoding="utf-8"))
 
-    def test_repair_loop_is_wired_for_both_failure_modes(self) -> None:
+    def test_changed_pin_uses_one_terminal_state_machine(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        queue_repair = _step_block(workflow, "Agent repair loop (patch-queue failure)")
-        self.assertIn("steps.prepare.outcome == 'failure'", queue_repair)
-        self.assertIn("scripts/llama-canary-agent-repair.sh patch-queue", queue_repair)
-        # The repair loop must not silently turn the canary green.
-        self.assertIn("continue-on-error: true", queue_repair)
+        duplicate = _step_block(workflow, "Detect existing changed-pin canary PR")
+        self.assertIn("github.event_name == 'schedule'", duplicate)
+        self.assertIn("$CANDIDATE_SHA in:body", duplicate)
+        self.assertIn('startswith("llama-canary/repair-")', duplicate)
+        self.assertIn('contains("- Candidate pin: `\\($sha)`")', duplicate)
+        self.assertIn('echo "found=true"', duplicate)
 
-        battery_repair = _step_block(workflow, "Agent repair loop (battery failure)")
-        self.assertIn("steps.prepare.outcome == 'success'", battery_repair)
-        self.assertIn("steps.battery.outcome == 'failure'", battery_repair)
-        self.assertIn("steps.sha.outputs.cadence != 'nightly'", battery_repair)
-        self.assertIn("scripts/llama-canary-agent-repair.sh battery", battery_repair)
-        self.assertIn("continue-on-error: true", battery_repair)
+        changed = _step_block(
+            workflow, "Changed-pin prepare, build, certify, and publish"
+        )
+        self.assertIn("steps.sha.outputs.changed == 'true'", changed)
+        self.assertIn("steps.existing_changed_pin.outputs.found != 'true'", changed)
+        self.assertIn("timeout-minutes: 720", changed)
+        self.assertIn("continue-on-error: true", changed)
+        self.assertIn("CANARY_REPAIR_BUDGET_SECONDS: \"41400\"", changed)
+        self.assertIn("CANARY_PUBLISH_RESERVE_SECONDS: \"1800\"", changed)
+        self.assertIn("CANARY_REPAIR_TOKEN:", changed)
+        self.assertIn("UPSTREAM_SHA_INPUT:", changed)
+        self.assertIn("scripts/llama-canary-agent-repair.sh", changed)
+        self.assertNotIn("patch-queue", changed)
+        self.assertNotIn(" battery", changed)
 
-        # Any repair outcome keeps the run red: the certified fix must merge
-        # through the repair PR before trusted main can certify.
-        fail_step = _step_block(workflow, "Fail when the canary needs human attention")
-        self.assertIn("steps.repair_queue.outcome", fail_step)
-        self.assertIn("steps.repair_battery.outcome", fail_step)
-        self.assertIn("CANARY_CADENCE:", fail_step)
-        self.assertIn('[[ "$CANARY_CADENCE" == "nightly" ]]', fail_step)
-        self.assertIn("repair agent was intentionally not invoked", fail_step)
-        self.assertIn("exit 1", fail_step)
+        stop = _step_block(workflow, "Stop after changed-pin terminal PR")
+        self.assertIn("steps.sha.outputs.changed == 'true'", stop)
+        self.assertIn("!cancelled()", stop)
+        self.assertNotIn("always()", stop)
+        self.assertIn("exit 1", stop)
+        self.assertIn("EXISTING_CANARY_FOUND", stop)
+        self.assertIn("Skipped duplicate scheduled certification", stop)
+        self.assertIn("duplicate-PR lookup failed", stop)
+        self.assertIn("A preflight failure can stop before any branch or PR", stop)
 
-        # The battery lane itself no longer hard-fails the job before the
-        # repair loop can run.
-        battery = _step_block(workflow, "Supported-families certification battery (parity gate)")
-        self.assertIn("continue-on-error: true", battery)
+        upload = _step_block(workflow, "Upload changed-pin canary evidence")
+        self.assertIn("llama-canary-state-${{ github.run_id }}-${{ github.run_attempt }}", upload)
+        self.assertIn("llama-canary-changed-pin-${{ github.run_id }}-${{ github.run_attempt }}", upload)
+        self.assertNotIn("name: llama-family-battery-", upload)
+        self.assertIn("retention-days: 14", upload)
 
-        # Both repair paths use the dedicated token, never the job token.
-        self.assertNotIn("github.token", workflow[workflow.index("  latest-upstream:") : workflow.index("  update-pin:")])
-
-        # Untrusted dispatch SHAs reach Bash only as environment variables.
-        for repair_step in (queue_repair, battery_repair):
-            self.assertIn("UPSTREAM_SHA_INPUT:", repair_step)
-            self.assertIn("CANARY_REPAIR_TOKEN:", repair_step)
-            # Extract the run: command body (everything after "run: |" or "run:")
-            # to ensure inline interpolation checks only inspect shell commands,
-            # not the env: mapping where ${{ }} is safe and intended.
-            run_marker = repair_step.find("\n        run:")
-            self.assertNotEqual(-1, run_marker, "repair step must have a run: key")
-            run_body = repair_step[run_marker + len("\n        run:"):]
-            self.assertNotIn("github.event.inputs", run_body)
-            self.assertNotIn("steps.sha.outputs", run_body)
-
-        # The workflow's battery step tees its evidence log so a battery-mode
-        # repair turn reuses it instead of re-running the battery.
-        self.assertIn("tee .deps/llama-canary-repair-battery.log", battery)
-
-    def test_post_green_agent_review_is_wired_and_opt_out(self) -> None:
+    def test_post_green_modifying_review_is_removed(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        # After a certified repair, the wrapper runs one fresh-context review
-        # turn that may modify the repair (a separate review(llama): commit).
-        # Both repair steps pass the opt-out var with the same vars-pattern
-        # as CANARY_AGENT_MODEL, defaulting to enabled.
-        for repair_step in (
-            _step_block(workflow, "Agent repair loop (patch-queue failure)"),
-            _step_block(workflow, "Agent repair loop (battery failure)"),
-        ):
-            self.assertIn("CANARY_AGENT_REVIEW:", repair_step)
-            self.assertIn(
-                "CANARY_AGENT_REVIEW: ${{ vars.LLAMA_CANARY_AGENT_REVIEW || 'true' }}",
-                repair_step,
-            )
+        wrapper = (ROOT / "scripts" / "llama-canary-agent-repair.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("CANARY_AGENT_REVIEW", workflow)
+        self.assertNotIn("post_green", wrapper)
+        self.assertNotIn("post-green", wrapper)
 
     def test_family_results_have_typed_failure_outcomes(self) -> None:
         certify = FAMILY_CERTIFY.read_text(encoding="utf-8")
@@ -495,14 +544,17 @@ class SkippyFamilyBatteryTests(unittest.TestCase):
             for line in result.stdout.splitlines()
             if line.startswith(str(FAMILY_CERTIFY) + " ")
         ]
-        self.assertEqual(1, len(commands))
-        self.assertTrue(
-            commands[0]
-            .strip()
-            .endswith(
-                "--require-lanes --skip-build --skip-speculative"
-            )
+        self.assertEqual(3, len(commands))
+        self.assertEqual(
+            ["3", "1", "5"],
+            [command.split("--split-layer ", 1)[1].split()[0] for command in commands],
         )
+        for command in commands:
+            self.assertTrue(
+                command.strip().endswith(
+                    "--require-lanes --skip-build --skip-speculative"
+                )
+            )
 
     def test_family_battery_has_no_activation_wire_dtype_switches(self) -> None:
         script = BATTERY.read_text(encoding="utf-8")
@@ -522,9 +574,9 @@ class SkippyFamilyBatteryTests(unittest.TestCase):
             for line in result.stdout.splitlines()
             if line.startswith(str(FAMILY_CERTIFY) + " ")
         ]
-        self.assertEqual(2, len(commands))
+        self.assertEqual(6, len(commands))
         self.assertIn("--family test-family", commands[0])
-        self.assertIn("--family second-family", commands[1])
+        self.assertIn("--family second-family", commands[3])
 
     def test_family_filter_limits_the_resolved_dry_run(self) -> None:
         selected = self._dry_run("--families", "test-family")
@@ -567,7 +619,7 @@ class SkippyFamilyBatteryTests(unittest.TestCase):
         self.assertIn("SKIPPY_MM_PROJECTOR=", smokes[0])
         self.assertIn("frontend::tests::multimodal", smokes[0])
         self.assertIn("--test-threads=1", smokes[0])
-        self.assertIn("family battery complete: 1/1", with_mmproj.stdout)
+        self.assertIn("family battery complete: 3/3", with_mmproj.stdout)
 
     def test_mmproj_failure_is_accounted_separately_from_core_certification(self) -> None:
         script = BATTERY.read_text(encoding="utf-8")
@@ -593,7 +645,7 @@ class SkippyFamilyBatteryTests(unittest.TestCase):
             digest,
         )
 
-    def test_preflight_pins_snapshot_and_limits_speculative_corpus_to_mtp(self) -> None:
+    def test_preflight_pins_snapshot_and_records_native_mtp_models(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             revision = "a" * 40
@@ -654,17 +706,7 @@ class SkippyFamilyBatteryTests(unittest.TestCase):
                 f"#!/bin/sh\nprintf '%s\\n' '{complete_scan}'\n",
                 encoding="utf-8",
             )
-            spec = bin_dir / "llama-spec-bench"
-            spec.write_text(
-                "#!/bin/sh\n"
-                "while [ \"$#\" -gt 0 ]; do\n"
-                "  if [ \"$1\" = --json-out ]; then printf '{}\\n' > \"$2\"; exit 0; fi\n"
-                "  shift\n"
-                "done\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
-            for name in ("hf", "skippy-model-package", "llama-spec-bench"):
+            for name in ("hf", "skippy-model-package"):
                 path = bin_dir / name
                 path.chmod(path.stat().st_mode | stat.S_IXUSR)
             for name in ("skippy-correctness", "skippy-server"):
@@ -728,9 +770,13 @@ class SkippyFamilyBatteryTests(unittest.TestCase):
             resolved = (run_dir / "resolved-models.tsv").read_text(encoding="utf-8")
             self.assertIn(revision, resolved)
             self.assertIn("|1|1024|5|", resolved)
-            mtp_corpus = (run_dir / "mtp-corpus.tsv").read_text(encoding="utf-8")
-            self.assertIn("mtp-family", mtp_corpus)
-            self.assertTrue((run_dir / "preflight" / "speculative-smoke.json").is_file())
+            native_mtp_models = (run_dir / "native-mtp-models.tsv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("mtp-family", native_mtp_models)
+            self.assertFalse(
+                (run_dir / "preflight" / "speculative-smoke.json").exists()
+            )
 
             incomplete_tensors = complete_tensors[:5] + [complete_tensors[5]]
             incomplete_scan = json.dumps(
@@ -759,7 +805,7 @@ class SkippyFamilyBatteryTests(unittest.TestCase):
             )
             self.assertEqual(1, incomplete.returncode)
             incomplete_run = next(incomplete_artifacts.iterdir())
-            incomplete_corpus = (incomplete_run / "mtp-corpus.tsv").read_text(
+            incomplete_corpus = (incomplete_run / "native-mtp-models.tsv").read_text(
                 encoding="utf-8"
             )
             self.assertEqual(
@@ -769,6 +815,14 @@ class SkippyFamilyBatteryTests(unittest.TestCase):
             self.assertFalse(
                 (incomplete_run / "preflight" / "speculative-smoke.json").exists()
             )
+
+    def test_native_mtp_uses_one_target_model_and_correctness_sidebands(self) -> None:
+        script = BATTERY.read_text(encoding="utf-8")
+
+        self.assertIn("--require-native-mtp-draft", script)
+        self.assertIn("--skip-speculative", script)
+        self.assertNotIn("--draft-model", script)
+        self.assertNotIn("llama-spec-bench", script)
 
 
 if __name__ == "__main__":

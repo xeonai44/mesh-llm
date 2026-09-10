@@ -4,10 +4,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{
-    SkippyPackageIdentity, SkippyPackageSourceFile, SyntheticIdentityMode, hex_lower,
-    synthetic_gguf_package,
-};
+use super::{SkippyPackageIdentity, SkippyPackageSourceFile, hex_lower, synthetic_gguf_package};
 
 #[derive(Serialize)]
 struct ContentAddressedGgufManifest<'a> {
@@ -40,11 +37,7 @@ pub fn synthetic_content_addressed_gguf_package(
     model_id: &str,
     model_path: &Path,
 ) -> Result<SkippyPackageIdentity> {
-    synthetic_gguf_package(
-        model_id,
-        model_path,
-        SyntheticIdentityMode::ContentAddressed,
-    )
+    synthetic_gguf_package(model_id, model_path)
 }
 
 pub(super) fn validate_source_set(model_path: &Path) -> Result<()> {
@@ -311,6 +304,25 @@ mod tests {
         .to_string();
 
         assert!(error.contains("must be absolute"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_rejects_user_supplied_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model-target.gguf");
+        let link = dir.path().join("model.gguf");
+        write_test_metadata_gguf(&target, 4096);
+        symlink(&target, &link).unwrap();
+
+        let error = synthetic_content_addressed_gguf_package("logical/model", &link)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("non-symlink file"));
+        assert!(error.contains("model.gguf"));
     }
 
     #[cfg(unix)]

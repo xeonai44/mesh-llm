@@ -171,6 +171,39 @@ fn write_hf_artifact_stream_package(
     )
 }
 
+fn write_hf_package_v2_artifact_stream_package(
+    root: &std::path::Path,
+) -> (std::path::PathBuf, String, String, String) {
+    let package_dir = root
+        .join("models--meshllm--stream-package-v2")
+        .join("snapshots")
+        .join("abc123");
+    let manifest = crate::inference::skippy::write_test_package_v2_fixture(
+        &package_dir,
+        "meshllm/stream-package-v2",
+        &[
+            ("primary", "artifacts/primary.gguf", "input.weight"),
+            (
+                "resident",
+                "artifacts/resident.gguf",
+                "resident-tensor",
+            ),
+            ("unowned", "artifacts/unowned.gguf", "unowned-tensor"),
+        ],
+    )
+    .unwrap();
+    let package_id = manifest.package_id.clone();
+    let manifest_bytes = std::fs::read(package_dir.join("model-package.json")).unwrap();
+    let manifest_sha = sha256_hex(&manifest_bytes);
+
+    (
+        package_dir,
+        "hf://meshllm/stream-package-v2@abc123".to_string(),
+        manifest_sha,
+        package_id,
+    )
+}
+
 fn verified_owner_summary(owner_id: &str) -> OwnershipSummary {
     OwnershipSummary {
         owner_id: Some(owner_id.to_string()),
