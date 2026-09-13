@@ -1,10 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fs::{File, OpenOptions};
 use std::io::{LineWriter, Write};
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(unix)]
@@ -26,7 +26,59 @@ static NATIVE_LOG_FILTERED_TX: OnceLock<Mutex<Option<mpsc::UnboundedSender<Nativ
     OnceLock::new();
 
 static NATIVE_LOG_AGGREGATOR: OnceLock<Mutex<NativeLogAggregator>> = OnceLock::new();
-static NATIVE_LOG_FORWARDING_ENABLED: AtomicBool = AtomicBool::new(false);
+static NATIVE_LOG_FORWARDING_MASK: AtomicU8 = AtomicU8::new(0);
+
+const BACKEND_CATEGORY: u8 = 1 << 0;
+const MODEL_CATEGORY: u8 = 1 << 1;
+const MEMORY_CATEGORY: u8 = 1 << 2;
+const KV_CACHE_CATEGORY: u8 = 1 << 3;
+const TOKENIZER_CATEGORY: u8 = 1 << 4;
+const ALL_PRESENTATION_CATEGORIES: u8 =
+    BACKEND_CATEGORY | MODEL_CATEGORY | MEMORY_CATEGORY | KV_CACHE_CATEGORY | TOKENIZER_CATEGORY;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeLogParserMode {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeLogParserPolicy {
+    forwarding_mask: u8,
+}
+
+impl NativeLogParserPolicy {
+    pub fn new(mode: NativeLogParserMode, _capabilities: &crate::CapabilityReport) -> Self {
+        let forwarding_mask = match mode {
+            NativeLogParserMode::Enabled => ALL_PRESENTATION_CATEGORIES,
+            NativeLogParserMode::Disabled => 0,
+            // A bit, a callable symbol, or one observed event proves only
+            // that one native path is observable. It does not prove that
+            // every category in a family has a production transition. Keep
+            // fallback enabled in Auto; callers may explicitly choose
+            // Disabled only after they have a complete, version-specific
+            // coverage proof.
+            NativeLogParserMode::Auto => ALL_PRESENTATION_CATEGORIES,
+        };
+        Self { forwarding_mask }
+    }
+
+    pub fn forwards(self, category: &str) -> bool {
+        category_mask(category).is_some_and(|mask| self.forwarding_mask & mask != 0)
+    }
+}
+
+fn category_mask(category: &str) -> Option<u8> {
+    match category {
+        "backend" => Some(BACKEND_CATEGORY),
+        "model" => Some(MODEL_CATEGORY),
+        "memory" => Some(MEMORY_CATEGORY),
+        "kv_cache" => Some(KV_CACHE_CATEGORY),
+        "tokenizer" => Some(TOKENIZER_CATEGORY),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 static NATIVE_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -185,6 +237,8 @@ struct NativeLogAggregator {
     metadata_progress: ProgressTracker,
     tensor_progress: ProgressTracker,
     layer_assign_progress: ProgressTracker,
+    layer_devices: BTreeMap<usize, String>,
+    layer_devices_emitted: bool,
     kv_cache_progress: ProgressTracker,
     metadata_in_dump: bool,
     metadata_summary_emitted: bool,
@@ -227,7 +281,16 @@ pub fn unregister_filtered_native_logs() {
 }
 
 pub fn set_filtered_native_logs_enabled(enabled: bool) {
-    NATIVE_LOG_FORWARDING_ENABLED.store(enabled, Ordering::Relaxed);
+    let mask = if enabled {
+        ALL_PRESENTATION_CATEGORIES
+    } else {
+        0
+    };
+    NATIVE_LOG_FORWARDING_MASK.store(mask, Ordering::Relaxed);
+}
+
+pub fn configure_native_log_parser(policy: NativeLogParserPolicy) {
+    NATIVE_LOG_FORWARDING_MASK.store(policy.forwarding_mask, Ordering::Relaxed);
 }
 
 impl NativeLogAggregator {
@@ -239,6 +302,8 @@ impl NativeLogAggregator {
         self.metadata_progress.reset();
         self.tensor_progress.reset();
         self.layer_assign_progress.reset();
+        self.layer_devices.clear();
+        self.layer_devices_emitted = false;
         self.kv_cache_progress.reset();
         self.metadata_in_dump = false;
         self.metadata_summary_emitted = false;
@@ -257,11 +322,15 @@ impl NativeLogAggregator {
         let mut events = Vec::new();
         let metadata_kv = parse_metadata_kv_line(s);
         let tensor_summary = parse_tensor_type_summary(s);
+        let layer_assignment = parse_layer_assignment(s);
         if metadata_kv.is_none() {
             events.extend(self.flush_metadata_summary());
         }
         if tensor_summary.is_none() {
             events.extend(self.flush_tensor_group_summary());
+        }
+        if layer_assignment.is_none() {
+            events.extend(self.flush_layer_device_summary());
         }
 
         if let Some((metadata_rows, tensor_rows)) = parse_loaded_metadata_counts(s) {
@@ -321,24 +390,8 @@ impl NativeLogAggregator {
             return events;
         }
 
-        if let Some(layer_index) = parse_layer_assign_index(s) {
-            if self.layer_assign_progress.total.is_none()
-                && let Some(total) = self
-                    .metadata_highlights
-                    .block_count
-                    .as_deref()
-                    .and_then(|s| s.parse::<usize>().ok())
-            {
-                self.layer_assign_progress.set_total(total);
-            }
-            let new_completed = layer_index + 1;
-            if new_completed > self.layer_assign_progress.completed {
-                let delta = new_completed - self.layer_assign_progress.completed;
-                events.extend(
-                    self.layer_assign_progress
-                        .advance(delta, "model", "layers", "layers"),
-                );
-            }
+        if let Some((layer_index, device)) = layer_assignment {
+            events.extend(self.record_layer_assignment(layer_index, device));
             return events;
         }
 
@@ -351,6 +404,45 @@ impl NativeLogAggregator {
         }
 
         events
+    }
+
+    fn record_layer_assignment(&mut self, layer_index: usize, device: &str) -> Vec<NativeLogEvent> {
+        if self.layer_devices.get(&layer_index).map(String::as_str) != Some(device) {
+            self.layer_devices.insert(layer_index, device.to_string());
+            self.layer_devices_emitted = false;
+        }
+        if self.layer_assign_progress.total.is_none()
+            && let Some(total) = self
+                .metadata_highlights
+                .block_count
+                .as_deref()
+                .and_then(|s| s.parse::<usize>().ok())
+        {
+            self.layer_assign_progress.set_total(total);
+        }
+        let new_completed = layer_index.saturating_add(1);
+        let delta = new_completed.saturating_sub(self.layer_assign_progress.completed);
+        self.layer_assign_progress
+            .advance(delta, "model", "layers", "layers")
+    }
+
+    fn flush_layer_device_summary(&mut self) -> Vec<NativeLogEvent> {
+        if self.layer_devices.is_empty() || self.layer_devices_emitted {
+            return Vec::new();
+        }
+        self.layer_devices_emitted = true;
+        let mut counts = BTreeMap::new();
+        for device in self.layer_devices.values() {
+            *counts.entry(device.as_str()).or_insert(0_u64) += 1;
+        }
+        vec![NativeLogEvent {
+            message: "Model layers by device".to_string(),
+            category: "model",
+            params: counts
+                .into_iter()
+                .map(|(device, count)| (device.to_string(), Value::from(count)))
+                .collect(),
+        }]
     }
 
     fn flush_metadata_summary(&mut self) -> Vec<NativeLogEvent> {
@@ -475,7 +567,7 @@ fn summarize_native_log_line(line: &str) -> Option<NativeLogEvent> {
     if line.contains("VRAM")
         || line.contains("vram")
         || line.contains("mem_alloc")
-        || line.contains("_Mapped model buffer size")
+        || line.contains("model buffer size")
         || (line.contains("GPU") && line.contains("memory"))
         || line.contains("compute buffer size")
         || line.contains("scratch buffer")
@@ -569,17 +661,12 @@ fn parse_tensor_type_summary(line: &str) -> Option<(&str, usize)> {
     Some((tensor_type.trim(), count))
 }
 
-fn parse_layer_assign_index(line: &str) -> Option<usize> {
-    if !line.starts_with("load_tensors: layer") || !line.contains("assigned to device") {
-        return None;
-    }
-    let (_, remainder) = line.split_once("load_tensors: layer")?;
-    let digits = remainder
-        .trim_start()
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+fn parse_layer_assignment(line: &str) -> Option<(usize, &str)> {
+    let remainder = line.strip_prefix("load_tensors: layer")?;
+    let (index, device) = remainder.split_once("assigned to device")?;
+    let index = index.trim().parse().ok()?;
+    let device = device.split(',').next()?.trim();
+    (!device.is_empty()).then_some((index, device))
 }
 
 fn parse_kv_cache_layers_total(line: &str) -> Option<usize> {
@@ -636,7 +723,8 @@ pub fn write_native_log_note(note: impl AsRef<str>) {
 }
 
 fn forward_native_log_note(note: String) {
-    if !NATIVE_LOG_FORWARDING_ENABLED.load(Ordering::Relaxed) {
+    let forwarding_mask = NATIVE_LOG_FORWARDING_MASK.load(Ordering::Relaxed);
+    if forwarding_mask & MODEL_CATEGORY == 0 {
         return;
     }
     let event = NativeLogEvent {
@@ -734,7 +822,8 @@ unsafe extern "C" fn write_native_log(_level: c_int, text: *const c_char, _user_
     }
 
     // Also send aggregated messages through the channel when runtime forwarding is enabled.
-    if !NATIVE_LOG_FORWARDING_ENABLED.load(Ordering::Relaxed) {
+    let forwarding_mask = NATIVE_LOG_FORWARDING_MASK.load(Ordering::Relaxed);
+    if forwarding_mask == 0 {
         return;
     }
 
@@ -748,7 +837,9 @@ unsafe extern "C" fn write_native_log(_level: c_int, text: *const c_char, _user_
             && let Some(ref sender) = *guard
         {
             for event in events {
-                let _ = sender.send(event);
+                if category_mask(event.category).is_some_and(|mask| forwarding_mask & mask != 0) {
+                    let _ = sender.send(event);
+                }
             }
         }
     }
@@ -764,6 +855,7 @@ unsafe extern "C" fn discard_native_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skippy_ffi::{FEATURE_DEVICE_EVENTS, FEATURE_KV_EVENTS, FEATURE_MODEL_LOAD_EVENTS_V2};
     use std::{
         env,
         ffi::CString,
@@ -774,6 +866,112 @@ mod tests {
         },
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn parser_mode_runtime_events_keeps_auto_fallback_until_coverage() {
+        let report = crate::CapabilityReport {
+            confirmed: FEATURE_DEVICE_EVENTS | FEATURE_KV_EVENTS,
+            health_messages: Vec::new(),
+        };
+        let policy = NativeLogParserPolicy::new(NativeLogParserMode::Auto, &report);
+
+        assert!(policy.forwards("backend"));
+        assert!(policy.forwards("model"));
+        assert!(policy.forwards("memory"));
+        assert!(policy.forwards("kv_cache"));
+        assert!(policy.forwards("tokenizer"));
+    }
+
+    #[test]
+    fn parser_mode_runtime_events_keeps_model_fallback_until_coverage() {
+        let report = crate::CapabilityReport {
+            confirmed: FEATURE_MODEL_LOAD_EVENTS_V2,
+            health_messages: Vec::new(),
+        };
+        let policy = NativeLogParserPolicy::new(NativeLogParserMode::Auto, &report);
+
+        assert!(policy.forwards("model"));
+        assert!(policy.forwards("memory"));
+        assert!(policy.forwards("tokenizer"));
+        assert!(policy.forwards("backend"));
+        assert!(policy.forwards("kv_cache"));
+    }
+
+    #[test]
+    fn auto_parser_retains_fallback_when_one_family_is_observable() {
+        let _native_log_guard = native_log_test_guard();
+        let report = crate::CapabilityReport {
+            confirmed: FEATURE_DEVICE_EVENTS | FEATURE_KV_EVENTS,
+            health_messages: Vec::new(),
+        };
+        configure_native_log_parser(NativeLogParserPolicy::new(
+            NativeLogParserMode::Auto,
+            &report,
+        ));
+        // Capability bits and a live event from one family do not prove
+        // coverage for the other transitions in that family. Auto therefore
+        // keeps every parser fallback available until a version-specific
+        // complete coverage policy exists.
+        let mask = NATIVE_LOG_FORWARDING_MASK.load(Ordering::Relaxed);
+        assert_ne!(mask & BACKEND_CATEGORY, 0);
+        assert_ne!(mask & MODEL_CATEGORY, 0);
+        assert_ne!(mask & MEMORY_CATEGORY, 0);
+        assert_ne!(mask & KV_CACHE_CATEGORY, 0);
+        assert_ne!(mask & TOKENIZER_CATEGORY, 0);
+        configure_native_log_parser(NativeLogParserPolicy::new(
+            NativeLogParserMode::Disabled,
+            &crate::CapabilityReport::default(),
+        ));
+    }
+
+    #[test]
+    fn parser_mode_runtime_events_enabled_and_disabled_ignore_capabilities() {
+        let report = crate::CapabilityReport {
+            confirmed: u64::MAX,
+            health_messages: Vec::new(),
+        };
+
+        for category in ["backend", "model", "memory", "kv_cache", "tokenizer"] {
+            assert!(
+                NativeLogParserPolicy::new(NativeLogParserMode::Enabled, &report)
+                    .forwards(category)
+            );
+            assert!(
+                !NativeLogParserPolicy::new(NativeLogParserMode::Disabled, &report)
+                    .forwards(category)
+            );
+        }
+    }
+
+    #[test]
+    fn native_log_note_obeys_the_model_category_mask() {
+        let _native_log_guard = native_log_test_guard();
+        let mut receiver = register_filtered_native_logs();
+        struct RestoreForwardingMask(u8);
+
+        impl Drop for RestoreForwardingMask {
+            fn drop(&mut self) {
+                NATIVE_LOG_FORWARDING_MASK.store(self.0, Ordering::Relaxed);
+            }
+        }
+
+        let _mask_guard = RestoreForwardingMask(
+            NATIVE_LOG_FORWARDING_MASK.swap(BACKEND_CATEGORY, Ordering::Relaxed),
+        );
+        write_native_log_note("hidden model note despite backend forwarding");
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+
+        NATIVE_LOG_FORWARDING_MASK.store(MODEL_CATEGORY, Ordering::Relaxed);
+        write_native_log_note("visible model note");
+        let event = receiver
+            .try_recv()
+            .expect("enabled model note should forward");
+        assert_eq!(event.category, "model");
+        assert!(event.message.contains("visible model note"));
+
+        unregister_filtered_native_logs();
+    }
+
     use tokio::sync::mpsc::error::TryRecvError;
 
     mod native_log {
@@ -1062,6 +1260,96 @@ mod tests {
     }
 
     #[test]
+    fn aggregator_preserves_model_buffers_for_all_devices() {
+        let mut aggregator = NativeLogAggregator::default();
+        for device in ["CUDA0", "CUDA1", "Metal", "ROCm0", "Vulkan0", "CPU_Mapped"] {
+            let line = format!("load_tensors: {device} model buffer size = 4321.00 MiB");
+            let events = aggregator.process_line(&line);
+            assert_eq!(events.len(), 1, "missing buffer for {device}");
+            assert_eq!(events[0].message, line);
+            assert_eq!(events[0].category, "memory");
+        }
+    }
+
+    #[test]
+    fn aggregator_summarizes_unique_layer_assignments_including_output_layer() {
+        let mut aggregator = NativeLogAggregator::default();
+        aggregator.process_line("llama_model_loader: - kv 0: qwen35.block_count u32 = 4");
+        for (layer, device) in [
+            (0, "CUDA0"),
+            (1, "CPU"),
+            (2, "CUDA0"),
+            (2, "CUDA0"),
+            (3, "CUDA1"),
+            (4, "CPU"),
+        ] {
+            let events = aggregator.process_line(&format!(
+                "load_tensors: layer {layer} assigned to device {device}, is_swa = 0"
+            ));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.message != "Model layers by device")
+            );
+        }
+
+        assert_eq!(
+            aggregator.process_line("load_tensors: finished"),
+            vec![NativeLogEvent {
+                message: "Model layers by device".to_string(),
+                category: "model",
+                params: vec![
+                    ("CPU".to_string(), Value::from(2_u64)),
+                    ("CUDA0".to_string(), Value::from(2_u64)),
+                    ("CUDA1".to_string(), Value::from(1_u64)),
+                ],
+            }]
+        );
+        assert!(aggregator.process_line("load_tensors: finished").is_empty());
+    }
+
+    #[test]
+    fn aggregator_emits_only_changed_layer_device_counts() {
+        let mut aggregator = NativeLogAggregator::default();
+        aggregator.process_line("load_tensors: layer 0 assigned to device CUDA0");
+        assert_eq!(aggregator.process_line("load_tensors: finished").len(), 1);
+        aggregator.process_line("load_tensors: layer 0 assigned to device CUDA0");
+        assert!(aggregator.process_line("load_tensors: finished").is_empty());
+
+        aggregator.process_line("load_tensors: layer 0 assigned to device CPU");
+        assert_eq!(
+            aggregator.process_line("load_tensors: finished"),
+            vec![NativeLogEvent {
+                message: "Model layers by device".to_string(),
+                category: "model",
+                params: vec![("CPU".to_string(), Value::from(1_u64))],
+            }]
+        );
+    }
+
+    #[test]
+    fn aggregator_resets_layer_devices_for_each_model() {
+        let mut aggregator = NativeLogAggregator::default();
+        aggregator.process_line("load_tensors: layer 0 assigned to device CUDA0");
+        let next_model = aggregator.process_line(
+            "llama_model_loader: loaded meta data with 1 key-value pairs and 1 tensors from next.gguf (version GGUF V3)",
+        );
+        assert!(next_model.iter().any(|event| {
+            event.message == "Model layers by device"
+                && event.params == vec![("CUDA0".to_string(), Value::from(1_u64))]
+        }));
+        aggregator.process_line("load_tensors: layer 0 assigned to device Metal");
+        assert_eq!(
+            aggregator.process_line("load_tensors: finished"),
+            vec![NativeLogEvent {
+                message: "Model layers by device".to_string(),
+                category: "model",
+                params: vec![("Metal".to_string(), Value::from(1_u64))],
+            }]
+        );
+    }
+
+    #[test]
     fn aggregator_tags_cpu_offload_evidence_without_capacity_facts() {
         let mut aggregator = NativeLogAggregator::default();
         let model_buffer =
@@ -1225,25 +1513,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_layer_assign_index_extracts_layer_number() {
+    fn parse_layer_assignment_extracts_layer_and_device() {
         assert_eq!(
-            parse_layer_assign_index("load_tensors: layer   0 assigned to device CUDA0"),
-            Some(0)
+            parse_layer_assignment("load_tensors: layer   0 assigned to device CUDA0"),
+            Some((0, "CUDA0"))
         );
         assert_eq!(
-            parse_layer_assign_index("load_tensors: layer  63 assigned to device CUDA0"),
-            Some(63)
+            parse_layer_assignment("load_tensors: layer  63 assigned to device CUDA0, is_swa = 0"),
+            Some((63, "CUDA0"))
         );
         assert_eq!(
-            parse_layer_assign_index("load_tensors: layer   5 assigned to device CPU"),
-            Some(5)
+            parse_layer_assignment("load_tensors: layer   5 assigned to device CPU, is_swa = 1"),
+            Some((5, "CPU"))
         );
         assert_eq!(
-            parse_layer_assign_index("llm_load_tensors: offloaded 64/65 layers"),
+            parse_layer_assignment("llm_load_tensors: offloaded 64/65 layers"),
             None
         );
         assert_eq!(
-            parse_layer_assign_index("load_tensors: layer   0 computation graph"),
+            parse_layer_assignment("load_tensors: layer   0 computation graph"),
+            None
+        );
+        assert_eq!(
+            parse_layer_assignment("load_tensors: layer x assigned to device CUDA0"),
+            None
+        );
+        assert_eq!(
+            parse_layer_assignment("load_tensors: layer 0 assigned to device , is_swa = 0"),
             None
         );
     }

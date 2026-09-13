@@ -2,7 +2,7 @@
   "schema_version": 1,
   "manifest_kind": "test-model-artifacts",
   "suite": "skippy-ci-smoke",
-  "registry_sha256": "bea620d33fcefe91bcadb2de42084e78a7d525b163193f3f6816045f556c0eac",
+  "registry_sha256": "dcdc8545709e3d3578ad00ca773b9a9b0dcfae9558155a9014230bcf0e575b1f",
   "artifacts": [
     {
       "id": "family-qwen3-dense",
@@ -20,7 +20,9 @@
         "llama-bump",
         "manual-full",
         "nightly",
-        "manual"
+        "manual",
+        "pull-request",
+        "main"
       ],
       "repo": "Qwen/Qwen3-0.6B-GGUF",
       "revision": "23749fefcc72300e3a2ad315e1317431b06b590a",

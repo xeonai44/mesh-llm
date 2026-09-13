@@ -6,6 +6,7 @@ mod recovery;
 mod test_support;
 #[cfg(test)]
 mod tests;
+mod topology_events;
 
 use super::capacity::model_fits_runtime_capacity;
 use super::local::{
@@ -316,6 +317,7 @@ pub(super) async fn start_runtime_split_model(
         survey_telemetry: spec.survey_telemetry.clone(),
         event_tx: coordinator_tx,
         stage_loss_first_seen: None,
+        previously_unavailable_stage_nodes: Vec::new(),
         topology_locked,
         local_source_required,
         health_interval: loading::configured_stage_lifecycle_intervals(
@@ -542,7 +544,7 @@ fn realize_split_stage_admissions(
     } else {
         anyhow::ensure!(
             model_path.is_file(),
-            "generation-8 direct-GGUF split source must be a local file: {}",
+            "generation-9 direct-GGUF split source must be a local file: {}",
             model_path.display()
         );
         super::stage_admission::realize_direct_gguf_stage_admissions(
@@ -554,7 +556,7 @@ fn realize_split_stage_admissions(
             "skippy-backend:auto:v1",
         )
     }
-    .context("realize and admit generation-8 native stage chain")
+    .context("realize and admit generation-9 native stage chain")
 }
 
 async fn elect_split_start_coordinator(
