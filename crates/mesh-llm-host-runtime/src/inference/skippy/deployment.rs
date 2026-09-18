@@ -70,6 +70,7 @@ pub(crate) fn remote_stage_load_request(
         model_path: Some(context.package.package_ref.clone()),
         source_model_bytes: context.package.source_model_bytes,
         source_model_sha256: Some(context.package.source_model_sha256.clone()),
+        split_certification: None,
         local_source_required: false,
         projector_path: None,
         projector_use_gpu: None,
@@ -111,6 +112,11 @@ pub(crate) fn stage0_config(
     downstream_endpoint: String,
     selected_device: Option<StageDevice>,
 ) -> StageConfig {
+    let frontier_profile = context
+        .admission
+        .profiles
+        .first()
+        .expect("validated stage admission has at least one execution profile");
     let mut config = StageConfig {
         run_id: context.run_id.to_string(),
         topology_id: context.topology_id.to_string(),
@@ -164,6 +170,10 @@ pub(crate) fn stage0_config(
         cache_idle_slots: context.runtime_settings.cache_idle_slots,
         filter_tensors_on_load: true,
         resident_tensor_names: Vec::new(),
+        activation_import_identities: frontier_profile.activation_imports.clone(),
+        activation_import_bindings: frontier_profile.activation_import_bindings.clone(),
+        activation_export_identities: frontier_profile.activation_exports.clone(),
+        activation_export_bindings: frontier_profile.activation_export_bindings.clone(),
         checkpoint_quantization: None,
         checkpoint_imatrix: None,
         checkpoint_imatrix_sha256: None,

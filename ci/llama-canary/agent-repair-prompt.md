@@ -30,19 +30,21 @@ Own the repair end to end:
    requires it. Bump the prepare schema and ABI version together where the
    repository skills require that. A model row may change only when runtime
    evidence shows that its immutable manifest data is stale.
-5. Run the canonical path repeatedly until it is green: prepare, the complete
-   patched llama.cpp build with upstream tests, the generated-family check, all
-   four Rust package builds, Skippy smoke tests, parity validation, the
-   `llama-bump` family plan, the live package-v2 matrix, and the full family
-   battery. Inspect failures and continue repairing rather than stopping after
-   the first partial pass.
+5. Run prepare, the complete patched llama.cpp build with upstream tests, the
+   generated-family check, affected Rust package checks, and focused smoke or
+   real-model reproductions for your repairs. Inspect failures and fix them.
+   Once those checks pass, return control to the trusted harness. Do not run
+   an additional full family battery inside the coding session: the wrapper
+   runs every canonical gate, including the complete roster, after you return.
+   If it finds a failure, use the supplied logs to reproduce and fix that
+   failure, then return for the next trusted pass. Report the exact checks you
+   ran and remaining uncertainties; a focused pass is not certification.
 
 The models are already available in the runner's `HF_CACHE`. Stay offline and
-do not add Actions caching or download logic. Every runnable `model_pin` row
-must still resolve its exact GGUF bytes, package as source-complete package-v2,
-pass independent verification, and pass the two-node split smoke. Full family
-certification must retain all planned single-step, chain, state-handoff, native
-draft, and multimodal lanes.
+do not add Actions caching or download logic. Full family certification must
+retain all planned single-step, chain, state-handoff, native draft, and
+multimodal lanes. Package-v2 product coverage runs in the required pull-request
+checks after the canary publishes a candidate.
 
 Leave the finished changes uncommitted in the current mesh-llm checkout. Do not
 change the target pin, create or switch branches, commit, push, use GitHub
@@ -53,7 +55,7 @@ implementation, Rust code, and model manifests that the fixed gates exercise.
 
 Manifest edits are deliberately narrow. In
 `ci/llama-canary/family-certified.json`, keep the roster, artifact identities,
-cadences, lanes, execution policy, and every other field unchanged; only
+lanes, execution policy, and every other field unchanged; only
 `resources.estimated_model_bytes` may be corrected from the immutable GGUF
 tensor scan. In `docs/skippy/llama-parity-candidates.json`, keep every existing
 row and all top-level policy unchanged. Append exactly one classification row

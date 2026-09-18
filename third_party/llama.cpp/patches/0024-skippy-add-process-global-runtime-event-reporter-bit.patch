@@ -1,7 +1,8 @@
-From 39da9386b2e4d75fe88fe3f392c3f8162dd0e4cc Mon Sep 17 00:00:00 2001
+From 84e3d59c9a1566f7c0e68d8c27654e228dceda98 Mon Sep 17 00:00:00 2001
 From: Mesh-LLM CI <ci@mesh-llm.local>
 Date: Sat, 5 Sep 2026 02:00:59 -0400
-Subject: [PATCH] skippy: add process-global runtime event reporter (bit 31)
+Subject: [PATCH 024/113] skippy: add process-global runtime event reporter
+ (bit 31)
 
 Bumps SKIPPY_ABI_VERSION_PATCH to 54 (the one bump for this atomically
 landed capability series; sibling family patches do not bump again) and
@@ -24,7 +25,6 @@ family's own emit entrypoint.
 
 Rebased onto main's graph-derived package-v2 queue as patches 0020-0029.
 Feature bits 31-36 are unchanged.
-
 ---
  include/skippy/common.h             |  12 +-
  include/skippy/events.h             |  37 +++++
@@ -39,7 +39,7 @@ Feature bits 31-36 are unchanged.
  create mode 100644 src/skippy/tests/runtime_events.cpp
 
 diff --git a/include/skippy/common.h b/include/skippy/common.h
-index b156cb5eb..98d69de67 100644
+index 65cfa2ce8..212ac273d 100644
 --- a/include/skippy/common.h
 +++ b/include/skippy/common.h
 @@ -46,7 +46,7 @@ extern "C" {
@@ -124,18 +124,18 @@ index 9fee2715f..97d451269 100644
  }
  #endif
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 320b5419e..1066937b5 100644
+index 6fa5d7644..fee006086 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -65,6 +65,7 @@ add_library(llama
+@@ -72,6 +72,7 @@ add_library(llama
              skippy/state_effects.cpp
              skippy/speculative_decoding.cpp
              skippy/tokenization.cpp
 +            skippy/events.cpp
-             llama-vocab.cpp
-             unicode-data.cpp
-             unicode.cpp
-@@ -101,6 +102,26 @@ if (LLAMA_STAGE_BUILD_TESTS)
+             unicode.h
+             ${LLAMA_MODELS_SOURCES}
+             )
+@@ -119,6 +120,26 @@ if (LLAMA_STAGE_BUILD_TESTS)
          NAME skippy_hardware_application_probe
          COMMAND skippy-hardware-application-probe)
  
@@ -167,7 +167,7 @@ index ec2b47444..21dcbecb9 100644
 --- a/src/skippy/abi.cpp
 +++ b/src/skippy/abi.cpp
 @@ -39,7 +39,8 @@ uint64_t skippy_abi_features(void) {
-            SKIPPY_FEATURE_INKLING_MTP_MM |
+            SKIPPY_FEATURE_MTP_MULTIMODAL |
             SKIPPY_FEATURE_ITERATION_BATCH |
             SKIPPY_FEATURE_ACTIVATION_BOUNDARY |
 -           SKIPPY_FEATURE_MODEL_SOURCE;
@@ -640,5 +640,5 @@ index 000000000..666a5a52c
 +    return 2;
 +}
 -- 
-2.50.1 (Apple Git-155)
+2.55.0
 

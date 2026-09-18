@@ -17,6 +17,37 @@ If one node can load the full model, Mesh LLM prefers the single-node path.
 Splitting is used when the model physically needs a split or when an explicit
 split run asks for it.
 
+## Certified architecture admission
+
+Split startup fails closed unless the model's GGUF `general.architecture`
+appears in the bundled split certification roster. The check runs after
+package identity and compact GGUF metadata resolution and before coordinator
+election, topology planning, stage materialization, or native model loading.
+Automatic splitting because a model does not fit locally uses the same gate.
+
+The llama canary regenerates the roster after its complete staged correctness
+battery passes. Each roster is bound to the llama.cpp upstream pin, the Skippy
+ABI, and the ordered patch queue. A different quantization or immutable repack
+of a certified architecture is admitted; an architecture that has not passed
+the battery is rejected. Artifact digests remain the peer-to-peer identity and
+integrity boundary, independent of architecture admission. Cached Hugging Face
+GGUFs use a versioned canonical identity containing the repository, immutable
+commit, and ordered Hub filenames, sizes, and blob SHA-256 values, so startup
+does not reread the weight payload merely to establish mesh identity.
+
+An operator can explicitly run an uncertified architecture for development:
+
+```bash
+mesh-llm serve \
+  --model /path/to/model.gguf \
+  --split \
+  --allow-uncertified-split
+```
+
+The unsafe flag is accepted only with `--split`. Logs, `GET /api/status` under
+`runtime.stages`, and `GET /api/runtime/stages` report `split_certification` as
+either `certified` or `uncertified_override`.
+
 ## Use a published layer package
 
 Layer packages are durable Hugging Face repos with a `model-package.json`
@@ -110,6 +141,7 @@ every node with the same pinned package and context allocation:
 mesh-llm serve \
   --model meshllm/inkling-UD-Q2_K_XL-layers@9b4b91a7ddd978dd7a01679bc977f6e53777f2c7 \
   --split \
+  --allow-uncertified-split \
   --ctx-size 131072 \
   --bind-port 7842
 
@@ -117,6 +149,7 @@ mesh-llm serve \
 mesh-llm serve \
   --model meshllm/inkling-UD-Q2_K_XL-layers@9b4b91a7ddd978dd7a01679bc977f6e53777f2c7 \
   --split \
+  --allow-uncertified-split \
   --ctx-size 131072 \
   --bind-port 7842 \
   --join <token>
@@ -228,6 +261,14 @@ mesh-llm serve --gguf ~/models/model.gguf
 Internally, direct GGUF serving materializes through the same package-backed
 stage machinery as a synthetic single-stage package. That keeps the runtime path
 consistent without requiring you to publish a package repository first.
+
+An explicit local path has no upstream identity, so Mesh LLM hashes its ordered
+GGUF shards. A Hugging Face reference resolves to an immutable commit and exact
+ordered shard set instead. Mesh LLM reads each managed blob's authoritative
+SHA-256 and size from cache metadata, using a metadata-only Hub request when the
+platform cache cannot preserve snapshot symlinks. Artifact integrity remains a
+download, materialization, and load concern rather than a full payload scan on
+every startup.
 
 ## Check readiness
 

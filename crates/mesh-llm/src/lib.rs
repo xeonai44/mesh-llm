@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{ffi::OsString, fmt, path::PathBuf};
@@ -299,7 +300,12 @@ fn maybe_print_binary_help(args: &[OsString]) -> bool {
         return true;
     }
     if let Some(surface) = runtime_surface_help_request(args.iter().cloned()) {
-        print!("{}", mesh_llm_cli::parser::runtime_surface_help(surface));
+        let mut out = mesh_llm_events::console_out();
+        let _ = write!(
+            out,
+            "{}",
+            mesh_llm_cli::parser::runtime_surface_help(surface)
+        );
         return true;
     }
     if args.iter().any(|arg| arg == "--help-advanced") {
@@ -381,9 +387,11 @@ where
 }
 
 fn print_advanced_help() {
-    print!("{}", advanced_help_text());
-    print!("{}", mesh_llm_cli::parser::logging_help());
-    eprintln!();
+    let mut out = mesh_llm_events::console_out();
+    let _ = write!(out, "{}", advanced_help_text());
+    let _ = write!(out, "{}", mesh_llm_cli::parser::logging_help());
+    let mut err = mesh_llm_events::console_err();
+    let _ = writeln!(err);
 }
 
 fn advanced_help_text() -> String {
@@ -461,6 +469,7 @@ fn runtime_options_from_cli(cli: mesh_llm_cli::Cli) -> mesh_llm_host_runtime::Ru
         no_draft: cli.no_draft,
         speculative_overrides,
         split: cli.split,
+        allow_uncertified_split: cli.allow_uncertified_split,
         split_topology_lock: cli.split_topology_lock,
         ctx_size: cli.ctx_size,
         max_vram: cli.max_vram,

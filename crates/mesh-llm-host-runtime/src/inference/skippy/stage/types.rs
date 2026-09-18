@@ -72,6 +72,7 @@ pub(crate) struct StageLoadRequest {
     pub(crate) model_path: Option<String>,
     pub(crate) source_model_bytes: Option<u64>,
     pub(crate) source_model_sha256: Option<String>,
+    pub(crate) split_certification: Option<String>,
     pub(crate) local_source_required: bool,
     pub(crate) projector_path: Option<String>,
     pub(crate) projector_use_gpu: Option<bool>,
@@ -136,6 +137,10 @@ pub(crate) fn test_stage_admission(
             source_snapshot_identity: "snapshot".to_string(),
             graph_configuration_id: "graph-config".to_string(),
             backend_id: "backend".to_string(),
+            activation_imports: Vec::new(),
+            activation_exports: Vec::new(),
+            activation_import_bindings: Vec::new(),
+            activation_export_bindings: Vec::new(),
         }],
     }
 }
@@ -248,6 +253,7 @@ pub(crate) struct StageStatusSnapshot {
     pub(crate) manifest_sha256: Option<String>,
     pub(crate) source_model_path: Option<String>,
     pub(crate) source_model_sha256: Option<String>,
+    pub(crate) split_certification: Option<String>,
     pub(crate) source_model_bytes: Option<u64>,
     pub(crate) materialized_path: Option<String>,
     pub(crate) materialized_pinned: bool,
