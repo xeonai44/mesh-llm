@@ -50,22 +50,24 @@ LLVM.LLVM`.
 
 ## Build from source
 
-Build the normal debug product: a backend-neutral dynamic host, its adjacent
-locally packaged native runtime, and the UI:
+Build both debug products in order: patched llama.cpp and the standalone
+Skippy CLI with a locally packaged runtime, then the backend-neutral MeshLLM
+host and console:
 
 ```bash
-just build
+just
 ```
+
+This produces `target/debug/skippy`, `target/debug/native-runtimes/`, and
+`target/debug/mesh-llm`. Pass `--runtime-bundle target/debug/native-runtimes`
+when running Skippy; MeshLLM discovers the adjacent runtime itself.
+Use `just skippy` when working only on the complete standalone Skippy product,
+or `just mesh` to rebuild only MeshLLM. `just build` runs the same sequence
+as bare `just`; `just skippy-cli-build` builds only Skippy's CLI.
 
 Release and packaging use the same host/runtime boundary. The only lower-level
 static compilation primitive is runtime packaging; it never builds a host.
-Build a release host once:
-
-```bash
-just release-host-build
-```
-
-Then build the backend runtime you are changing:
+For explicit local stages, build the backend runtime you are changing first:
 
 ```bash
 just release-runtime-build cpu
@@ -83,6 +85,15 @@ CUDA major and architecture from the toolchain/environment.
 PATH=/opt/cuda/bin:$PATH just release-runtime-build cuda
 # or
 PATH=/usr/local/cuda/bin:$PATH just release-runtime-build cuda
+```
+
+Then build the standalone Skippy CLI, followed by the neutral MeshLLM host
+and console once. The same host can be composed with any compatible backend
+runtime:
+
+```bash
+just skippy-cli-release-build
+just release-host-build
 ```
 
 Exercise the exact release discovery boundary with an isolated cache:
@@ -106,7 +117,7 @@ just release-bundle v0.X.0 dist
 
 ## UI development workflow
 
-The React console and embedded asset crate live in `crates/mesh-llm-ui/`.
+The React console and embedded asset crate live in `mesh/crates/mesh-llm-ui/`.
 The host binary serves the built assets through the management API.
 
 Use this two-terminal flow for UI development.
@@ -212,7 +223,7 @@ fresh clone needs none of this.
 
 A bare Windows checkout cannot build the test targets of crates that pull in
 `skippy-ffi`'s static link mode (`mesh-llm-system` does, through
-`mesh-llm-runtime-install`, which depends on `skippy-ffi` with
+`skippy-runtime-install`, which depends on `skippy-ffi` with
 `default-features = false`), because `skippy-ffi/build.rs` then requires
 the llama.cpp ABI archives to be prepared
 (`automatic native preparation is not supported for Windows from build.rs yet`).
@@ -304,7 +315,7 @@ Co-authored-by: Real Person <real@example.com>                  # kept
 ```
 
 Trailers naming a human contributor are untouched. Extend the lists in
-`scripts/check-conventional-commit.py` when a new agent identity shows up.
+`tools/xtask/src/repository/conventional_commit/trailers.rs` when a new agent identity shows up.
 
 A squash merge builds the commit on `main` from the pull request title and
 body, both of which CI validates, so a trailer in a branch commit cannot reach
@@ -326,6 +337,17 @@ and runner/provider/cache policy are documented in [`ci/ci.md`](ci/ci.md),
 especially [Planner and profiles](ci/ci.md#planner-and-profiles) and [Provider
 and cache policy](ci/ci.md#provider-and-cache-policy). The normative rules for
 editing workflows and CI scripts live in the [`manage-ci` skill](.agents/skills/manage-ci/SKILL.md).
+
+When a pull request changes workflow YAML, local actions, planner contracts,
+runner selection, or other CI plumbing, apply the `ci:canary` label to request
+the optional non-required diagnostic. It builds the pull-request merge commit
+through one real hosted Linux amd64 CPU chain (UI artifact, release host,
+native runtime including its runtime-event gate, and product composition).
+The PR head SHA is retained as separate identity evidence. The canary does not
+cover the five required lane orchestrators, macOS, Windows, GPU, SDK, smoke,
+or release paths. The canary lane and runner-policy actions come from protected
+`main`; the merge commit is used only as the product source. Remove the label to
+cancel an active run.
 
 Linux CI uses prebuilt public and self-hosted images from
 [`Mesh-LLM/mesh-llm-runner-images`](https://github.com/Mesh-LLM/mesh-llm-runner-images).
@@ -388,7 +410,7 @@ Intel GPU benchmark execution is not currently supported in standard `just build
 
 ## Protocol Backward Compatibility
 
-Any change to `crates/mesh-llm-host-runtime/src/protocol/` or `crates/mesh-client/src/protocol/` requires backward-compatibility tests before merging.
+Any change to `mesh/crates/mesh-llm-host-runtime/src/protocol/` or `mesh/crates/mesh-client/src/protocol/` requires backward-compatibility tests before merging.
 
 Embedded clients (iOS, macOS, Android) are permanently supported. Protocol changes that break embedded client compatibility are breaking changes.
 
@@ -399,4 +421,4 @@ cargo test -p mesh-llm --test protocol_compat_v0_client
 cargo test -p mesh-llm --test protocol_convert_matrix
 ```
 
-See [`docs/design/EMBEDDED_CLIENT_ADR.md`](docs/design/EMBEDDED_CLIENT_ADR.md) for the full compatibility policy and rationale.
+See [`mesh/docs/design/EMBEDDED_CLIENT_ADR.md`](mesh/docs/design/EMBEDDED_CLIENT_ADR.md) for the full compatibility policy and rationale.

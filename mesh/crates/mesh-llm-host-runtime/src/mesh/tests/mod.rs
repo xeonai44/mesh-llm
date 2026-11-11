@@ -1,0 +1,43 @@
+use crate::crypto::OwnershipStatus;
+use crate::mesh::artifact_transfer_io::{PartialArtifactGuard, write_artifact_transfer_chunk};
+use crate::mesh::node::LocalRequestMetricsSampler;
+use mesh_llm_types::mesh::{DEMAND_TTL_SECS, merge_demand};
+
+mod control_listener;
+mod memberships;
+mod signed_gossip;
+
+include!("connections.rs");
+include!("own_invite_token.rs");
+include!("admission/helpers.rs");
+include!("endpoint_shutdown.rs");
+include!("protocol_compat.rs");
+include!("owner_control.rs");
+include!("stage_transport.rs");
+include!("stage_control_identity.rs");
+include!("peer_state.rs");
+include!("plugin_snapshot.rs");
+include!("protocol_frames.rs");
+include!("admission.rs");
+include!("requirements.rs");
+include!("plugin_mesh_identity.rs");
+
+mod split_coverage {
+    use super::super::*;
+
+    mod cases {
+        use super::super::{
+            make_test_endpoint_id, make_test_peer, open_owner_control_stream,
+            read_owner_control_envelope, start_owner_control_test_server, test_owner_keypair,
+        };
+        use super::*;
+        use crate::mesh::node_requirements::preflight_pushed_config_for_current_node_with_gpus;
+        use prost::Message;
+
+        include!("announcement_unique.rs");
+        include!("control_plane_unique.rs");
+        include!("stage_control.rs");
+    }
+}
+
+mod model_requirements;

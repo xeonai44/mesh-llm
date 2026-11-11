@@ -7,6 +7,15 @@ on:
         description: Immutable product source revision.
         required: true
         type: string
+      original_event_name:
+        description: Original event used for model-cache publication policy.
+        required: false
+        default: ''
+        type: string
+      runtime_matrix:
+        description: JSON Linux runtime/product rows from the versioned CI plan.
+        required: true
+        type: string
       smoke_matrix:
         description: JSON platform smoke rows from the versioned CI plan.
         required: true
@@ -27,6 +36,12 @@ on:
 permissions:
   contents: read
   packages: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_BENCH_DEBUG: "0"
 
 jobs:
   core:
@@ -52,6 +67,7 @@ jobs:
       artifact_name: ci-product-linux-amd64-cpu
       artifact_path: ci-artifacts/linux
       staged_binary_path: ${{ inputs.binary_target }}
+      model_artifact_id: smollm2-q8-inference
       model_cache_scope: two-node-smoke-model
       smoke_script: scripts/ci-two-node-client-serving-smoke.sh
       timeout_minutes: ${{ inputs.timeout_minutes }}
@@ -67,88 +83,14 @@ jobs:
       artifact_name: ci-product-linux-amd64-cpu
       artifact_path: ci-artifacts/linux
       staged_binary_path: ${{ inputs.binary_target }}
-      model_url: https://huggingface.co/unsloth/SmolLM2-135M-Instruct-GGUF/resolve/9e6855bc4be717fca1ef21360a1db4b29d5c559a/SmolLM2-135M-Instruct-Q8_0.gguf
-      model_file: SmolLM2-135M-Instruct-Q8_0.gguf
+      model_artifact_id: smollm2-q8-inference
       model_cache_scope: two-node-split-smoke-model
-      smoke_script: MESH_TWO_NODE_SPLIT_ALLOW_UNCERTIFIED=1 scripts/ci-two-node-split-smoke.sh
-      kv_recurrent_model_url: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf
-      kv_recurrent_model_file: Qwen3.5-0.8B-Q4_K_M.gguf
+      smoke_script: MESH_TWO_NODE_SPLIT_DURABLE_L3=1 MESH_TWO_NODE_SPLIT_ALLOW_UNCERTIFIED=1 scripts/ci-two-node-split-smoke.sh
+      kv_recurrent_model_artifact_id: family-granite-hybrid
       kv_recurrent_model_cache_scope: two-node-split-recurrent-smoke-model
       kv_recurrent_context_size: '4096'
       kv_recurrent_expected_exact_payload_kind: kv-recurrent
-      timeout_minutes: ${{ inputs.timeout_minutes }}
-    secrets:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-
-  product_integration_cpu:
-    name: CPU product integration suite
-    if: ${{ contains(fromJson(inputs.smoke_matrix).*.id, 'product-integration-cpu') }}
-    uses: ./.github/workflows/product-integration-smoke.yml
-    with:
-      source_sha: ${{ inputs.source_sha }}
-      artifact_name: ci-product-linux-amd64-cpu
-      artifact_path: ci-artifacts/linux
-      staged_binary_path: ${{ inputs.binary_target }}
-      platform: linux
-      backend: cpu
-      timeout_minutes: ${{ inputs.timeout_minutes }}
-    secrets:
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-
-  product_integration_cuda:
-    name: CUDA product integration suite
-    if: ${{ contains(fromJson(inputs.smoke_matrix).*.id, 'product-integration-cuda') }}
-    uses: ./.github/workflows/product-integration-smoke.yml
-    with:
-      source_sha: ${{ inputs.source_sha }}
-      artifact_name: ci-product-linux-amd64-cuda
-      artifact_path: ci-artifacts/linux-cuda
-      staged_binary_path: ${{ inputs.binary_target }}
-      platform: linux
-      backend: cuda
-      timeout_minutes: ${{ inputs.timeout_minutes }}
-
-  product_integration_vulkan:
-    name: Vulkan product integration suite
-    if: ${{ contains(fromJson(inputs.smoke_matrix).*.id, 'product-integration-vulkan') }}
-    uses: ./.github/workflows/product-integration-smoke.yml
-    with:
-      source_sha: ${{ inputs.source_sha }}
-      artifact_name: ci-product-linux-amd64-vulkan
-      artifact_path: ci-artifacts/linux-vulkan
-      staged_binary_path: ${{ inputs.binary_target }}
-      platform: linux
-      backend: vulkan
-      timeout_minutes: ${{ inputs.timeout_minutes }}
-
-  product_integration_rocm:
-    name: ROCm product integration suite
-    if: ${{ contains(fromJson(inputs.smoke_matrix).*.id, 'product-integration-rocm') && vars.MESH_ROCM_INFERENCE_RUNNER_ENABLED == 'true' }}
-    uses: ./.github/workflows/product-integration-smoke.yml
-    with:
-      source_sha: ${{ inputs.source_sha }}
-      artifact_name: ci-product-linux-amd64-rocm
-      artifact_path: ci-artifacts/linux-rocm
-      staged_binary_path: ${{ inputs.binary_target }}
-      platform: linux
-      backend: rocm
-      timeout_minutes: ${{ inputs.timeout_minutes }}
-
-  qwen_recurrent_gate:
-    name: Qwen3.5 recurrent migration gate
-    if: ${{ contains(fromJson(inputs.smoke_matrix).*.id, 'qwen-recurrent-gate') }}
-    uses: ./.github/workflows/scripted-binary-smoke.yml
-    with:
-      source_sha: ${{ inputs.source_sha }}
-      artifact_name: ci-product-linux-amd64-cpu
-      artifact_path: ci-artifacts/linux
-      staged_binary_path: ${{ inputs.binary_target }}
-      model_url: https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/6ab461498e2023f6e3c1baea90a8f0fe38ab64d0/Qwen3.5-0.8B-Q4_K_M.gguf
-      model_file: Qwen3.5-0.8B-Q4_K_M.gguf
-      model_cache_scope: two-node-split-recurrent-smoke-model
-      model_context_size: '4096'
-      expected_exact_payload_kind: kv-recurrent
-      smoke_script: MESH_TWO_NODE_SPLIT_ALLOW_UNCERTIFIED=1 scripts/ci-two-node-split-smoke.sh
+      split_evidence_artifact_name: two-node-split-dense-recurrent-evidence
       timeout_minutes: ${{ inputs.timeout_minutes }}
     secrets:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -175,3 +117,306 @@ jobs:
       timeout_minutes: ${{ inputs.timeout_minutes }}
     secrets:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+  laya_cpu:
+    name: Laya smoke (Linux CPU)
+    if: ${{ contains(fromJson(inputs.runtime_matrix).*.id, 'linux-cpu') && contains(fromJson(inputs.smoke_matrix).*.id, 'core') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/run-laya-product-smoke
+        with:
+          artifact_name: ci-product-linux-amd64-cpu
+          artifact_path: ci-artifacts/laya-linux-cpu
+          staged_binary_path: target/release/mesh-llm
+          expected_backend: cpu
+          device: CPU
+          model_cadence: ${{ inputs.original_event_name == 'push' && 'main' || inputs.original_event_name == 'pull_request' && 'pull-request' || 'manual' }}
+          save_model_cache: ${{ inputs.original_event_name == 'push' }}
+
+  laya_cuda:
+    name: Laya smoke (Linux CUDA)
+    if: ${{ contains(fromJson(inputs.runtime_matrix).*.id, 'linux-cuda') && contains(fromJson(inputs.smoke_matrix).*.id, 'core-cuda') }}
+    runs-on: [self-hosted, Linux, X64, amd64, gpu-nvidia, mesh-llm-amd64]
+    timeout-minutes: ${{ inputs.timeout_minutes > 100 && inputs.timeout_minutes || 100 }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Prepare source-bound native cleanup before managed work
+        timeout-minutes: 20
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$SOURCE_SHA"
+          report="$(just automation-bootstrap)"
+          binary="$(printf '%s\n' "$report" | awk -F= '$1 == "binary_path" { count++; print substr($0, index($0, "=") + 1) } END { if (count != 1) exit 1 }')"
+          [[ "$binary" == /* && -f "$binary" && ! -L "$binary" && -x "$binary" ]] || exit 1
+          sha="$(sha256sum "$binary" | awk '{print $1}')"
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          controller_dir="$(mktemp -d "$RUNNER_TEMP/native-cleanup.XXXXXX")"
+          cp "$binary" "$controller_dir/xtask"
+          chmod 500 "$controller_dir/xtask"
+          test "$(sha256sum "$controller_dir/xtask" | awk '{print $1}')" = "$sha"
+          binary="$controller_dir/xtask"
+          {
+            printf 'MESH_LLM_AUTOMATION_BIN=%s\n' "$binary"
+            printf 'MESH_NATIVE_CLEANUP_SHA=%s\n' "$sha"
+            printf 'MESH_NATIVE_CLEANUP_SOURCE=%s\n' "$SOURCE_SHA"
+          } >> "$GITHUB_ENV"
+      - name: Admit cleanup controller before managed work
+        run: |
+          set -euo pipefail
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$MESH_NATIVE_CLEANUP_SOURCE"
+          test "$(sha256sum "$MESH_LLM_AUTOMATION_BIN" | awk '{print $1}')" = "$MESH_NATIVE_CLEANUP_SHA"
+          printf 'MESH_NATIVE_MANAGED_WORK_STARTED=true\n' >> "$GITHUB_ENV"
+      - uses: ./.github/actions/run-laya-product-smoke
+        timeout-minutes: 70
+        with:
+          artifact_name: ci-product-linux-amd64-cuda
+          artifact_path: ci-artifacts/laya-linux-cuda
+          staged_binary_path: target/release/mesh-llm
+          expected_backend: cuda
+          device: CUDA0
+          model_cadence: ${{ inputs.original_event_name == 'push' && 'main' || inputs.original_event_name == 'pull_request' && 'pull-request' || 'manual' }}
+          save_model_cache: 'false'
+      - name: Clean self-hosted Laya smoke outputs
+        if: ${{ success() || failure() || cancelled() }}
+        timeout-minutes: 5
+        env:
+          CLEANUP_ARTIFACT_PATH: ci-artifacts/laya-linux-cuda
+          CLEANUP_BINARY_PATH: target/release/mesh-llm
+        run: |
+          set -euo pipefail
+          if [[ "${MESH_NATIVE_MANAGED_WORK_STARTED:-}" != true ]]; then
+            echo 'native cleanup refused: managed work never started; no owned workload cleanup attempted' >&2
+            exit 1
+          fi
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$MESH_NATIVE_CLEANUP_SOURCE"
+          test "$(sha256sum "$MESH_LLM_AUTOMATION_BIN" | awk '{print $1}')" = "$MESH_NATIVE_CLEANUP_SHA"
+          "$MESH_LLM_AUTOMATION_BIN" ci-ops runner-cleanup --job smoke --evidence-uploaded false
+
+  # Case-sensitive exact-`true` gate for the two hardware-backed Laya rows.
+  #
+  # A GitHub Actions expression cannot compare strings case-sensitively: `==`
+  # ignores case, so `vars.X == 'true'` also matches `TRUE` and `True`. A
+  # mis-cased variable therefore schedules a GPU row against a runner that is
+  # not certified for that backend - the `gpu-nvidia` scale set has never
+  # exposed a Vulkan device, and the `gpu-amd` ROCm role is repository-scoped -
+  # which restores the red main these gates exist to prevent. Validate the raw
+  # value in the shell, where `[[ .. == .. ]]` is exact, and let both rows
+  # depend on the normalized result. `run-laya-product-smoke` still repeats the
+  # gate from that normalized input, so an older protected workflow cannot run
+  # the Vulkan smoke on an uncertified PR runner before this workflow change
+  # reaches main.
+  gpu_runner_gate:
+    name: GPU runner gate
+    if: ${{ contains(fromJson(inputs.smoke_matrix).*.id, 'core') && (contains(fromJson(inputs.runtime_matrix).*.id, 'linux-vulkan') || contains(fromJson(inputs.runtime_matrix).*.id, 'linux-rocm')) }}
+    runs-on: ubuntu-24.04
+    outputs:
+      vulkan_enabled: ${{ steps.check.outputs.vulkan_enabled }}
+      rocm_enabled: ${{ steps.check.outputs.rocm_enabled }}
+    steps:
+      - name: Require exactly the lowercase true
+        id: check
+        env:
+          MESH_VULKAN_INFERENCE_RUNNER_ENABLED: ${{ vars.MESH_VULKAN_INFERENCE_RUNNER_ENABLED }}
+          MESH_ROCM_INFERENCE_RUNNER_ENABLED: ${{ vars.MESH_ROCM_INFERENCE_RUNNER_ENABLED }}
+        run: |
+          set -euo pipefail
+          for pair in \
+            "vulkan_enabled:MESH_VULKAN_INFERENCE_RUNNER_ENABLED" \
+            "rocm_enabled:MESH_ROCM_INFERENCE_RUNNER_ENABLED"
+          do
+            output="${pair%%:*}"
+            name="${pair#*:}"
+            value="${!name:-}"
+            enabled=false
+            if [[ "$value" == "true" ]]; then
+              enabled=true
+            fi
+            echo "$output=$enabled" >> "$GITHUB_OUTPUT"
+          done
+      # A gated row that stays skipped only shows as a skipped job, so a green
+      # run can read as GPU coverage when only packaging ran. Name every planned
+      # row from the normalized decision, with the reason it did not run.
+      - name: Report GPU rows without a qualified runner
+        env:
+          VULKAN_PLANNED: ${{ contains(fromJson(inputs.runtime_matrix).*.id, 'linux-vulkan') }}
+          ROCM_PLANNED: ${{ contains(fromJson(inputs.runtime_matrix).*.id, 'linux-rocm') }}
+          VULKAN_ENABLED: ${{ steps.check.outputs.vulkan_enabled }}
+          ROCM_ENABLED: ${{ steps.check.outputs.rocm_enabled }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### GPU inference rows"
+            echo
+            for row in \
+              "Linux Vulkan:VULKAN:MESH_VULKAN_INFERENCE_RUNNER_ENABLED" \
+              "Linux ROCm:ROCM:MESH_ROCM_INFERENCE_RUNNER_ENABLED"
+            do
+              label="${row%%:*}"
+              rest="${row#*:}"
+              backend="${rest%%:*}"
+              variable="${rest#*:}"
+              planned="${backend}_PLANNED"
+              enabled="${backend}_ENABLED"
+              if [[ "${!planned}" != "true" ]]; then
+                continue
+              fi
+              if [[ "${!enabled}" == "true" ]]; then
+                echo "- $label: inference smoke scheduled on its qualified runner; its result is in the row job."
+              else
+                echo "- $label: inference smoke skipped, no qualified runner (\`$variable\` is not \`true\`). No inference ran on this backend."
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  laya_vulkan:
+    name: Laya smoke (Linux Vulkan)
+    needs: [gpu_runner_gate]
+    if: ${{ contains(fromJson(inputs.runtime_matrix).*.id, 'linux-vulkan') && contains(fromJson(inputs.smoke_matrix).*.id, 'core') && needs.gpu_runner_gate.outputs.vulkan_enabled == 'true' }}
+    runs-on: [self-hosted, Linux, X64, amd64, gpu-nvidia, mesh-llm-amd64]
+    timeout-minutes: ${{ inputs.timeout_minutes > 100 && inputs.timeout_minutes || 100 }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MESH_LLM_VULKAN_AVAILABLE: '1'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Prepare source-bound native cleanup before managed work
+        timeout-minutes: 20
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$SOURCE_SHA"
+          report="$(just automation-bootstrap)"
+          binary="$(printf '%s\n' "$report" | awk -F= '$1 == "binary_path" { count++; print substr($0, index($0, "=") + 1) } END { if (count != 1) exit 1 }')"
+          [[ "$binary" == /* && -f "$binary" && ! -L "$binary" && -x "$binary" ]] || exit 1
+          sha="$(sha256sum "$binary" | awk '{print $1}')"
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          controller_dir="$(mktemp -d "$RUNNER_TEMP/native-cleanup.XXXXXX")"
+          cp "$binary" "$controller_dir/xtask"
+          chmod 500 "$controller_dir/xtask"
+          test "$(sha256sum "$controller_dir/xtask" | awk '{print $1}')" = "$sha"
+          binary="$controller_dir/xtask"
+          {
+            printf 'MESH_LLM_AUTOMATION_BIN=%s\n' "$binary"
+            printf 'MESH_NATIVE_CLEANUP_SHA=%s\n' "$sha"
+            printf 'MESH_NATIVE_CLEANUP_SOURCE=%s\n' "$SOURCE_SHA"
+          } >> "$GITHUB_ENV"
+      - name: Admit cleanup controller before managed work
+        run: |
+          set -euo pipefail
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$MESH_NATIVE_CLEANUP_SOURCE"
+          test "$(sha256sum "$MESH_LLM_AUTOMATION_BIN" | awk '{print $1}')" = "$MESH_NATIVE_CLEANUP_SHA"
+          printf 'MESH_NATIVE_MANAGED_WORK_STARTED=true\n' >> "$GITHUB_ENV"
+      - uses: ./.github/actions/run-laya-product-smoke
+        timeout-minutes: 70
+        with:
+          artifact_name: ci-product-linux-amd64-vulkan
+          artifact_path: ci-artifacts/laya-linux-vulkan
+          staged_binary_path: target/release/mesh-llm
+          expected_backend: vulkan
+          device: Vulkan0
+          enable_vulkan_inference: ${{ needs.gpu_runner_gate.outputs.vulkan_enabled }}
+          model_cadence: ${{ inputs.original_event_name == 'push' && 'main' || inputs.original_event_name == 'pull_request' && 'pull-request' || 'manual' }}
+          save_model_cache: 'false'
+      - name: Clean self-hosted Laya smoke outputs
+        if: ${{ success() || failure() || cancelled() }}
+        timeout-minutes: 5
+        env:
+          CLEANUP_ARTIFACT_PATH: ci-artifacts/laya-linux-vulkan
+          CLEANUP_BINARY_PATH: target/release/mesh-llm
+        run: |
+          set -euo pipefail
+          if [[ "${MESH_NATIVE_MANAGED_WORK_STARTED:-}" != true ]]; then
+            echo 'native cleanup refused: managed work never started; no owned workload cleanup attempted' >&2
+            exit 1
+          fi
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$MESH_NATIVE_CLEANUP_SOURCE"
+          test "$(sha256sum "$MESH_LLM_AUTOMATION_BIN" | awk '{print $1}')" = "$MESH_NATIVE_CLEANUP_SHA"
+          "$MESH_LLM_AUTOMATION_BIN" ci-ops runner-cleanup --job smoke --evidence-uploaded false
+
+  laya_rocm:
+    name: Laya smoke (Linux ROCm)
+    needs: [gpu_runner_gate]
+    if: ${{ contains(fromJson(inputs.runtime_matrix).*.id, 'linux-rocm') && contains(fromJson(inputs.smoke_matrix).*.id, 'core') && needs.gpu_runner_gate.outputs.rocm_enabled == 'true' }}
+    runs-on: [self-hosted, Linux, X64, amd64, gpu-amd, mesh-llm-amd64]
+    timeout-minutes: ${{ inputs.timeout_minutes > 100 && inputs.timeout_minutes || 100 }}
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Prepare source-bound native cleanup before managed work
+        timeout-minutes: 20
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$SOURCE_SHA"
+          report="$(just automation-bootstrap)"
+          binary="$(printf '%s\n' "$report" | awk -F= '$1 == "binary_path" { count++; print substr($0, index($0, "=") + 1) } END { if (count != 1) exit 1 }')"
+          [[ "$binary" == /* && -f "$binary" && ! -L "$binary" && -x "$binary" ]] || exit 1
+          sha="$(sha256sum "$binary" | awk '{print $1}')"
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || exit 1
+          controller_dir="$(mktemp -d "$RUNNER_TEMP/native-cleanup.XXXXXX")"
+          cp "$binary" "$controller_dir/xtask"
+          chmod 500 "$controller_dir/xtask"
+          test "$(sha256sum "$controller_dir/xtask" | awk '{print $1}')" = "$sha"
+          binary="$controller_dir/xtask"
+          {
+            printf 'MESH_LLM_AUTOMATION_BIN=%s\n' "$binary"
+            printf 'MESH_NATIVE_CLEANUP_SHA=%s\n' "$sha"
+            printf 'MESH_NATIVE_CLEANUP_SOURCE=%s\n' "$SOURCE_SHA"
+          } >> "$GITHUB_ENV"
+      - name: Admit cleanup controller before managed work
+        run: |
+          set -euo pipefail
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$MESH_NATIVE_CLEANUP_SOURCE"
+          test "$(sha256sum "$MESH_LLM_AUTOMATION_BIN" | awk '{print $1}')" = "$MESH_NATIVE_CLEANUP_SHA"
+          printf 'MESH_NATIVE_MANAGED_WORK_STARTED=true\n' >> "$GITHUB_ENV"
+      - uses: ./.github/actions/run-laya-product-smoke
+        timeout-minutes: 70
+        with:
+          artifact_name: ci-product-linux-amd64-rocm
+          artifact_path: ci-artifacts/laya-linux-rocm
+          staged_binary_path: target/release/mesh-llm
+          expected_backend: rocm
+          device: ROCm0
+          model_cadence: ${{ inputs.original_event_name == 'push' && 'main' || inputs.original_event_name == 'pull_request' && 'pull-request' || 'manual' }}
+          save_model_cache: 'false'
+      - name: Clean self-hosted Laya smoke outputs
+        if: ${{ success() || failure() || cancelled() }}
+        timeout-minutes: 5
+        env:
+          CLEANUP_ARTIFACT_PATH: ci-artifacts/laya-linux-rocm
+          CLEANUP_BINARY_PATH: target/release/mesh-llm
+        run: |
+          set -euo pipefail
+          if [[ "${MESH_NATIVE_MANAGED_WORK_STARTED:-}" != true ]]; then
+            echo 'native cleanup refused: managed work never started; no owned workload cleanup attempted' >&2
+            exit 1
+          fi
+          test "$(GIT_MASTER=1 git rev-parse HEAD)" = "$MESH_NATIVE_CLEANUP_SOURCE"
+          test "$(sha256sum "$MESH_LLM_AUTOMATION_BIN" | awk '{print $1}')" = "$MESH_NATIVE_CLEANUP_SHA"
+          "$MESH_LLM_AUTOMATION_BIN" ci-ops runner-cleanup --job smoke --evidence-uploaded false

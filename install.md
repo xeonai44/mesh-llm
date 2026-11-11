@@ -51,8 +51,10 @@ installed binary:
 
 Do not make a mesh public unless the user explicitly asks. Do not post an
 invite token, credentials, host inventory, or private paths to a public service.
-An ordinary private invite is connectivity material, not a strong
-identity/admission policy. For an untrusted network or controlled membership,
+The default join token is connectivity material, not a bearer authorization
+credential or a strong identity/admission policy. Unpublished is not the same
+as access-controlled; the publication status `private` only means unpublished.
+For an untrusted network or controlled membership,
 stop and discuss the owner identity and trust-policy options in
 <https://meshllm.cloud/MESHES.md> before enrolling nodes.
 
@@ -91,7 +93,7 @@ section 1, follow only the sections it needs instead of walking all eleven:
 | Local chat or coding agent on one machine you already have | 2 (install check), 3 (survey — filtered), 9 (harness), 11 (report). Skip 4–7. |
 | Prove a two-node mesh works | 2, 3, 4, 5, 6, 11 |
 | Several independent models across machines | 2, 3, 4, 5, 6, 7, 11 |
-| One large model split across machines (advanced) | 2, 3, 4, 5, 6, 7 (split shape) + `docs/SKIPPY_SPLITS.md`, 11 |
+| One large model split across machines (advanced) | 2, 3, 4, 5, 6, 7 (split shape) + `skippy/docs/SKIPPY_SPLITS.md`, 11 |
 | Persistent service after a foreground test proves out | Prove the goal first, then revisit service setup in 2 |
 
 Diagnostics (section 8) and the journal (section 10) apply throughout. When a
@@ -128,10 +130,10 @@ Check the current stable GitHub release separately from the installed version:
 
 ```sh
 curl -fsSL https://api.github.com/repos/Mesh-LLM/mesh-llm/releases/latest |
-  python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])'
+  jq -er '.tag_name | select(type == "string" and length > 0)'
 ```
 
-If Python is unavailable, inspect the API response with another local JSON
+If jq is unavailable, inspect the API response with another local JSON
 tool. In PowerShell use:
 
 ```powershell
@@ -149,7 +151,7 @@ entry where `prerelease` is true and `draft` is false:
 
 ```sh
 curl -fsSL 'https://api.github.com/repos/Mesh-LLM/mesh-llm/releases?per_page=20' |
-  python3 -c 'import json,sys; print(next(r["tag_name"] for r in json.load(sys.stdin) if r["prerelease"] and not r["draft"]))'
+  jq -er '[.[] | select(.prerelease == true and .draft == false)][0].tag_name | select(type == "string" and length > 0)'
 ```
 
 Use `mesh-llm update --version '<tag>'` only after the user confirms that exact
@@ -271,7 +273,7 @@ anything to the user:
 - Exclude split fragments and package internals: refs ending in `-layers` (or
   containing `/layers/` or `/shared/`), and any `layer-*.gguf`, `shared/*.gguf`,
   `metadata.gguf`, or `skippy-shard-*` path. These are only relevant when the
-  goal is a split (section 7 and `docs/SKIPPY_SPLITS.md`).
+  goal is a split (section 7 and `skippy/docs/SKIPPY_SPLITS.md`).
 - Keep complete, independently loadable GGUFs.
 - For a coding-agent goal, rank the survivors by advertised `tool_use` support,
   then by fit, and confirm capability with `models show`.
@@ -367,6 +369,48 @@ that machine.
 Tell the user that the final command remains in the foreground and should keep
 running. If a block fails before the node joins, the main node cannot see its
 local error. Ask for the terminal output, or offer SSH-based inspection.
+
+To run a node joining a mesh as a service instead of a foreground process, do not
+hand-edit the generated unit. `setup --service` installs a unit whose command
+is a bare `serve`, and the only non-default inputs it reads are
+`~/.mesh-llm/config.toml` and `~/.config/mesh-llm/service.env` (systemd loads
+the latter through `EnvironmentFile=-`; the launchd runner sources it before
+executing `serve`). Write the invite token to a file the operator owns. A token
+at `~/.mesh-llm/invite.token` needs no further configuration, since that is the
+default location when no explicit file is named; the env line below pins the
+source explicitly, which is worth doing when the config path is not the default
+(the default file then sits beside the resolved config instead):
+
+```sh
+install -m 600 /dev/null ~/.mesh-llm/invite.token
+read -r -s -p 'Invite token: ' invite_token
+printf '\n' >&2
+printf '%s\n' "$invite_token" > ~/.mesh-llm/invite.token
+unset invite_token
+printf 'MESH_LLM_JOIN_FILE=%s\n' "$HOME/.mesh-llm/invite.token" >> ~/.config/mesh-llm/service.env
+systemctl --user restart mesh-llm.service
+# macOS: launchctl kickstart -k gui/$(id -u)/com.mesh-llm.mesh-llm
+```
+
+On Windows, `setup --service` registers a per-user scheduled task named
+`mesh-llm` that runs a bare `serve` through `mesh-llm service-host`. There is
+no `service.env`: write the token to `%USERPROFILE%\.mesh-llm\invite.token`,
+the default location. A node that started without any token starts its own
+mesh and does not look for one later, so after writing the first token restart
+the task: `schtasks /End /TN mesh-llm`, then `schtasks /Run /TN mesh-llm`. From
+then on the file is re-read on every rejoin. The task's output goes to
+`%LOCALAPPDATA%\mesh-llm\logs\service.log`; past 10 MiB, and at each start, it
+moves to `service.previous.log`, so the logs stay under 20 MiB.
+
+The token file is re-read on every rejoin attempt, so replacing its contents is
+all a rotation needs: no unit edit and no restart. The same holds for a token at
+the default location, which is re-resolved on each attempt rather than frozen at
+startup. An empty or unreadable token file is a startup error, never a silent
+standalone run. Never put the invite token in
+argv or in the unit file — both are visible to any process listing on the host.
+`MESH_LLM_JOIN` takes the token inline instead, and `serve --join-file <PATH>`
+is the foreground equivalent. On a `[mesh_requirements]` mesh the signed token
+expires, so give the operator a rotation step in the completion report.
 
 If the user approved SSH, first inspect the named target rather than scanning
 the network. Explain the exact remote commands, then use SSH to install, survey,
@@ -636,7 +680,7 @@ by `/v1/models`.
 For a coding harness, validate tool calls rather than stopping at plain chat:
 
 ```sh
-scripts/qa-agent-tool-call-reliability.py \
+cargo xtool automation stability tool-call \
   --base-url http://127.0.0.1:9337/v1 \
   --models '<exact-model-id>' --attempts 2 --print-plan
 ```

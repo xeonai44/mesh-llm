@@ -29,6 +29,19 @@ or cache identity.
   same-commit reusable lane. PRs and routine main pushes therefore keep nested
   jobs in focused native topic/platform runs; only explicit manual-full runs
   use protected detached lane dispatch.
+- `pr_ci_canary.yml` is an optional, non-required `ci:canary`-label diagnostic
+  outside the five-entry required-check census. It calls a protected `main`-
+  owned merge-source lane, which runs one catalog-derived Linux amd64 CPU chain
+  through the existing UI, host, native-runtime, and product slices, including
+  the native runtime-event gate. Runner-policy checkouts remain on `main`. It
+  deliberately does not call `ci-linux-lane.yml` or cover the other platform,
+  SDK, smoke, GPU, or release graphs.
+- The canary uses read-only `contents`/`packages` permissions and a plain
+  step-summary result. It requests no checks write, secrets, environments,
+  OIDC, Depot, or persistent self-hosted runner. The protected workflow ref and
+  default-branch runner-policy checkout keep PR-controlled workflow/action
+  changes out of runner-owning jobs. Any future persistent-runner rollout
+  still requires protected main-owned workflow references in the runner group.
 - ci/ownership.yml and ci/slices.yml define the checked ownership, dependency,
   row, runner-role, cache-mode and worker-budget catalog.
 - Protected PR planning extracts only those two manifests from the validated
@@ -52,6 +65,11 @@ or cache identity.
   lanes; PR-controlled jobs never receive Actions-write permission.
 - Existing static ABI, native SDK, Swift, smoke and HF workflows remain
   lower-level reusable producers/consumers.
+- The Linux, macOS and Windows host slices each build one standalone Skippy CLI
+  input before their MeshLLM host input. Skippy native runtime slices remain
+  backend-specific and feed existing composed-product/test edges. Release
+  produces separate platform Skippy CLI archives under the shared tag without
+  rebuilding the CLI per backend or test shard.
 - Current PR routing may use Depot for eligible same-repository executor jobs
   under the checked-in cache-risk deadline and repository gate. Forks,
   control-plane jobs, credential-bearing smokes, and the documented CUDA smoke
@@ -90,6 +108,7 @@ Routine main validation has the same acceptance invariant and exposes
   PR macOS entry --> plan --> protected macOS lane --> PR / macOS
   PR Windows entry --> plan --> protected Windows lane --> PR / Windows
   PR Quality in-progress --> protected sibling monitor --> cancel other exact-revision lanes after first failure
+  ci:canary label --> merge-source canary plan --> Linux CPU product chain --> Canary / CI (non-required)
 
   Main Quality/Website/Linux/macOS/Windows entries --> same-commit matching lanes
   Explicit manual-full entry --> protected controller --> five dispatched lanes
@@ -104,7 +123,11 @@ contains a platform-local static superset of typed reusable calls. Workflow
 YAML is never generated, and lanes do not download a planner artifact or
 allocate a planner. Fork heads are fetched through the base repository while
 planner, action, and workflow definitions remain protected on the default
-branch.
+branch for the five required lanes. The optional canary intentionally resolves
+its local workflow and action graph from the pull-request merge commit, passes
+that same `github.sha` as the built source, and keeps the PR head SHA as
+separate identity evidence. It compares merge-source ownership/slice catalogs
+with the base and refuses catalog drift before calling its fixed graph.
 
 ## Planner contract
 
@@ -161,10 +184,14 @@ credentials may differ.
 - ci-{linux,macos,windows}-product-slice.yml: platform-local composition after
   matching host and runtime producers succeed.
 - ci-platform-checks-slice.yml: macOS portable/unit and Windows checks.
-- ci-linux-product-smoke-slice.yml and ci-macos-product-smoke-slice.yml:
-  platform-local inference, backend, two-node, Metal and model-download
-  consumers using only composed artifacts. One Linux KV caching smoke job runs
-  a fixed dense SmolLM2 leg followed by a recurrent Qwen3.5 leg; both must pass.
+- ci-{linux,macos,windows}-product-smoke-slice.yml: platform-local inference,
+  backend, two-node, Metal, Windows CPU, model-download, and real-model Laya
+  consumers using only composed artifacts. Laya executes the upstream golden
+  System One battery on every hardware-backed platform row and selects the
+  exact native device name, so an unavailable backend fails at model load.
+  Product integration includes a digest-bound durable-L3
+  phase for dense and recurrent models across a full process restart; Windows
+  runs that phase alone on a real product executor.
 - ci-linux-sdk-slice.yml and ci-macos-sdk-slice.yml: platform-local
   Rust/Kotlin/Swift consumers. Swift and Kotlin SDK artifacts are independent
   producers that start from the plan and static ABI respectively, before
@@ -239,15 +266,22 @@ exact-SHA, same-epoch runs. Main/manual and unrelated workflows are never
 targets. The monitor is the only owner of Actions-write permission; checked-out
 PR code cannot invoke the cancellation API.
 
-PR caching is selective. Linux Clippy, Rust tests, host, and runtime restore one
+PR caching is selective. Linux Clippy, Rust tests, and host restore one
 bounded trusted sccache seed on GitHub-hosted runners and no longer restore
-per-row Cargo target archives. PR writes stay job-local; only the protected
+per-row Cargo target archives; native runtime rows remain cold after measured
+zero-reuse qualification. PR writes stay job-local; only the protected
 post-Main-Quality warmer publishes the exact 2 GiB seed, and Depot selections
 cannot restore it. Exact verified static,
 Swift, Metal-unit and Windows ABI caches may publish into the PR merge-ref
 scope for same-PR reruns. Website owns the single pnpm publisher and its npm
 store cache, while platform UI producers are restore-only for the shared pnpm
 key. Artifacts remain run-scoped correctness inputs, never rerun caches.
+The Linux CPU runtime row is the deliberate hosted-provider exception to this
+default: central runner policy selects a hosted runner for both PR and main,
+so a trusted-main push can publish one exact packaged-runtime cache and PRs
+can restore and verify it. Accelerator runtime rows keep their normal provider
+selection. The cache never replaces the run-scoped runtime artifact or its
+native runtime-event gate.
 
 scripts/collect-ci-metrics.py is the read-only measurement tool. Schema-v3
 reports keep queue, measured dependency wait, execution and wall-clock timing

@@ -8,7 +8,7 @@ metadata:
 # connect-agents
 
 Use this when pointing an agent harness or any OpenAI client at a running
-mesh-llm node. Full reference: `docs/AGENTS.md`.
+mesh-llm node. Full reference: `mesh/docs/AGENTS.md`.
 
 ## Mental model
 
@@ -28,7 +28,7 @@ mesh-llm node. Full reference: `docs/AGENTS.md`.
 mesh-llm launches the major agent CLIs with config injected for you:
 
 ```bash
-mesh-llm goose     [--model <id>]                 # writes ~/.config/goose/custom_providers/mesh.json
+mesh-llm goose     [--model <id>]                 # writes custom_providers/mesh.json in goose's config dir
 mesh-llm claude    [--model <id>]
 mesh-llm opencode  [--model <id>] [--host <h>]    # injects OPENCODE_CONFIG_CONTENT (no file edits)
 mesh-llm pi        [--model <id>] [--host <h>]    # writes ~/.pi/agent/models.json
@@ -60,21 +60,21 @@ curl -s http://localhost:9337/v1/chat/completions \
   -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Exact manual provider JSON for OpenCode and Pi is in `docs/AGENTS.md`.
+Exact manual provider JSON for OpenCode and Pi is in `mesh/docs/AGENTS.md`.
 
 ## Validating agent behavior
 
 Direct API contract probe (tool-call forcing, streaming reconstruction):
 
 ```bash
-scripts/qa-agent-tool-call-reliability.py \
+cargo xtool automation stability tool-call \
   --base-url http://127.0.0.1:9337/v1 --models auto,mesh --attempts 3 \
   --output target/agent-tool-call-reliability/results.jsonl
 ```
 
 Broader harness (models, chat, streaming, plus optional Goose/OpenCode/Pi
-smokes): `scripts/qa-nightly-stability.py` — see `docs/AGENTS.md`. Use
-`--print-plan` on either script for a side-effect-free preview.
+smokes): `cargo xtool automation stability nightly` — see `mesh/docs/AGENTS.md`. Use
+`--print-plan` on either command for a side-effect-free preview.
 
 ## Blackboard (cross-mesh agent coordination)
 
@@ -100,3 +100,13 @@ every peer — never post secrets, credentials, private paths, or customer data.
 - An empty `/v1/models` usually means the model is still loading or no mesh was
   joined yet — check `/api/status` on `:3131` (see `mesh-join`).
 - The response `"model"` field tells you which node/model actually answered.
+
+## Config-only Hermes and OpenClaw
+
+`mesh-llm hermes --write` and `mesh-llm openclaw --write` add a named Mesh
+provider without changing the default or launching anything. They require a
+running endpoint; use `--host`, `--model` (default `auto`), `--config-path` for
+custom profiles, and `--context-length` to lower the serving-derived budget.
+OpenClaw selects `mesh/auto`; Hermes selects provider `mesh`, model `auto`.
+Existing files are backed up; formatting/comments normalize, and conflicts or
+includes are refused. See `docs/CLI.md` for schema requirements and context caveats.

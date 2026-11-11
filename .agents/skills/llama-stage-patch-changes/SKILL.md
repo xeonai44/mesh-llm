@@ -7,19 +7,30 @@ metadata:
 
 # llama-stage-patch-changes
 
+New documentation generation automation follows `../manage-ci/SKILL.md`:
+do not add Python tooling; use typed `tools/xtask` commands through thin Just
+recipes. From the repository root, `cargo xtool repo-consistency ci-crate-lists`
+is a working alias example, not a replacement for the transitional Python API
+documentation commands below. Keep them until the Rust port passes parity.
+
 Use this skill when changing the Skippy staged-runtime ABI carried in
-`third_party/llama.cpp/patches`.
+`skippy/llama_cpp/patches`.
 
 ## Boundaries
 
-- Keep durable llama.cpp-side changes in `third_party/llama.cpp/patches/*.patch`.
-- Keep the upstream pin in `third_party/llama.cpp/upstream.txt`.
+- Keep durable llama.cpp-side changes in the ordered queue under
+  `skippy/llama_cpp/patches`: top-level core patches first,
+  `model_support/series` second, and `generated/series` last.
+- Keep the upstream pin in `skippy/llama_cpp/upstream.txt`.
 - Do not edit `.deps/llama.cpp` as the final artifact; regenerate the
   patch queue from commits.
 - Keep mesh orchestration, protocol compatibility, lifecycle, model management,
   and API status behavior in Rust.
 - Keep one functional boundary per patch. Patch numbers must be unique and
-  contiguous.
+  contiguous within each queue lane.
+- Put family-specific model support in a focused `model_support/` patch. Keep
+  reusable staged-runtime machinery in the core lane and generated graph
+  annotations in the generated lane.
 - Keep public ABI declarations separate from independently reviewable model
   lifecycle, loading, and package implementation changes.
 - The Skippy native ABI is an internal lockstep boundary, not a stable
@@ -47,6 +58,18 @@ Use this skill when changing the Skippy staged-runtime ABI carried in
 - Do not preserve retired source include paths unless the task explicitly asks
   for compatibility. Continue to version and mirror any binary ABI change.
 
+## Graph input capabilities
+
+- Derive planned input modes from what the graph can execute, not merely from
+  allocated input tensors. Shared builders may allocate an embedding input that
+  a particular model's metadata forbids using.
+- Carry capability declarations through both helper construction and direct
+  input-bundle registration. Keep model restrictions at graph construction;
+  do not add family-name dispatch to the generic planner.
+- When adding an input-mode profile, cover both an accepting synthetic model
+  and a rejecting variant. Preserve the graph's existing rejection of invalid
+  direct input while ensuring metadata-only planning never probes that mode.
+
 ## Native API documentation
 
 - Treat Doxygen-style comments in `include/skippy.h` and
@@ -58,11 +81,11 @@ Use this skill when changing the Skippy staged-runtime ABI carried in
 
   ```bash
   scripts/prepare-llama.sh pinned
-  python3 scripts/generate-skippy-api-doc.py
-  python3 scripts/generate-skippy-api-doc.py --check
+  cargo xtool automation native-generator contracts api-doc
+  cargo xtool automation native-generator contracts api-doc --check
   ```
 
-- Commit `website/src/docs/pages/skippy-api.md` alongside the native queue
+- Commit `mesh/website/src/docs/pages/skippy-api.md` alongside the native queue
   change. The generated page must not be hand-edited, and its inventory must
   include every public header and exported function in the prepared checkout.
 
@@ -97,7 +120,7 @@ the symbol name is unchanged. List removed declarations explicitly as
 “none” when no functions or fields were deleted; this prevents reviewers from
 having to infer removals from a patch diff. Keep this inventory synchronized
 with the ABI version constants in `include/skippy/common.h` and the mirrors in
-`crates/skippy-ffi/src/lib.rs`. Do not add compatibility shims solely to
+`skippy/crates/skippy-ffi/src/lib.rs`. Do not add compatibility shims solely to
 support an older native runtime; the acceptance criterion is a synchronized
 Rust/native build and a clear version mismatch if the pieces are mixed.
 
@@ -111,21 +134,23 @@ scripts/prepare-llama.sh pinned
 
 For llama-side editing, work in `.deps/llama.cpp` or another llama.cpp
 checkout where commits can be named and inspected. Base the branch on the
-pinned upstream, then carry the stage ABI patch commits on top.
+pinned upstream, then carry core stage ABI commits, model-support commits, and
+generated family commits in that order.
 
-For an ordinary capability change, emit one focused mail-format patch after
-the current queue. Do not rewrite unrelated entries:
+For an ordinary core capability change, emit one focused mail-format patch
+after the current top-level core lane. Do not rewrite unrelated entries or put
+the patch after `model_support/` or generated shards:
 
 ```bash
 repo_root="$(pwd)"
 llama_checkout="${LLAMA_CHECKOUT:-$repo_root/.deps/llama.cpp}"
-last_patch="$(find third_party/llama.cpp/patches -maxdepth 1 -type f -name '*.patch' | sort | tail -n 1)"
+last_patch="$(find skippy/llama_cpp/patches -maxdepth 1 -type f -name '*.patch' | sort | tail -n 1)"
 last_number="${last_patch##*/}"
 last_number="${last_number%%-*}"
 next_number=$((10#$last_number + 1))
 git -C "$llama_checkout" format-patch -1 \
   --start-number "$next_number" \
-  --output-directory "$repo_root/third_party/llama.cpp/patches" HEAD
+  --output-directory "$repo_root/skippy/llama_cpp/patches" HEAD
 ```
 
 For a deliberate queue-boundary or source-layout change, rebuild the affected
@@ -144,11 +169,17 @@ git log --reverse --oneline <pinned-upstream>..<reconstructed-series-head>
 ```
 
 Move the old queue to an explicit temporary backup, generate the replacement
-into a fresh `third_party/llama.cpp/patches` directory, and retain the backup
+into a fresh `skippy/llama_cpp/patches` directory, and retain the backup
 until clean application and native compilation pass. Never keep both series or
 duplicate patch numbers in the durable directory.
 
 ## Validation
+
+Controller-managed upgrade repairs use the shared `repair-check --phase fast`
+command in `ci/llama-canary/agent-repair-prompt.md`, plus focused reproductions.
+The trusted full phase owns the complete native suite and generation/idempotence
+checks after the agent returns. The validation below remains the standalone
+development workflow; do not duplicate the trusted full gates in a coding turn.
 
 Validate patch application in a clean checkout:
 
@@ -165,7 +196,7 @@ LLAMA_WORKDIR="$tmp_root/llama.cpp" \
 
 ### Re-pinning upstream
 
-Advancing `third_party/llama.cpp/upstream.txt` can silently invalidate a patch
+Advancing `skippy/llama_cpp/upstream.txt` can silently invalidate a patch
 that depends on upstream's *ordering*, not just its symbols. The queue still
 applies, everything compiles, and the behavior is broken. This happened with
 upstream `1269cb1`, which moved `check_tensor_dims` ahead of `buft_for_tensor`
@@ -176,14 +207,18 @@ So on every re-pin, in addition to the checks above:
 
 - Read `git log <old-pin>..<new-pin> -- src/llama-model-loader.* src/llama-model.*`
   for changes to load order, not just to signatures the patches touch.
-- Prove the staged load path with a real artifact whose first block is not
-  block 0. `cargo test -p skippy-model-package` covers this via
-  `mid_stage_artifact_opens_with_the_stage_filter_applied`.
-- Confirm that test actually ran rather than skipped. It is gated on
-  `SKIPPY_CORRECTNESS_MODEL`; without it the test prints
-  `skipping mid-stage: SKIPPY_CORRECTNESS_MODEL is not set` and passes. Grep the
-  CI log for `mid_stage_artifact_opens_with_the_stage_filter_applied ... ok`, or
-  set the variable locally. A skipped gate reads identically to a pass.
+- Prove the graph-admitted load path with a real model and a stage whose first
+  block is greater than zero. Run `RUN_DENSE_CHAIN_SMOKE=1 scripts/skippy-ci-smoke.sh`
+  through `just with-lld`; its dense single-step and three-stage chain checks
+  open nonzero stage ranges and compare their output with the monolithic model.
+- Inspect `dense-binary.json` and `dense-chain.json` under the smoke report
+  directory. Require `matches: true` and confirm their `stage_models` include a
+  nonzero `layer_start`; a filtered test invocation that runs zero tests is not
+  evidence of a staged model load.
+- On Metal, also run `skippy-correctness core-parity` with `--n-gpu-layers 999`
+  and `--flash-attn enabled`, explicit model/split ranges, and both report paths.
+  Require both reports to match. This exercises the native mask-row inputs that
+  differ from the CPU smoke's disabled Flash Attention path.
 
 Compile each new public header once as C11 and once as C++17 with warnings
 treated as errors. For implementation moves, run the tests owned by the moved
@@ -195,7 +230,7 @@ For Rust fallout, run cargo commands serially:
 cargo fmt --all --check
 cargo check -p mesh-llm
 cargo test -p skippy-runtime --lib
-cargo test -p skippy-server --lib
+cargo test -p skippy-serving --lib
 cargo test -p mesh-llm --lib
 ```
 

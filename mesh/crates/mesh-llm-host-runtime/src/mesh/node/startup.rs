@@ -1,0 +1,363 @@
+use super::*;
+use mesh_llm_membership::load_or_create_key;
+
+/// The budget this host plans models against, the same one the local fit
+/// uses: accelerator memory, plus system RAM only when `gpu.host_ram_offload`
+/// is set, capped by `max_vram_gb`.
+pub fn detect_local_fit_bytes(max_vram_gb: Option<f64>, host_ram_offload: bool) -> u64 {
+    super::super::capacity::local_fit_capacity_bytes(
+        &crate::system::hardware::survey(),
+        max_vram_gb,
+        host_ram_offload,
+    )
+}
+
+pub(super) async fn startup_secret_key(role: &NodeRole) -> Result<SecretKey> {
+    if matches!(role, NodeRole::Client) || std::env::var("MESH_LLM_EPHEMERAL_KEY").is_ok() {
+        let key = SecretKey::generate();
+        tracing::info!("Using ephemeral key (unique identity)");
+        Ok(key)
+    } else {
+        load_or_create_key().await
+    }
+}
+
+/// Where the node saves a renewed ownership certificate. Renewal still works
+/// without one; the renewed certificate just is not written for `mesh-llm auth`
+/// to read, which is worth a warning.
+pub(super) fn saved_owner_attestation_path(
+    identity_directory: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    super::ownership::owner_attestation_path(identity_directory)
+        .inspect_err(|error| {
+            tracing::warn!("renewed ownership certificates will not be saved to disk: {error:#}");
+        })
+        .ok()
+}
+
+pub(crate) fn startup_transport_config() -> iroh::endpoint::QuicTransportConfig {
+    // We only raise the concurrent bidi-stream ceiling; everything else uses
+    // iroh's tuned defaults.
+    //
+    // History: this function used to override keep-alive (10s) and idle
+    // timeouts (300s connection + 300s per path). iroh 1.0 clamps per-path idle
+    // to 15s and already sends keep-alive PINGs every 5s, so those overrides do
+    // not provide the intended behavior and needlessly diverge from iroh's path
+    // management defaults.
+    // Mesh multiplexes many concurrent streams (gossip + heartbeat + inference
+    // tunnels) over one connection per peer, so we keep a generous bidi ceiling.
+    iroh::endpoint::QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(1024u32.into())
+        .build()
+}
+
+fn relay_mode_for_startup(relay: RelayConfig<'_>) -> Result<iroh::endpoint::RelayMode> {
+    let urls = effective_relay_urls(relay.policy, relay.urls);
+    if relay.policy.uses_relay() {
+        tracing::info!("Relay: {:?}", urls);
+        Ok(iroh::endpoint::RelayMode::Custom(relay_map_from_urls(
+            &urls,
+            relay.auths,
+        )?))
+    } else {
+        let reason = match relay.policy {
+            RelayPolicy::ExplicitlyDisabled => "disabled by embedded config",
+            RelayPolicy::Disabled => "disabled by LAN-only discovery mode",
+            RelayPolicy::DefaultPublic => unreachable!("default public uses relays"),
+        };
+        tracing::info!("Relay: {reason}");
+        Ok(iroh::endpoint::RelayMode::Disabled)
+    }
+}
+
+pub(super) async fn bind_mesh_endpoint(
+    secret_key: SecretKey,
+    relay: RelayConfig<'_>,
+    quic_bind: QuicBindSelection,
+) -> Result<Endpoint> {
+    let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .secret_key(secret_key)
+        .alpns(vec![
+            ALPN_V1.to_vec(),
+            skippy_protocol::STAGE_ALPN_V2.to_vec(),
+        ])
+        .transport_config(startup_transport_config())
+        .relay_mode(relay_mode_for_startup(relay)?);
+
+    if let Some(addr) = quic_bind_addr(quic_bind) {
+        tracing::info!("Binding QUIC to {addr}");
+        if !relay.policy.uses_relay() && addr.is_ipv4() {
+            // LAN-only (relay-disabled) mode with a specific IPv4 bind: clear the
+            // pre-configured default sockets first. `bind_addr` only replaces the
+            // default for the *same* address family, so binding a specific IPv4
+            // would otherwise leave the default IPv6 `[::]` socket in place. That
+            // extra local IPv6 path becomes a second candidate, and with no relay
+            // iroh's multipath negotiation across the IPv4+IPv6 locals fails with
+            // `MultipathNotNegotiated`, stalling the connection with no fallback.
+            // Pinning a single IPv4 socket keeps one local path family so the LAN
+            // direct path establishes cleanly. In relay (public) mode we keep the
+            // defaults so relay/IPv6 reachability is unaffected.
+            builder = builder.clear_ip_transports();
+        }
+        builder = builder.bind_addr(addr)?;
+    }
+
+    builder.bind().await.map_err(Into::into)
+}
+
+/// Ends startup once the embedded node is being stopped, before the hardware
+/// survey a stop can't interrupt. The endpoint is closed first: dropping it
+/// unclosed makes iroh abort it and log an error.
+pub(super) async fn end_if_stopping(endpoint: &Endpoint) -> Result<()> {
+    if let Err(stopped) = crate::sdk::embedded_shutdown::ensure_running() {
+        close_endpoint_gracefully(endpoint, "mesh").await;
+        return Err(stopped);
+    }
+    Ok(())
+}
+
+pub(super) async fn wait_for_endpoint_online(
+    endpoint: &Endpoint,
+    connected_log: &str,
+    timeout_log: &str,
+) {
+    let online = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.online());
+    tokio::select! {
+        biased;
+        // An embedded node being stopped doesn't wait out the relay; outside
+        // the embedded SDK this never resolves.
+        _ = crate::sdk::embedded_shutdown::cancelled() => {}
+        result = online => match result {
+            Ok(()) => tracing::info!("{connected_log}"),
+            Err(_) => tracing::warn!("{timeout_log}"),
+        },
+    }
+}
+
+/// Surveys the host and derives the capacity this node will advertise. The
+/// advertised reserve mirrors what the local fit withholds, so the itemized
+/// capacity and the fit target agree on the configured margin.
+pub(super) fn advertised_hardware_for_start(
+    config: &crate::plugin::MeshConfig,
+    role: &NodeRole,
+    max_vram_gb: Option<f64>,
+) -> NodeHardwareSnapshot {
+    let safety_margin_bytes =
+        crate::inference::skippy::effective_safety_margin_bytes(config.defaults.as_ref());
+    hardware_snapshot_for_start(
+        crate::system::hardware::survey(),
+        role,
+        max_vram_gb,
+        safety_margin_bytes,
+        config.gpu.host_ram_offload.unwrap_or(false),
+    )
+}
+
+pub(crate) fn hardware_snapshot_for_start(
+    hw: crate::system::hardware::HardwareSurvey,
+    role: &NodeRole,
+    max_vram_gb: Option<f64>,
+    safety_margin_bytes: u64,
+    host_ram_offload: bool,
+) -> NodeHardwareSnapshot {
+    let local_runtime_capacity_bytes =
+        super::super::capacity::local_fit_capacity_bytes(&hw, max_vram_gb, host_ram_offload);
+    let host_ram_capacity_bytes = if !host_ram_offload
+        && !hw.is_soc
+        && super::super::capacity::mesh_capacity_bytes(&hw) > 0
+    {
+        hw.ram_offload_bytes
+    } else {
+        0
+    };
+    let host_ram_offload_gain_bytes =
+        super::super::capacity::host_ram_offload_gain_bytes(&hw, max_vram_gb, host_ram_offload);
+    let mut vram_bytes = super::super::capacity::advertised_capacity_bytes(&hw, max_vram_gb);
+    let memory = super::super::capacity::advertised_memory(
+        &hw,
+        max_vram_gb,
+        safety_margin_bytes,
+        host_ram_offload,
+    );
+    let gpu_name = if matches!(role, NodeRole::Client) {
+        None
+    } else {
+        hw.gpu_name
+    };
+    let hostname = hw.hostname;
+    let is_soc = Some(hw.is_soc);
+    let gpu_vram = (!hw.gpu_vram.is_empty()).then(|| {
+        hw.gpu_vram
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let gpu_reserved_bytes = if hw.gpu_reserved.iter().all(Option::is_none) {
+        None
+    } else {
+        Some(
+            hw.gpu_reserved
+                .iter()
+                .map(|value| value.map(|v| v.to_string()).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
+
+    log_detected_vram(&mut vram_bytes, max_vram_gb);
+
+    NodeHardwareSnapshot {
+        vram_bytes,
+        local_runtime_capacity_bytes,
+        host_ram_capacity_bytes,
+        host_ram_offload_gain_bytes,
+        gpu_name,
+        hostname,
+        is_soc,
+        gpu_vram,
+        gpu_reserved_bytes,
+        memory,
+    }
+}
+
+fn detected_vram_log(vram_bytes: u64, max_vram_gb: Option<f64>) -> DetectedVramLog {
+    let detected_gb = vram_bytes as f64 / 1e9;
+    let capped_bytes = max_vram_gb
+        .map(|max_gb| ((max_gb * 1e9) as u64, max_gb))
+        .and_then(|(max_bytes, _)| (max_bytes < vram_bytes).then_some(max_bytes));
+    DetectedVramLog {
+        detected_gb,
+        max_gb: max_vram_gb,
+        capped_bytes,
+    }
+}
+
+fn log_detected_vram(vram_bytes: &mut u64, max_vram_gb: Option<f64>) {
+    let log = detected_vram_log(*vram_bytes, max_vram_gb);
+    if let Some(max_gb) = log.max_gb {
+        log_detected_vram_with_cap(vram_bytes, log.detected_gb, max_gb, log.capped_bytes);
+    } else {
+        tracing::info!("Detected VRAM: {:.1} GB", log.detected_gb);
+    }
+}
+
+fn log_detected_vram_with_cap(
+    vram_bytes: &mut u64,
+    detected_gb: f64,
+    max_gb: f64,
+    capped_bytes: Option<u64>,
+) {
+    if let Some(capped_bytes) = capped_bytes {
+        tracing::info!(
+            "Detected VRAM: {:.1} GB, capped to {:.1} GB (--max-vram)",
+            detected_gb,
+            max_gb
+        );
+        *vram_bytes = capped_bytes;
+    } else {
+        tracing::info!(
+            "Detected VRAM: {:.1} GB (--max-vram {:.1} has no effect)",
+            detected_gb,
+            max_gb
+        );
+    }
+}
+
+/// Initialize trust and sign endpoint ownership with the configured owner key.
+/// Scoped identities persist their attestation in their own state directory.
+pub(super) fn init_owner_runtime(
+    owner_config: Option<&OwnerRuntimeConfig>,
+    endpoint_id: EndpointId,
+    hostname: Option<String>,
+    identity_directory: Option<&std::path::Path>,
+) -> Result<OwnerRuntimeInit> {
+    let trust_store = owner_config
+        .map(|config| config.trust_store.clone())
+        .unwrap_or_default();
+    let trust_policy = owner_config
+        .map(|config| config.trust_policy)
+        .unwrap_or_default();
+    let owner_attestation = match owner_config.and_then(|config| config.keypair.as_ref()) {
+        Some(keypair) => Some(match identity_directory {
+            Some(directory) => {
+                let attestation = sign_node_ownership(
+                    keypair,
+                    endpoint_id.as_bytes(),
+                    current_time_unix_ms() + DEFAULT_NODE_CERT_LIFETIME_SECS * 1000,
+                    owner_config.and_then(|config| config.node_label.clone()),
+                    hostname,
+                )?;
+                save_node_ownership(
+                    &super::ownership::owner_attestation_path(Some(directory))?,
+                    &attestation,
+                )?;
+                attestation
+            }
+            None => load_or_refresh_owner_attestation(
+                keypair,
+                endpoint_id,
+                owner_config.and_then(|config| config.node_label.clone()),
+                hostname,
+            )?,
+        }),
+        None => None,
+    };
+
+    Ok(OwnerRuntimeInit {
+        trust_store,
+        trust_policy,
+        owner_attestation,
+    })
+}
+
+/// Stamp the local endpoint id as a plugin event's source.
+///
+/// Receivers read `source_peer_id` as the originating node, so the host always
+/// overwrites whatever the plugin supplied: a local plugin must not be able to
+/// name another node as the source of an event it hands over. The plugin SDK
+/// leaves the field empty on the normal path.
+pub(crate) fn stamp_plugin_event_source(endpoint_id: EndpointId, source_peer_id: &mut String) {
+    // Always stamp the local endpoint id. Receivers treat `source_peer_id` as
+    // the originator, so a local plugin must never be able to name another node
+    // here; the plugin SDK leaves the field empty on the normal path.
+    *source_peer_id = endpoint_id_hex(endpoint_id);
+}
+
+/// Load the configuration bound to this node before publishing its state.
+pub(super) fn load_config_state(
+    config_path: Option<&std::path::Path>,
+) -> Result<crate::runtime::config_state::ConfigState> {
+    let path = crate::plugin::config_path(config_path)
+        .unwrap_or_else(|_| std::path::PathBuf::from("config.toml"));
+    crate::runtime::config_state::ConfigState::load(&path)
+}
+
+/// Which model names may still be coming while the startup models resolve,
+/// before any of them is assigned to this node.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum StartupResolution {
+    /// Nothing is resolving.
+    #[default]
+    Done,
+    /// Every startup model is declared or configured under a name before it
+    /// resolves, so only these names may be coming.
+    Names(Vec<String>),
+    /// A bare local GGUF is named only once it is hashed, so any name may be.
+    AnyName,
+}
+
+impl Node {
+    pub(crate) async fn set_startup_resolution(&self, resolution: StartupResolution) {
+        *self.startup_models_resolving.lock().await = resolution;
+    }
+
+    /// True while the startup models resolve and `model_name` may be one of them.
+    pub(crate) async fn startup_model_may_be(&self, model_name: &str) -> bool {
+        match &*self.startup_models_resolving.lock().await {
+            StartupResolution::Done => false,
+            StartupResolution::Names(names) => names.iter().any(|name| name == model_name),
+            StartupResolution::AnyName => true,
+        }
+    }
+}

@@ -1,0 +1,1064 @@
+use super::common::is_retryable_context_overflow_response;
+use anyhow::{Context, Result, anyhow, bail};
+use mesh_llm_events::logging::identifiers::RequestId;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+use super::served_model_headers::{
+    SERVED_MODEL_CANONICAL_REF_HEADER, SERVED_WEIGHTS_DIGEST_HEADER, ServedModelHeaders,
+};
+use crate::network::openai::request_parse::{MAX_HEADER_BYTES, MAX_HEADERS};
+
+const MAX_RESPONSE_BODY_PREVIEW_BYTES: usize = 4 * 1024;
+
+pub(in crate::network::openai::response) struct ParsedResponseHeaders {
+    pub(in crate::network::openai::response) header_end: usize,
+    pub(in crate::network::openai::response) status_code: u16,
+    pub(in crate::network::openai::response) content_length: Option<usize>,
+    pub(in crate::network::openai::response) content_type: Option<String>,
+    pub(super) chunked: bool,
+    /// The capsule client nonce and, if the inner frontend minted it itself,
+    /// the origin marker — both echoed on the inner frontend's response, but
+    /// otherwise lost because the public-proxy response adapters below
+    /// rebuild fresh HTTP responses instead of forwarding upstream headers.
+    pub(in crate::network::openai::response) client_nonce: Option<String>,
+    pub(in crate::network::openai::response) nonce_origin: Option<String>,
+    /// The serving node's served-model headers, kept for the same reason: a
+    /// rebuilt response must still carry them back to the routing node.
+    pub(in crate::network::openai::response) served_model: ServedModelHeaders,
+}
+
+/// Append the capsule client nonce and origin-marker headers (when present)
+/// to a hand-built response header string, so response adapters that
+/// otherwise discard the upstream headers still echo them to the client.
+pub(in crate::network::openai::response) fn append_capsule_nonce_headers(
+    header: &mut String,
+    client_nonce: Option<&str>,
+    nonce_origin: Option<&str>,
+) {
+    if let Some(nonce) = client_nonce {
+        header.push_str(&format!(
+            "{}: {nonce}\r\n",
+            skippy_inference_api::lifecycle::CLIENT_NONCE_HEADER.as_str()
+        ));
+    }
+    if let Some(origin) = nonce_origin {
+        header.push_str(&format!(
+            "{}: {origin}\r\n",
+            skippy_inference_api::lifecycle::CLIENT_NONCE_ORIGIN_HEADER.as_str()
+        ));
+    }
+}
+
+/// The header the routing node echoes the resolved `x-mesh-target` peer back
+/// on, so the client can seal which peer answered without parsing
+/// provenance. See `ingress.rs`'s remote-mesh routing.
+pub(in crate::network::openai::response) const MESH_SERVED_BY_HEADER: &str = "x-mesh-served-by";
+
+/// Append the `x-mesh-served-by` header (when present) to a hand-built
+/// response header string. Sibling of `append_capsule_nonce_headers` for
+/// response adapters that rebuild headers instead of relaying them raw.
+pub(in crate::network::openai::response) fn append_mesh_served_by_header(
+    header: &mut String,
+    served_by: Option<&str>,
+) {
+    if let Some(served_by) = served_by {
+        header.push_str(&format!("{MESH_SERVED_BY_HEADER}: {served_by}\r\n"));
+    }
+}
+
+/// The request-id header every OpenAI-facing response echoes with the
+/// canonical request id, the way the management API already does
+/// (`api/management_lifecycle.rs`). A node that rebuilds a response head can
+/// no longer drop the client's trace correlation (issue #2352, papercut 4).
+pub(in crate::network::openai::response) const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Echo the canonical request id on a hand-built response header string.
+pub(in crate::network::openai::response) fn append_mesh_request_id_header(
+    header: &mut String,
+    request_id: RequestId,
+) {
+    header.push_str(&format!(
+        "{REQUEST_ID_HEADER}: {}\r\n",
+        request_id.as_uuid()
+    ));
+}
+
+/// Remove an existing `name: ...` header line (case-insensitive) from the
+/// header block `buf[..header_end]`, if one is present, and return how many
+/// bytes were removed (0 if none matched).
+///
+/// Belt-and-braces for [`insert_header_before_body`]: a value this codebase
+/// already meant to be single-valued (e.g. `x-mesh-served-by`) must never
+/// appear twice just because some upstream response already carried one —
+/// canonicalize to one value instead of appending a second.
+pub(super) fn remove_existing_header(buf: &mut Vec<u8>, header_end: usize, name: &str) -> usize {
+    let mut offset = 0usize;
+    let mut total_removed = 0usize;
+    while offset < header_end.saturating_sub(total_removed) {
+        let remaining_end = header_end - total_removed;
+        let Some(rel) = buf[offset..remaining_end]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+        else {
+            break;
+        };
+        let line_end = offset + rel + 2;
+        let is_match = buf[offset..line_end]
+            .iter()
+            .position(|&b| b == b':')
+            .is_some_and(|colon| buf[offset..offset + colon].eq_ignore_ascii_case(name.as_bytes()));
+        if is_match {
+            let removed = line_end - offset;
+            buf.drain(offset..line_end);
+            total_removed += removed;
+            // don't advance offset — the next line now starts at the same offset
+        } else {
+            offset = line_end;
+        }
+    }
+    total_removed
+}
+
+/// Splice a `name: value` header line into an already-buffered raw HTTP
+/// response, immediately before the blank line that terminates the header
+/// block, replacing any existing header of the same name (case-insensitive)
+/// rather than appending a duplicate. Returns the net change in buffer
+/// length (new line inserted minus any old line removed) so callers can
+/// adjust byte offsets computed against the pre-splice buffer. Used by relay
+/// paths that forward upstream response bytes verbatim and have no other
+/// rebuild step.
+///
+/// `header_end` must be the byte offset of the first body byte (the
+/// convention `httparse::Status::Complete` and `ParsedResponseHeaders`
+/// already use) — i.e. it points just past the terminating `\r\n\r\n`.
+pub(in crate::network::openai::response) fn insert_header_before_body(
+    buf: &mut Vec<u8>,
+    header_end: usize,
+    name: &str,
+    value: &str,
+) -> isize {
+    if header_end < 2 || header_end > buf.len() {
+        return 0;
+    }
+    let removed = remove_existing_header(buf, header_end, name);
+    let header_end = header_end - removed;
+    let mut line = Vec::with_capacity(name.len() + value.len() + 4);
+    line.extend_from_slice(name.as_bytes());
+    line.extend_from_slice(b": ");
+    line.extend(
+        value
+            .bytes()
+            .filter(|byte| *byte != b'\r' && *byte != b'\n'),
+    );
+    line.extend_from_slice(b"\r\n");
+    let inserted = line.len();
+    buf.splice(header_end - 2..header_end - 2, line);
+    inserted as isize - removed as isize
+}
+
+#[derive(Clone, Copy)]
+pub(in crate::network::openai::response) struct ResponseBodyReadLimits {
+    pub(in crate::network::openai::response) max_body_bytes: usize,
+    pub(in crate::network::openai::response) idle_timeout: Duration,
+}
+
+#[derive(Clone)]
+pub(in crate::network::openai::response) struct ResponseProbe {
+    pub(in crate::network::openai::response) buffered: Vec<u8>,
+    pub(in crate::network::openai::response) header_end: usize,
+    pub(in crate::network::openai::response) status_code: u16,
+    pub(in crate::network::openai::response) retryable_context_overflow: bool,
+}
+
+/// The rung-ladder response-leg header a SERVED node's own frontend stamps
+/// on its response (`skippy_inference_api::router::X_CAPSULE_ID_HEADER`). On a
+/// `RemoteMesh` dispatch this node did not serve the exchange, so any value
+/// here is the PEER's own header, relayed byte-for-byte — see
+/// `peer_response_header_value` and `ingress.rs`'s remote-mesh routing.
+pub(in crate::network::openai::response) const PEER_CAPSULE_ID_HEADER: &str = "x-capsule-id";
+
+/// Case-insensitive lookup of a single response header's value, scanning
+/// only the already-buffered, untouched header block the peer/upstream sent
+/// (`probe.buffered[..probe.header_end]`) — i.e. before any relay/adapter
+/// rewrite runs. Returns the first occurrence; `None` when absent or the
+/// header block fails to parse.
+pub(in crate::network::openai::response) fn peer_response_header_value(
+    buf: &[u8],
+    header_end: usize,
+    name: &str,
+) -> Option<String> {
+    let mut headers_buf = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut response = httparse::Response::new(&mut headers_buf);
+    if response.parse(&buf[..header_end.min(buf.len())]).is_err() {
+        return None;
+    }
+    response
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .and_then(|header| std::str::from_utf8(header.value).ok())
+        .map(|value| value.trim().to_string())
+}
+
+/// Remote first-byte timeout: 5 minutes. This covers the full round trip
+/// through the QUIC tunnel including remote prefill. Concurrent requests
+/// on a loaded host can legitimately take minutes. A truly dead QUIC
+/// connection will reset/error much faster than this (QUIC idle timeout,
+/// connection loss detection). The old 60s default caused spurious 503s
+/// when the remote host was alive but busy.
+fn response_first_byte_timeout() -> Duration {
+    Duration::from_secs(5 * 60)
+}
+
+pub(in crate::network::openai::response) fn response_is_event_stream(
+    headers: &ParsedResponseHeaders,
+) -> bool {
+    headers
+        .content_type
+        .as_deref()
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
+        .unwrap_or(false)
+}
+
+pub(in crate::network::openai::response) fn try_parse_response_headers(
+    buf: &[u8],
+) -> Result<Option<ParsedResponseHeaders>> {
+    let mut headers_buf = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut response = httparse::Response::new(&mut headers_buf);
+    match response.parse(buf) {
+        Ok(httparse::Status::Complete(header_end)) => {
+            let mut content_length = None;
+            let mut content_type = None;
+            let mut chunked = false;
+            let mut client_nonce = None;
+            let mut nonce_origin = None;
+            let mut served_model = ServedModelHeaders::default();
+            let nonce_header = skippy_inference_api::lifecycle::CLIENT_NONCE_HEADER.as_str();
+            let nonce_origin_header =
+                skippy_inference_api::lifecycle::CLIENT_NONCE_ORIGIN_HEADER.as_str();
+            for header in response.headers.iter() {
+                if header.name.eq_ignore_ascii_case("content-length") {
+                    let value = std::str::from_utf8(header.value)
+                        .context("invalid response Content-Length encoding")?;
+                    content_length =
+                        Some(value.trim().parse::<usize>().with_context(|| {
+                            format!("invalid response Content-Length: {value}")
+                        })?);
+                } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+                    chunked = std::str::from_utf8(header.value)?
+                        .split(',')
+                        .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
+                } else if header.name.eq_ignore_ascii_case("content-type") {
+                    content_type = Some(
+                        std::str::from_utf8(header.value)
+                            .context("invalid response Content-Type encoding")?
+                            .trim()
+                            .to_string(),
+                    );
+                } else if header.name.eq_ignore_ascii_case(nonce_header) {
+                    client_nonce = std::str::from_utf8(header.value)
+                        .ok()
+                        .map(|value| value.trim().to_string());
+                } else if header.name.eq_ignore_ascii_case(nonce_origin_header) {
+                    nonce_origin = std::str::from_utf8(header.value)
+                        .ok()
+                        .map(|value| value.trim().to_string());
+                } else if header
+                    .name
+                    .eq_ignore_ascii_case(SERVED_WEIGHTS_DIGEST_HEADER)
+                {
+                    served_model.weights_digest = std::str::from_utf8(header.value)
+                        .ok()
+                        .map(|value| value.trim().to_string());
+                } else if header
+                    .name
+                    .eq_ignore_ascii_case(SERVED_MODEL_CANONICAL_REF_HEADER)
+                {
+                    served_model.canonical_ref = std::str::from_utf8(header.value)
+                        .ok()
+                        .map(|value| value.trim().to_string());
+                }
+            }
+            Ok(Some(ParsedResponseHeaders {
+                header_end,
+                status_code: response.code.unwrap_or(0),
+                content_length,
+                content_type,
+                chunked,
+                client_nonce,
+                nonce_origin,
+                served_model,
+            }))
+        }
+        Ok(httparse::Status::Partial) => Ok(None),
+        Err(err) => Err(anyhow!("HTTP response parse error: {err}")),
+    }
+}
+
+/// Read the next chunk of HTTP response data without any timeout.
+/// Used by relay paths whose own body limits provide the lifetime bound.
+pub(in crate::network::openai::response) async fn read_response_chunk<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<usize> {
+    let mut chunk = [0u8; 8192];
+    let read_result = reader.read(&mut chunk).await?;
+    if read_result == 0 {
+        bail!("unexpected EOF while reading HTTP response");
+    }
+    buf.extend_from_slice(&chunk[..read_result]);
+    Ok(read_result)
+}
+
+async fn read_response_chunk_with_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    timeout: Duration,
+) -> Result<usize> {
+    tokio::time::timeout(timeout, read_response_chunk(reader, buf))
+        .await
+        .context("upstream response continuation read timeout")?
+}
+
+pub(in crate::network::openai::response) async fn read_transformed_response_body<
+    R: AsyncRead + Unpin,
+>(
+    reader: &mut R,
+    buffered: &mut Vec<u8>,
+    header_end: usize,
+    content_length: Option<usize>,
+    limits: ResponseBodyReadLimits,
+) -> Result<usize> {
+    if header_end > buffered.len() {
+        bail!("invalid HTTP response header boundary");
+    }
+    let buffered_body_bytes = buffered.len() - header_end;
+    if buffered_body_bytes > limits.max_body_bytes {
+        bail!(
+            "upstream success response body exceeds {} bytes",
+            limits.max_body_bytes
+        );
+    }
+
+    let expected_end = content_length
+        .map(|content_length| {
+            if content_length > limits.max_body_bytes {
+                bail!(
+                    "upstream success response Content-Length exceeds {} bytes",
+                    limits.max_body_bytes
+                );
+            }
+            header_end
+                .checked_add(content_length)
+                .ok_or_else(|| anyhow!("upstream success response Content-Length overflow"))
+        })
+        .transpose()?;
+
+    loop {
+        if let Some(expected_end) = expected_end
+            && buffered.len() >= expected_end
+        {
+            return Ok(expected_end);
+        }
+
+        let mut chunk = [0u8; 8192];
+        let read_result = tokio::time::timeout(limits.idle_timeout, reader.read(&mut chunk))
+            .await
+            .context("upstream success response body idle timeout")??;
+        if read_result == 0 {
+            return expected_end.map_or_else(
+                || Ok(buffered.len()),
+                |_| Err(anyhow!("unexpected EOF while reading HTTP response body")),
+            );
+        }
+        let next_body_bytes = buffered
+            .len()
+            .saturating_sub(header_end)
+            .saturating_add(read_result);
+        if next_body_bytes > limits.max_body_bytes {
+            bail!(
+                "upstream success response body exceeds {} bytes",
+                limits.max_body_bytes
+            );
+        }
+        buffered.extend_from_slice(&chunk[..read_result]);
+    }
+}
+
+/// Probes a remote OpenAI response using the configured remote first-byte
+/// budget and returns its parsed status and headers.
+pub(in crate::network::openai::response) async fn probe_http_response<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<ResponseProbe> {
+    probe_http_response_with_timeout(reader, response_first_byte_timeout()).await
+}
+
+/// Like `probe_http_response` but with the local surface's first-byte budget,
+/// which is far longer than the remote default. Prefill on a busy or slow
+/// machine can legitimately take minutes (large prompts, concurrent slot
+/// contention, slower hardware), and a non-streaming request's first response
+/// byte is its entire completion - so this budget bounds prefill plus decode,
+/// not merely a wedged connection. [`local_response_first_byte_timeout`] says
+/// how an operator raises or removes it (#2195).
+///
+/// The budget is passed as a plain `Duration` on purpose: see the note on
+/// [`probe_http_response_with_timeout`].
+pub(in crate::network::openai::response) async fn probe_http_response_local<
+    R: AsyncRead + Unpin,
+>(
+    reader: &mut R,
+) -> Result<ResponseProbe> {
+    probe_http_response_with_timeout(reader, local_response_first_byte_timeout()).await
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_RESPONSE_FIRST_BYTE_TIMEOUT: Duration;
+}
+
+/// Operator knob for the local OpenAI surface first-byte budget, in whole
+/// seconds. `0` removes the deadline.
+pub(in crate::network::openai::response) const LOCAL_FIRST_BYTE_TIMEOUT_SECS_ENV: &str =
+    "MESH_LLM_OPENAI_FIRST_BYTE_TIMEOUT_SECS";
+
+/// Built-in local first-byte budget: 10 minutes.
+const DEFAULT_LOCAL_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Lets the frontend return its timeout response before the local proxy gives up.
+const LOCAL_FIRST_BYTE_TIMEOUT_GRACE: Duration = Duration::from_secs(1);
+
+/// Largest budget this deadline can represent, and what "removed" resolves to.
+/// `tokio::time::timeout` panics past its far-future limit, so the budget is
+/// clamped here instead of crashing the host on its first local request. At
+/// ~49 days it is beyond any request a client will keep open, so it behaves as
+/// no deadline without adding an optional branch to the probe's hot loop.
+const MAX_LOCAL_FIRST_BYTE_TIMEOUT: Duration = Duration::from_millis(u32::MAX as u64);
+
+/// Local OpenAI surface first-byte budget.
+///
+/// `MESH_LLM_OPENAI_FIRST_BYTE_TIMEOUT_SECS` names this layer directly and
+/// always wins; `0` removes the deadline. When only the inner Skippy frontend's
+/// `MESH_OPENAI_BACKEND_TIMEOUT_SECS` is configured, this budget uses the
+/// 10-minute default or stays one second longer than the frontend deadline,
+/// whichever is longer. It is removed together with the frontend deadline
+/// when the operator disables that timeout. Otherwise the frontend's own
+/// OpenAI-shaped 504 could be unreachable and the operator's setting silently
+/// capped here (#2195).
+fn local_response_first_byte_timeout() -> Duration {
+    #[cfg(test)]
+    if let Ok(timeout) = TEST_RESPONSE_FIRST_BYTE_TIMEOUT.try_with(|timeout| *timeout) {
+        return timeout;
+    }
+
+    static EXPLICIT: std::sync::OnceLock<Option<Option<Duration>>> = std::sync::OnceLock::new();
+    let explicit = EXPLICIT.get_or_init(|| {
+        let value = std::env::var_os(LOCAL_FIRST_BYTE_TIMEOUT_SECS_ENV);
+        parse_first_byte_timeout(LOCAL_FIRST_BYTE_TIMEOUT_SECS_ENV, value.as_deref())
+    });
+    resolve_local_first_byte_timeout(
+        *explicit,
+        skippy_inference_api::router::configured_backend_timeout(),
+    )
+}
+
+/// Pure precedence behind [`local_response_first_byte_timeout`], kept free of
+/// the process environment so the table is testable directly. Each layer is
+/// `None` when unset, `Some(None)` when the operator removed it, and
+/// `Some(Some(budget))` when configured.
+fn resolve_local_first_byte_timeout(
+    explicit: Option<Option<Duration>>,
+    inner_backend: Option<Option<Duration>>,
+) -> Duration {
+    if let Some(explicit) = explicit {
+        return explicit.unwrap_or(MAX_LOCAL_FIRST_BYTE_TIMEOUT);
+    }
+    match inner_backend {
+        None => DEFAULT_LOCAL_FIRST_BYTE_TIMEOUT,
+        Some(None) => MAX_LOCAL_FIRST_BYTE_TIMEOUT,
+        Some(Some(inner)) => DEFAULT_LOCAL_FIRST_BYTE_TIMEOUT.max(
+            inner
+                .saturating_add(LOCAL_FIRST_BYTE_TIMEOUT_GRACE)
+                .min(MAX_LOCAL_FIRST_BYTE_TIMEOUT),
+        ),
+    }
+}
+
+/// Pure parse behind reading a whole-seconds first-byte budget from `env`.
+/// `0` means "no deadline"; an unusable value is warned about and reported as
+/// unset, leaving the defaults in place - the same handling the inner frontend
+/// gives its own timeout variable.
+fn parse_first_byte_timeout(
+    env: &str,
+    value: Option<&std::ffi::OsStr>,
+) -> Option<Option<Duration>> {
+    let value = value?;
+    let Some(value) = value.to_str() else {
+        tracing::warn!(
+            env,
+            "ignoring non-UTF-8 local first-byte timeout configuration"
+        );
+        return None;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(0) => Some(None),
+        Ok(secs) => Some(Some(if secs > MAX_LOCAL_FIRST_BYTE_TIMEOUT.as_secs() {
+            MAX_LOCAL_FIRST_BYTE_TIMEOUT
+        } else {
+            Duration::from_secs(secs)
+        })),
+        Err(_) => {
+            tracing::warn!(
+                env,
+                value = %value,
+                "ignoring invalid local first-byte timeout configuration; expected whole seconds"
+            );
+            None
+        }
+    }
+}
+
+/// Reads and parses an HTTP response under one overall deadline.
+///
+/// The same `timeout` bounds the first byte and all continuation reads, so a
+/// peer cannot extend the budget by sending partial headers or body chunks.
+pub(in crate::network::openai::response) async fn probe_http_response_with_timeout<
+    R: AsyncRead + Unpin,
+>(
+    reader: &mut R,
+    timeout: Duration,
+) -> Result<ResponseProbe> {
+    let started = Instant::now();
+    let mut buffered = Vec::with_capacity(8192);
+    let parsed = loop {
+        if let Some(parsed) = try_parse_response_headers(&buffered)? {
+            break parsed;
+        }
+        let first_read = buffered.is_empty();
+        if first_read {
+            let mut chunk = [0u8; 8192];
+            let read_timeout = timeout.saturating_sub(started.elapsed());
+            let read_result = tokio::time::timeout(read_timeout, reader.read(&mut chunk))
+                .await
+                .map_err(|error| {
+                    anyhow!(error).context(format!(
+                        "upstream sent no response within {:.3}s",
+                        timeout.as_secs_f64()
+                    ))
+                })??;
+            if read_result == 0 {
+                bail!("unexpected EOF while reading HTTP response");
+            }
+            buffered.extend_from_slice(&chunk[..read_result]);
+        } else {
+            let read_timeout = timeout.saturating_sub(started.elapsed());
+            read_response_chunk_with_timeout(reader, &mut buffered, read_timeout).await?;
+        }
+        if buffered.len() > MAX_HEADER_BYTES {
+            bail!("HTTP response headers exceed {MAX_HEADER_BYTES} bytes");
+        }
+    };
+
+    let preview_len = if parsed.status_code == 400 {
+        parsed
+            .content_length
+            .map(|value| value.min(MAX_RESPONSE_BODY_PREVIEW_BYTES))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    while buffered.len() < parsed.header_end + preview_len {
+        let read_timeout = timeout.saturating_sub(started.elapsed());
+        read_response_chunk_with_timeout(reader, &mut buffered, read_timeout).await?;
+    }
+
+    let retryable_context_overflow = parsed.status_code == 400
+        && preview_len > 0
+        && is_retryable_context_overflow_response(
+            &buffered[parsed.header_end..parsed.header_end + preview_len],
+        );
+    tracing::debug!(
+        status_code = parsed.status_code,
+        header_bytes = parsed.header_end,
+        probe_ms = started.elapsed().as_millis(),
+        "openai transport: upstream response probe complete"
+    );
+
+    Ok(ResponseProbe {
+        buffered,
+        header_end: parsed.header_end,
+        status_code: parsed.status_code,
+        retryable_context_overflow,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::openai::response::common::is_timeout_error;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn insert_header_before_body_splices_before_the_blank_line() {
+        let body = b"{}";
+        let header = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+        let mut buf = header.to_vec();
+        buf.extend_from_slice(body);
+        let header_end = header.len();
+
+        let inserted = insert_header_before_body(&mut buf, header_end, "x-mesh-served-by", "ab12");
+
+        let expected = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nx-mesh-served-by: ab12\r\n\r\n{}";
+        assert_eq!(buf, expected);
+        assert_eq!(
+            inserted,
+            (expected.len() - (header.len() + body.len())) as isize
+        );
+        // The body bytes themselves must be untouched, just shifted.
+        assert_eq!(&buf[buf.len() - body.len()..], body);
+    }
+
+    /// Regression (erlich review, 2026-09-07 round 2 / ndizazzo P2c): a
+    /// response that already carries the header (e.g. echoed back verbatim
+    /// from a peer) must end up with exactly one value, not two appended
+    /// copies that a client combining repeated fields would read as `id, id`.
+    #[test]
+    fn insert_header_before_body_replaces_an_existing_value_instead_of_duplicating() {
+        let body = b"{}";
+        let header = b"HTTP/1.1 200 OK\r\nx-mesh-served-by: stale\r\nContent-Length: 2\r\n\r\n";
+        let mut buf = header.to_vec();
+        buf.extend_from_slice(body);
+        let header_end = header.len();
+
+        insert_header_before_body(&mut buf, header_end, "x-mesh-served-by", "fresh");
+
+        let text = String::from_utf8_lossy(&buf);
+        assert_eq!(
+            text.matches("x-mesh-served-by:").count(),
+            1,
+            "expected exactly one served-by header, got: {text}"
+        );
+        assert!(
+            text.contains("x-mesh-served-by: fresh\r\n"),
+            "expected the new value to win: {text}"
+        );
+        assert!(!text.contains("stale"), "stale value must be gone: {text}");
+        assert!(buf.ends_with(body), "body must survive the replace: {text}");
+    }
+
+    /// Regression (CodeRabbit, PR #1671: "the header-removal loop stops
+    /// after the first case-insensitive match"): a response carrying TWO
+    /// pre-existing `x-mesh-served-by` occurrences (mixed case, as an
+    /// upstream that itself failed to canonicalize might produce) must end
+    /// up with exactly one value after the splice, not one stale duplicate
+    /// left behind by a loop that returns after its first removal.
+    #[test]
+    fn insert_header_before_body_removes_every_duplicate_not_just_the_first() {
+        let body = b"{}";
+        let header = b"HTTP/1.1 200 OK\r\nx-mesh-served-by: first\r\nContent-Length: 2\r\nX-Mesh-Served-By: second\r\n\r\n";
+        let mut buf = header.to_vec();
+        buf.extend_from_slice(body);
+        let header_end = header.len();
+
+        insert_header_before_body(&mut buf, header_end, "x-mesh-served-by", "fresh");
+
+        let text = String::from_utf8_lossy(&buf);
+        assert_eq!(
+            text.to_ascii_lowercase()
+                .matches("x-mesh-served-by:")
+                .count(),
+            1,
+            "expected every duplicate collapsed to one header, got: {text}"
+        );
+        assert!(
+            text.contains("x-mesh-served-by: fresh\r\n"),
+            "expected the new value to win: {text}"
+        );
+        assert!(
+            !text.contains("first"),
+            "first duplicate must be gone: {text}"
+        );
+        assert!(
+            !text.contains("second"),
+            "second duplicate must be gone: {text}"
+        );
+        assert!(buf.ends_with(body), "body must survive the replace: {text}");
+    }
+
+    #[test]
+    fn insert_header_before_body_replace_is_case_insensitive() {
+        let header = b"HTTP/1.1 200 OK\r\nX-Mesh-Served-By: stale\r\n\r\n";
+        let mut buf = header.to_vec();
+        let header_end = header.len();
+
+        insert_header_before_body(&mut buf, header_end, "x-mesh-served-by", "fresh");
+
+        let text = String::from_utf8_lossy(&buf);
+        assert_eq!(
+            text.to_ascii_lowercase()
+                .matches("x-mesh-served-by:")
+                .count(),
+            1,
+            "expected exactly one served-by header regardless of case, got: {text}"
+        );
+        assert!(text.contains("fresh"));
+    }
+
+    #[test]
+    fn insert_header_before_body_strips_crlf_from_the_value() {
+        let header = b"HTTP/1.1 200 OK\r\n\r\n";
+        let mut buf = header.to_vec();
+        let header_end = header.len();
+
+        insert_header_before_body(&mut buf, header_end, "x-mesh-served-by", "ab\r\n12");
+
+        assert!(
+            String::from_utf8_lossy(&buf).contains("x-mesh-served-by: ab12\r\n"),
+            "CR/LF in the value must not let it smuggle extra header lines: {}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
+    #[test]
+    fn peer_response_header_value_reads_case_insensitively() {
+        let header = b"HTTP/1.1 200 OK\r\nX-Capsule-Id: cap-123\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            peer_response_header_value(header, header.len(), "x-capsule-id"),
+            Some("cap-123".to_string())
+        );
+    }
+
+    #[test]
+    fn peer_response_header_value_absent_is_none() {
+        let header = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            peer_response_header_value(header, header.len(), PEER_CAPSULE_ID_HEADER),
+            None
+        );
+    }
+
+    /// The header value is recorded verbatim regardless of whether it is
+    /// genuinely the peer's own id or something else entirely — this layer
+    /// performs no verification, only observation (see
+    /// `CapsuleIdProvenance::PeerAsserted`).
+    #[test]
+    fn peer_response_header_value_never_validates_the_value() {
+        let header =
+            b"HTTP/1.1 200 OK\r\nX-Capsule-Id: not-a-real-capsule-id\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            peer_response_header_value(header, header.len(), PEER_CAPSULE_ID_HEADER),
+            Some("not-a-real-capsule-id".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn transformed_response_rejects_oversized_content_length_before_reading() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let mut buffered = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        let header_end = buffered.len();
+
+        let error = read_transformed_response_body(
+            &mut reader,
+            &mut buffered,
+            header_end,
+            Some(9),
+            ResponseBodyReadLimits {
+                max_body_bytes: 8,
+                idle_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect_err("oversized declared body must be rejected");
+
+        assert!(error.to_string().contains("Content-Length exceeds 8 bytes"));
+    }
+
+    #[tokio::test]
+    async fn transformed_response_rejects_oversized_unframed_body() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"123456789").await.unwrap();
+        drop(writer);
+        let mut buffered = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        let header_end = buffered.len();
+
+        let error = read_transformed_response_body(
+            &mut reader,
+            &mut buffered,
+            header_end,
+            None,
+            ResponseBodyReadLimits {
+                max_body_bytes: 8,
+                idle_timeout: Duration::from_secs(1),
+            },
+        )
+        .await
+        .expect_err("oversized unframed body must be rejected");
+
+        assert!(error.to_string().contains("body exceeds 8 bytes"));
+    }
+
+    #[tokio::test]
+    async fn transformed_response_body_read_has_idle_timeout() {
+        let (_writer, mut reader) = tokio::io::duplex(64);
+        let mut buffered = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        let header_end = buffered.len();
+
+        let error = read_transformed_response_body(
+            &mut reader,
+            &mut buffered,
+            header_end,
+            None,
+            ResponseBodyReadLimits {
+                max_body_bytes: 8,
+                idle_timeout: Duration::from_millis(10),
+            },
+        )
+        .await
+        .expect_err("idle body read must time out");
+
+        assert!(is_timeout_error(&error), "unexpected error: {error:#}");
+    }
+
+    #[tokio::test]
+    async fn probe_continuation_read_has_timeout_after_partial_headers() {
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        writer.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            probe_http_response_with_timeout(&mut reader, Duration::from_millis(10)),
+        )
+        .await
+        .expect("partial response headers must honor the configured timeout");
+        let error = match result {
+            Ok(_) => panic!("a stalled partial header must time out"),
+            Err(error) => error,
+        };
+
+        assert!(is_timeout_error(&error), "unexpected error: {error:#}");
+        assert!(error.to_string().contains("continuation read timeout"));
+    }
+
+    #[tokio::test]
+    async fn probe_partial_headers_share_one_timeout_budget() {
+        let timeout_budget = Duration::from_millis(100);
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"H").await.unwrap();
+            for byte in b"TTP/1.1 200 OK\r\n" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if writer.write_all(&[*byte]).await.is_err() {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            probe_http_response_with_timeout(&mut reader, timeout_budget),
+        )
+        .await
+        .expect("partial headers must time out before the outer guard");
+        let elapsed = started.elapsed();
+        writer_task.abort();
+
+        let error = match result {
+            Ok(_) => panic!("a partial header stream must time out"),
+            Err(error) => error,
+        };
+        assert!(is_timeout_error(&error), "unexpected error: {error:#}");
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "partial bytes extended the overall header budget: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_probe_http_response_local_tolerates_slow_first_byte() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let _ = server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await;
+        });
+
+        let mut reader = client;
+        let result = super::probe_http_response_local(&mut reader).await;
+        assert!(
+            result.is_ok(),
+            "probe_http_response_local should NOT timeout for slow local responses"
+        );
+        assert_eq!(result.unwrap().status_code, 200);
+    }
+
+    /// #2195: a non-streaming local request's first response byte is the whole
+    /// completion, so a prefill longer than the built-in local first-byte
+    /// deadline must be survivable by raising that deadline. The budget is read
+    /// from the environment, so the assertion runs in a child process (the
+    /// `mesh-llm-config` idiom for env-driven behavior: mutating the shared
+    /// test process environment races every other test in the binary).
+    #[tokio::test]
+    async fn local_first_byte_budget_is_configurable() {
+        if !mesh_llm_config::env_override_in_child_for_test(
+            concat!(module_path!(), "::local_first_byte_budget_is_configurable"),
+            "MESH_LLM_OPENAI_FIRST_BYTE_TIMEOUT_SECS",
+            "1",
+        ) {
+            return;
+        }
+
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = writer
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await;
+        });
+
+        let started = Instant::now();
+        let probe = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::probe_http_response_local(&mut reader),
+        )
+        .await
+        .expect("a configured 1s first-byte budget must end the wait, not the built-in default");
+        let elapsed = started.elapsed();
+        let result = match probe {
+            Ok(_) => panic!("a first byte later than the configured budget must be a timeout"),
+            Err(error) => error,
+        };
+
+        assert!(is_timeout_error(&result), "unexpected error: {result:#}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the configured 1s first-byte budget was not applied: {elapsed:?}"
+        );
+    }
+
+    /// The precedence table behind the local budget, including the coupling to
+    /// the inner Skippy frontend's deadline (#2195). Inputs are tri-state -
+    /// unset, removed by the operator, or configured - while the resolved
+    /// budget is one duration.
+    #[test]
+    fn local_first_byte_budget_precedence_covers_both_timeout_layers() {
+        let configured = |value: u64| Some(Some(Duration::from_secs(value)));
+
+        // The host knob names this layer, so it wins in both directions.
+        assert_eq!(
+            resolve_local_first_byte_timeout(configured(1800), None),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            resolve_local_first_byte_timeout(configured(30), configured(1800)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            resolve_local_first_byte_timeout(Some(None), configured(1800)),
+            MAX_LOCAL_FIRST_BYTE_TIMEOUT
+        );
+
+        // Nothing configured: the built-in 10 minute budget.
+        assert_eq!(
+            resolve_local_first_byte_timeout(None, None),
+            DEFAULT_LOCAL_FIRST_BYTE_TIMEOUT
+        );
+
+        // Only the inner frontend's deadline is configured. Give it a second
+        // to return its 504 before the proxy's own deadline fires.
+        assert_eq!(
+            resolve_local_first_byte_timeout(None, configured(1800)),
+            Duration::from_secs(1801)
+        );
+        assert_eq!(
+            resolve_local_first_byte_timeout(None, configured(600)),
+            Duration::from_secs(601)
+        );
+        assert_eq!(
+            resolve_local_first_byte_timeout(None, configured(60)),
+            DEFAULT_LOCAL_FIRST_BYTE_TIMEOUT
+        );
+
+        // Inner deadline removed: the outer proxy removes its own too.
+        assert_eq!(
+            resolve_local_first_byte_timeout(None, Some(None)),
+            MAX_LOCAL_FIRST_BYTE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn invalid_local_first_byte_budget_warns_once_per_process() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tracing_subscriber::prelude::*;
+
+        if !mesh_llm_config::env_override_in_child_for_test(
+            concat!(
+                module_path!(),
+                "::invalid_local_first_byte_budget_warns_once_per_process"
+            ),
+            LOCAL_FIRST_BYTE_TIMEOUT_SECS_ENV,
+            "invalid",
+        ) {
+            return;
+        }
+        struct Warnings(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN
+                    && event.metadata().target() == module_path!().trim_end_matches("::tests")
+                {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(Warnings(warnings.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let first = local_response_first_byte_timeout();
+            assert_eq!(local_response_first_byte_timeout(), first);
+        });
+        assert_eq!(warnings.load(Ordering::Relaxed), 1);
+    }
+
+    /// The budget is whole seconds, `0` removes it, and an unusable value
+    /// leaves the defaults in place rather than being half-applied.
+    #[test]
+    fn local_first_byte_budget_parses_whole_seconds_only() {
+        let parse = |value: &str| {
+            parse_first_byte_timeout(
+                LOCAL_FIRST_BYTE_TIMEOUT_SECS_ENV,
+                Some(std::ffi::OsStr::new(value)),
+            )
+        };
+
+        assert_eq!(parse("1800"), Some(Some(Duration::from_secs(1800))));
+        assert_eq!(parse(" 1800 "), Some(Some(Duration::from_secs(1800))));
+        assert_eq!(parse("0"), Some(None));
+        assert_eq!(parse("10min"), None);
+        assert_eq!(parse(""), None);
+        // Past tokio's far-future limit the budget clamps instead of panicking
+        // the host on its first local request.
+        assert_eq!(
+            parse("99999999999"),
+            Some(Some(MAX_LOCAL_FIRST_BYTE_TIMEOUT))
+        );
+    }
+}

@@ -1,0 +1,1029 @@
+use super::cancellation::{CancelUpstream, cancel_upstream_if_client_disconnected};
+use super::common::{
+    PeerCapsuleIdSink, ResponseRetryPolicy, RouteAttemptLoggingContext, RouteAttemptResult,
+    retryable_route_result_from_error,
+};
+use super::dispatch::{RelayAttemptContext, relay_attempted_response};
+use super::probe::{
+    PEER_CAPSULE_ID_HEADER, ResponseProbe, peer_response_header_value, probe_http_response,
+    probe_http_response_local,
+};
+use super::served_model_headers::{ServedModelHeaders, set_served_model_headers};
+use crate::logging::OpenAiRouteObserver;
+use crate::mesh;
+use crate::network::openai::client_stream::ClientStream;
+use crate::network::openai::forwarded_request::prepare_peer_forwarded_request;
+use crate::network::openai::request_normalize::ResponseAdapter;
+use anyhow::Result;
+use mesh_llm_events::logging::identifiers::RequestId;
+use std::future::Future;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+/// Forward a request to local inference on `port`.
+pub(in crate::network::openai) async fn route_local_attempt(
+    node: &mesh::Node,
+    tcp_stream: &mut ClientStream,
+    port: u16,
+    model: Option<&str>,
+    prefetched: &[u8],
+    logging: RouteAttemptLoggingContext<'_>,
+) -> RouteAttemptResult {
+    let RouteAttemptLoggingContext {
+        request_id,
+        retry_policy,
+        response_adapter,
+        route_observer,
+        served_by,
+        peer_capsule_id,
+    } = logging;
+    let served_model = served_model_headers_for_mesh_peer(node, tcp_stream, model, port).await;
+    let Ok((_instance_request, mut upstream)) = acquire_local_attempt_upstream(node, port).await
+    else {
+        return RouteAttemptResult::RetryableUnavailable;
+    };
+    let _inflight = node.begin_inflight_request();
+    let _ = upstream.set_nodelay(true);
+    if let Err(err) = forward_buffered_request(&mut upstream, prefetched).await {
+        tracing::warn!(
+            "API proxy: failed to forward buffered request to local OpenAI surface on {port}: {err}"
+        );
+        return RouteAttemptResult::RetryableUnavailable;
+    }
+    route_local_attempt_after_forward(
+        tcp_stream,
+        &mut upstream,
+        port,
+        request_id,
+        retry_policy,
+        response_adapter,
+        served_by,
+        served_model.as_ref(),
+        peer_capsule_id,
+        route_observer,
+    )
+    .await
+}
+
+/// This node's served-model headers for `model`, to return to a mesh peer
+/// that asked this node to serve it (see `served_model_headers`). `None` for
+/// a local client, which reads this node's own exchange events, and when this
+/// node knows nothing about the model.
+async fn served_model_headers_for_mesh_peer(
+    node: &mesh::Node,
+    tcp_stream: &ClientStream,
+    model: Option<&str>,
+    port: u16,
+) -> Option<ServedModelHeaders> {
+    let model = model?;
+    if !tcp_stream.is_mesh_peer() {
+        return None;
+    }
+    ServedModelHeaders::for_served_model(node, model, Some(port)).await
+}
+
+async fn acquire_local_attempt_upstream(
+    node: &mesh::Node,
+    port: u16,
+) -> Result<(Option<crate::runtime::InstanceRequestGuard>, TcpStream), ()> {
+    let instance_request = node
+        .begin_runtime_instance_request(port)
+        .await
+        .map_err(|error| {
+            tracing::debug!(%error, port, "local runtime instance rejected new work");
+        })?;
+    let upstream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .map_err(|error| {
+            tracing::warn!("API proxy: can't reach local OpenAI surface on {port}: {error}");
+        })?;
+    Ok((instance_request, upstream))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn route_local_attempt_after_forward<U: AsyncRead + Unpin + CancelUpstream>(
+    tcp_stream: &mut ClientStream,
+    upstream: &mut U,
+    port: u16,
+    request_id: RequestId,
+    retry_policy: ResponseRetryPolicy,
+    response_adapter: ResponseAdapter,
+    served_by: Option<&str>,
+    served_model: Option<&ServedModelHeaders>,
+    peer_capsule_id: Option<&PeerCapsuleIdSink>,
+    route_observer: OpenAiRouteObserver<'_>,
+) -> RouteAttemptResult {
+    match probe_with_downstream_disconnect(tcp_stream, probe_http_response_local(upstream)).await {
+        ProbeOutcome::ClientDisconnected => {
+            cancel_upstream_if_client_disconnected(RouteAttemptResult::ClientDisconnected, upstream)
+                .await
+        }
+        ProbeOutcome::Response(Ok(mut probe)) => {
+            record_peer_response_markers(peer_capsule_id, &probe);
+            // Recorded before the headers are set below, so this node never
+            // records its own model as a peer's, and a paid seller's headers
+            // read here never reach this node's client.
+            set_served_model_headers(&mut probe, served_model);
+            let result = relay_attempted_response(
+                tcp_stream,
+                upstream,
+                probe,
+                RelayAttemptContext {
+                    request_id,
+                    disconnect_message: "API proxy (local): downstream client disconnected during relay",
+                    commit_message: "API proxy (local) ended after commit",
+                    served_by,
+                    route_observer,
+                },
+                retry_policy,
+                response_adapter,
+            )
+            .await;
+            cancel_upstream_if_client_disconnected(result, upstream).await
+        }
+        ProbeOutcome::Response(Err(err)) => {
+            tracing::warn!(
+                "API proxy: failed to read local response from OpenAI surface on {port}: {err}"
+            );
+            retryable_route_result_from_error(&err)
+        }
+    }
+}
+
+enum ProbeOutcome {
+    ClientDisconnected,
+    Response(Result<ResponseProbe>),
+}
+
+/// Race the complete upstream response probe against a non-consuming
+/// downstream close check. Pipelined TCP bytes leave the watcher pending, while
+/// a TCP reset or QUIC STOP_SENDING reports a client disconnect promptly.
+async fn probe_with_downstream_disconnect<F>(client: &ClientStream, probe: F) -> ProbeOutcome
+where
+    F: Future<Output = Result<ResponseProbe>>,
+{
+    tokio::pin!(probe);
+    tokio::select! {
+        biased;
+        disconnected = client.wait_for_response_disconnect() => {
+            debug_assert!(disconnected);
+            ProbeOutcome::ClientDisconnected
+        }
+        response = &mut probe => ProbeOutcome::Response(response),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_remote_attempt_after_forward<R: AsyncRead + Unpin + CancelUpstream>(
+    tcp_stream: &mut ClientStream,
+    quic_recv: &mut R,
+    host_id: iroh::EndpointId,
+    request_id: RequestId,
+    retry_policy: ResponseRetryPolicy,
+    response_adapter: ResponseAdapter,
+    served_by: Option<&str>,
+    peer_capsule_id: Option<&PeerCapsuleIdSink>,
+    route_observer: OpenAiRouteObserver<'_>,
+) -> RouteAttemptResult {
+    match probe_with_downstream_disconnect(tcp_stream, probe_http_response(quic_recv)).await {
+        ProbeOutcome::ClientDisconnected => {
+            cancel_upstream_if_client_disconnected(
+                RouteAttemptResult::ClientDisconnected,
+                quic_recv,
+            )
+            .await
+        }
+        ProbeOutcome::Response(Ok(mut probe)) => {
+            record_peer_response_markers(peer_capsule_id, &probe);
+            // The peer's served-model headers are for this node's own exchange
+            // events; they are never relayed on to this node's client.
+            set_served_model_headers(&mut probe, None);
+            let result = relay_attempted_response(
+                tcp_stream,
+                quic_recv,
+                probe,
+                RelayAttemptContext {
+                    request_id,
+                    disconnect_message: "API proxy (remote): downstream client disconnected during relay",
+                    commit_message: "API proxy (remote) ended after commit",
+                    served_by,
+                    route_observer,
+                },
+                retry_policy,
+                response_adapter,
+            )
+            .await;
+            cancel_upstream_if_client_disconnected(result, quic_recv).await
+        }
+        ProbeOutcome::Response(Err(err)) => {
+            tracing::warn!(
+                "API proxy: failed to read response from host {}: {err}",
+                host_id.fmt_short()
+            );
+            retryable_route_result_from_error(&err)
+        }
+    }
+}
+
+pub(in crate::network::openai) async fn route_remote_attempt(
+    node: &mesh::Node,
+    tcp_stream: &mut ClientStream,
+    host_id: iroh::EndpointId,
+    prefetched: &[u8],
+    logging: RouteAttemptLoggingContext<'_>,
+) -> RouteAttemptResult {
+    let RouteAttemptLoggingContext {
+        request_id,
+        retry_policy,
+        response_adapter,
+        route_observer,
+        served_by,
+        peer_capsule_id,
+    } = logging;
+    let (mut quic_send, mut quic_recv) = match node.open_http_tunnel(host_id).await {
+        Ok(tunnel) => tunnel,
+        Err(err) => {
+            tracing::warn!(
+                "API proxy: can't tunnel to host {}: {err}",
+                host_id.fmt_short()
+            );
+            return retryable_route_result_from_error(&err);
+        }
+    };
+
+    if forward_peer_request(&mut quic_send, host_id, prefetched)
+        .await
+        .is_err()
+    {
+        return RouteAttemptResult::RetryableUnavailable;
+    }
+
+    route_remote_attempt_after_forward(
+        tcp_stream,
+        &mut quic_recv,
+        host_id,
+        request_id,
+        retry_policy,
+        response_adapter,
+        served_by,
+        peer_capsule_id,
+        route_observer,
+    )
+    .await
+}
+
+async fn forward_peer_request(
+    quic_send: &mut iroh::endpoint::SendStream,
+    host_id: iroh::EndpointId,
+    prefetched: &[u8],
+) -> Result<(), ()> {
+    // Caller credentials are meaningful at ingress, not on a remote peer.
+    let peer_request = match prepare_peer_forwarded_request(prefetched) {
+        Ok(request) => request,
+        Err(err) => {
+            tracing::warn!(
+                "API proxy: refusing to forward malformed request to host {}: {err}",
+                host_id.fmt_short()
+            );
+            return Err(());
+        }
+    };
+
+    if let Err(err) = quic_send.write_all(&peer_request).await {
+        tracing::warn!(
+            "API proxy: failed to forward buffered request to host {}: {err}",
+            host_id.fmt_short()
+        );
+        return Err(());
+    }
+
+    Ok(())
+}
+
+async fn forward_buffered_request<W: AsyncWrite + Unpin>(
+    upstream: &mut W,
+    prefetched: &[u8],
+) -> std::io::Result<()> {
+    upstream.write_all(prefetched).await
+}
+
+/// Peek the just-probed, untouched response headers for a peer's
+/// `X-Capsule-Id` and served-model headers and stash them in `sink`, before
+/// any relay/adapter rewrite runs. A no-op when `sink` is `None` (every attempt
+/// except the `RemoteMesh` dispatch path) or a header is absent — never
+/// invents a value.
+fn record_peer_response_markers(sink: Option<&PeerCapsuleIdSink>, probe: &ResponseProbe) {
+    let Some(sink) = sink else {
+        return;
+    };
+    if let Some(capsule_id) =
+        peer_response_header_value(&probe.buffered, probe.header_end, PEER_CAPSULE_ID_HEADER)
+    {
+        sink.set(capsule_id);
+    }
+    let served_model = ServedModelHeaders::read(&probe.buffered, probe.header_end);
+    if !served_model.is_empty() {
+        sink.set_served_model(served_model);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncReadExt;
+    use tokio::io::ReadBuf;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::{Duration, timeout};
+
+    /// A real silent duplex pipe as the upstream half of `CancelUpstream`.
+    struct DuplexUpstream {
+        inner: tokio::io::DuplexStream,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for DuplexUpstream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl CancelUpstream for DuplexUpstream {
+        async fn cancel(&mut self) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// An upstream that hands out a fixed script of reads, then records whether
+    /// the route arm cancelled it.
+    struct ScriptedUpstream {
+        steps: std::collections::VecDeque<Result<Vec<u8>, io::ErrorKind>>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedUpstream {
+        fn new(steps: Vec<Result<Vec<u8>, io::ErrorKind>>) -> Self {
+            Self {
+                steps: steps.into(),
+                cancels: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl AsyncRead for ScriptedUpstream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.steps.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf.put_slice(&bytes);
+                    Poll::Ready(Ok(()))
+                }
+                Some(Err(kind)) => Poll::Ready(Err(io::Error::new(kind, "scripted failure"))),
+                None => Poll::Ready(Ok(())),
+            }
+        }
+    }
+
+    impl CancelUpstream for ScriptedUpstream {
+        async fn cancel(&mut self) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Both route arms must cancel their silent upstream as soon as the real
+    /// downstream socket is reset, without waiting for the response probe.
+    #[tokio::test]
+    async fn a_local_attempt_cancels_the_upstream_when_the_client_disconnects() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let (upstream_ready_tx, upstream_ready_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream_peer, _) = upstream_listener.accept().await.unwrap();
+            upstream_ready_tx.send(()).unwrap();
+            let mut bytes = [0u8; 1];
+            timeout(Duration::from_secs(2), upstream_peer.read(&mut bytes))
+                .await
+                .expect("local cancellation must reach the upstream socket")
+                .expect("reading the cancelled upstream socket must succeed")
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let mut client: ClientStream = client.into();
+            let mut upstream = TcpStream::connect(upstream_address).await.unwrap();
+            route_local_attempt_after_forward(
+                &mut client,
+                &mut upstream,
+                0,
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                ResponseAdapter::None,
+                None,
+                None,
+                None,
+                OpenAiRouteObserver::default(),
+            )
+            .await
+        });
+        let client_socket = TcpStream::connect(address).await.unwrap();
+        upstream_ready_rx.await.unwrap();
+        client_socket.set_zero_linger().unwrap();
+        drop(client_socket);
+
+        let result = timeout(Duration::from_secs(2), task)
+            .await
+            .expect("local route must notice a reset promptly")
+            .unwrap();
+
+        assert_eq!(result, RouteAttemptResult::ClientDisconnected);
+        assert_eq!(
+            upstream_task.await.unwrap(),
+            0,
+            "local cancellation must shut down the concrete TCP upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_attempt_cancels_the_peer_tunnel_when_the_client_disconnects() {
+        let (_upstream_writer, upstream_reader) = tokio::io::duplex(64 * 1024);
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let mut upstream = DuplexUpstream {
+            inner: upstream_reader,
+            cancels: Arc::clone(&cancels),
+        };
+        let host_id = iroh::SecretKey::generate().public();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let mut client: ClientStream = client.into();
+            route_remote_attempt_after_forward(
+                &mut client,
+                &mut upstream,
+                host_id,
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                ResponseAdapter::None,
+                None,
+                None,
+                OpenAiRouteObserver::default(),
+            )
+            .await
+        });
+        let client_socket = TcpStream::connect(address).await.unwrap();
+        client_socket.set_zero_linger().unwrap();
+        drop(client_socket);
+
+        let result = timeout(Duration::from_secs(2), task)
+            .await
+            .expect("remote route must notice a reset promptly")
+            .unwrap();
+
+        assert_eq!(result, RouteAttemptResult::ClientDisconnected);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_quic_downstream_reset_cancels_the_peer_tunnel_during_probe() {
+        const TEST_ALPN: &[u8] = b"mesh-llm/routing-cancellation-test/1";
+
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::generate())
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let server_endpoint = server.clone();
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let route_cancels = Arc::clone(&cancels);
+        let host_id = iroh::SecretKey::generate().public();
+        let route = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.expect("connection arrives");
+            let connection = incoming.await.expect("connection negotiates");
+            let (send, recv) = connection.accept_bi().await.expect("stream arrives");
+            let mut downstream = ClientStream::from_quic_with_prefix(recv, send, Vec::new());
+            let (_upstream_writer, upstream_reader) = tokio::io::duplex(64 * 1024);
+            let mut upstream = DuplexUpstream {
+                inner: upstream_reader,
+                cancels: route_cancels,
+            };
+            route_remote_attempt_after_forward(
+                &mut downstream,
+                &mut upstream,
+                host_id,
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                ResponseAdapter::None,
+                None,
+                None,
+                OpenAiRouteObserver::default(),
+            )
+            .await
+        });
+
+        let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::generate())
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let connection = client.connect(server.addr(), TEST_ALPN).await.unwrap();
+        let (_request_send, mut response_recv) = connection.open_bi().await.unwrap();
+        response_recv.stop(42u32.into()).unwrap();
+
+        let result = timeout(Duration::from_secs(2), route)
+            .await
+            .expect("QUIC reset must interrupt the pending response probe")
+            .unwrap();
+        assert_eq!(result, RouteAttemptResult::ClientDisconnected);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+
+        client.close().await;
+        server.close().await;
+    }
+
+    #[tokio::test]
+    async fn pipelined_downstream_bytes_are_not_consumed_by_disconnect_watch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (downstream, _) = listener.accept().await.unwrap();
+            let mut downstream: ClientStream = downstream.into();
+            assert!(
+                timeout(
+                    Duration::from_millis(100),
+                    downstream.wait_for_response_disconnect()
+                )
+                .await
+                .is_err(),
+                "pipelined bytes are not a disconnect"
+            );
+            let mut pipelined = [0u8; 1];
+            timeout(
+                Duration::from_secs(1),
+                downstream.read_exact(&mut pipelined),
+            )
+            .await
+            .expect("pipelined byte must remain available after probing")
+            .unwrap();
+            pipelined
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+
+        assert_eq!(task.await.unwrap(), [b'x']);
+    }
+
+    /// The counterpart: a normal delivery must not cancel anything.
+    #[tokio::test]
+    async fn a_remote_attempt_that_delivers_leaves_the_peer_tunnel_alone() {
+        let body = "x".repeat(8);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut upstream = ScriptedUpstream::new(vec![Ok(header.into_bytes())]);
+        let cancels = Arc::clone(&upstream.cancels);
+        let host_id = iroh::SecretKey::generate().public();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let mut client: ClientStream = client.into();
+            route_remote_attempt_after_forward(
+                &mut client,
+                &mut upstream,
+                host_id,
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                ResponseAdapter::None,
+                None,
+                None,
+                OpenAiRouteObserver::default(),
+            )
+            .await
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let mut relayed = Vec::new();
+        socket.read_to_end(&mut relayed).await.unwrap();
+
+        let result = task.await.unwrap();
+
+        assert!(matches!(result, RouteAttemptResult::Delivered { .. }));
+        assert_eq!(cancels.load(Ordering::SeqCst), 0);
+    }
+
+    /// A `RemoteMesh` attempt records the
+    /// peer's `X-Capsule-Id` response header into the caller-supplied sink —
+    /// this is how the routing node learns what to thread onto its own
+    /// terminal plugin event (see `ingress.rs`'s remote-mesh routing).
+    #[tokio::test]
+    async fn a_remote_attempt_records_the_peers_capsule_id_into_the_sink() {
+        let body = "x".repeat(8);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nX-Capsule-Id: cap-peer-1\r\nx-mesh-weights-digest: 74a4da8c\r\nx-mesh-model-canonical-ref: org/repo@main:Q4_K_M\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut upstream = ScriptedUpstream::new(vec![Ok(header.into_bytes())]);
+        let host_id = iroh::SecretKey::generate().public();
+        let sink = PeerCapsuleIdSink::new();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let mut client: ClientStream = client.into();
+            route_remote_attempt_after_forward(
+                &mut client,
+                &mut upstream,
+                host_id,
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                ResponseAdapter::None,
+                None,
+                Some(&sink),
+                OpenAiRouteObserver::default(),
+            )
+            .await;
+            sink
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let mut relayed = Vec::new();
+        socket.read_to_end(&mut relayed).await.unwrap();
+
+        let sink = task.await.unwrap();
+        assert_eq!(sink.take(), Some("cap-peer-1".to_string()));
+        assert_eq!(sink.take_served_model(), test_served_model());
+    }
+
+    /// The peer's served-model headers are recorded for this node's own events
+    /// but never relayed on to this node's client, whether the head is relayed
+    /// as is or rebuilt by a response adapter.
+    #[tokio::test]
+    async fn a_remote_attempt_never_relays_the_peers_served_model() {
+        let body = r#"{"id":"c","object":"chat.completion","choices":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-mesh-weights-digest: 74a4da8c\r\nx-mesh-model-canonical-ref: org/repo@main:Q4_K_M\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        for adapter in [
+            ResponseAdapter::None,
+            ResponseAdapter::OpenAiChatCompletionsJson,
+        ] {
+            let mut upstream = ScriptedUpstream::new(vec![Ok(response.clone().into_bytes())]);
+            let host_id = iroh::SecretKey::generate().public();
+            let sink = PeerCapsuleIdSink::new();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (client, _) = listener.accept().await.unwrap();
+                let mut client: ClientStream = client.into();
+                route_remote_attempt_after_forward(
+                    &mut client,
+                    &mut upstream,
+                    host_id,
+                    RequestId::new(),
+                    ResponseRetryPolicy::next_target_available(false),
+                    adapter,
+                    None,
+                    Some(&sink),
+                    OpenAiRouteObserver::default(),
+                )
+                .await;
+                sink
+            });
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            let mut relayed = Vec::new();
+            socket.read_to_end(&mut relayed).await.unwrap();
+            let relayed = String::from_utf8(relayed).unwrap();
+
+            let sink = task.await.unwrap();
+            assert_eq!(sink.take_served_model(), test_served_model());
+            assert!(
+                relayed.starts_with("HTTP/1.1 200"),
+                "{adapter:?}: {relayed}"
+            );
+            let lowered = relayed.to_ascii_lowercase();
+            assert!(
+                !lowered.contains("x-mesh-weights-digest")
+                    && !lowered.contains("x-mesh-model-canonical-ref"),
+                "{adapter:?}: {relayed}"
+            );
+            assert!(
+                relayed.contains("\"chat.completion\""),
+                "{adapter:?}: {relayed}"
+            );
+        }
+    }
+
+    /// Mutant: no `X-Capsule-Id` on the peer's response — the sink stays
+    /// empty. Never invented.
+    #[tokio::test]
+    async fn a_remote_attempt_without_a_capsule_id_header_leaves_the_sink_empty() {
+        let body = "x".repeat(8);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut upstream = ScriptedUpstream::new(vec![Ok(header.into_bytes())]);
+        let host_id = iroh::SecretKey::generate().public();
+        let sink = PeerCapsuleIdSink::new();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let mut client: ClientStream = client.into();
+            route_remote_attempt_after_forward(
+                &mut client,
+                &mut upstream,
+                host_id,
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                ResponseAdapter::None,
+                None,
+                Some(&sink),
+                OpenAiRouteObserver::default(),
+            )
+            .await;
+            sink
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let mut relayed = Vec::new();
+        socket.read_to_end(&mut relayed).await.unwrap();
+
+        let sink = task.await.unwrap();
+        assert_eq!(sink.take(), None);
+        assert!(sink.take_served_model().is_empty());
+    }
+
+    fn test_served_model() -> ServedModelHeaders {
+        ServedModelHeaders {
+            weights_digest: Some("74a4da8c".to_owned()),
+            canonical_ref: Some("org/repo@main:Q4_K_M".to_owned()),
+        }
+    }
+
+    /// Serve `upstream_response` from this node with `served_model` set and
+    /// return the bytes the client received.
+    async fn relay_local_with_served_model(
+        upstream_response: String,
+        response_adapter: ResponseAdapter,
+        served_model: Option<ServedModelHeaders>,
+    ) -> String {
+        let mut upstream = ScriptedUpstream::new(vec![Ok(upstream_response.into_bytes())]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let mut client: ClientStream = client.into();
+            route_local_attempt_after_forward(
+                &mut client,
+                &mut upstream,
+                0,
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                response_adapter,
+                None,
+                served_model.as_ref(),
+                None,
+                OpenAiRouteObserver::default(),
+            )
+            .await
+        });
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        let mut relayed = Vec::new();
+        socket.read_to_end(&mut relayed).await.unwrap();
+        task.await.unwrap();
+        String::from_utf8(relayed).unwrap()
+    }
+
+    /// A node serving a mesh peer returns its served-model headers on the
+    /// response, both when it relays the backend's head as is and when a
+    /// response adapter rebuilds it.
+    #[tokio::test]
+    async fn a_local_attempt_returns_the_served_model() {
+        let body = r#"{"id":"c","object":"chat.completion","choices":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        for adapter in [
+            ResponseAdapter::None,
+            ResponseAdapter::OpenAiChatCompletionsJson,
+        ] {
+            let relayed =
+                relay_local_with_served_model(response.clone(), adapter, Some(test_served_model()))
+                    .await;
+            assert!(
+                relayed.contains("x-mesh-weights-digest: 74a4da8c\r\n")
+                    && relayed.contains("x-mesh-model-canonical-ref: org/repo@main:Q4_K_M\r\n"),
+                "{adapter:?}: {relayed}"
+            );
+        }
+        let relayed = relay_local_with_served_model(response, ResponseAdapter::None, None).await;
+        assert!(!relayed.contains("x-mesh-"), "{relayed}");
+
+        // A streamed chat completion rebuilds its head too.
+        let sse = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[]}\n\ndata: [DONE]\n\n";
+        let streamed = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+            sse.len()
+        );
+        let relayed = relay_local_with_served_model(
+            streamed,
+            ResponseAdapter::OpenAiChatCompletionsStream,
+            Some(test_served_model()),
+        )
+        .await;
+        assert!(
+            relayed.contains("x-mesh-weights-digest: 74a4da8c\r\n")
+                && relayed.contains("x-mesh-model-canonical-ref: org/repo@main:Q4_K_M\r\n"),
+            "{relayed}"
+        );
+    }
+
+    /// Only a mesh peer that reached this node over its QUIC tunnel is given
+    /// this node's served-model headers; a local TCP client is not, and a
+    /// model this node does not describe yields none.
+    #[tokio::test]
+    async fn only_a_mesh_peer_is_given_this_nodes_served_model() {
+        const TEST_ALPN: &[u8] = b"mesh-llm/weights-digest-peer-test/1";
+        let node = mesh::Node::new_for_tests(mesh::NodeRole::Worker)
+            .await
+            .unwrap();
+        *node.served_model_descriptors.lock().await = vec![mesh::ServedModelDescriptor {
+            identity: mesh::ServedModelIdentity {
+                model_name: "served".to_owned(),
+                canonical_ref: Some("org/repo@main:Q4_K_M".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        node.load_model_for_tests("served", 8080, "74a4da8c").await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _tcp_client = TcpStream::connect(address).await.unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tcp = ClientStream::from(tcp).with_response_metadata(Vec::new());
+        assert!(!tcp.is_mesh_peer());
+        assert_eq!(
+            served_model_headers_for_mesh_peer(&node, &tcp, Some("served"), 8080).await,
+            None
+        );
+        assert!(!ClientStream::null().is_mesh_peer());
+
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::generate())
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let server_endpoint = server.clone();
+        let accepting = tokio::spawn(async move {
+            let incoming = server_endpoint.accept().await.expect("connection arrives");
+            let connection = incoming.await.expect("connection negotiates");
+            let (send, recv) = connection.accept_bi().await.expect("stream arrives");
+            (connection, send, recv)
+        });
+        let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::generate())
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let connection = client.connect(server.addr(), TEST_ALPN).await.unwrap();
+        let (mut request_send, _response_recv) = connection.open_bi().await.unwrap();
+        request_send.write_all(b"x").await.unwrap();
+        let (_accepted, send, recv) = accepting.await.unwrap();
+        let quic = ClientStream::from_quic_with_prefix(recv, send, Vec::new())
+            .with_response_metadata(Vec::new());
+        assert!(quic.is_mesh_peer());
+        assert_eq!(
+            served_model_headers_for_mesh_peer(&node, &quic, Some("served"), 8080).await,
+            Some(test_served_model())
+        );
+        assert_eq!(
+            served_model_headers_for_mesh_peer(&node, &quic, Some("other"), 8080).await,
+            None
+        );
+        assert_eq!(
+            served_model_headers_for_mesh_peer(&node, &quic, None, 8080).await,
+            None
+        );
+
+        client.close().await;
+        server.close().await;
+        node.endpoint.close().await;
+    }
+
+    /// A non-2xx response served nothing, so it carries no served model.
+    #[tokio::test]
+    async fn a_failed_local_attempt_returns_no_served_model() {
+        let body = r#"{"error":{"message":"busy"}}"#;
+        let response = format!(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let relayed = relay_local_with_served_model(
+            response,
+            ResponseAdapter::None,
+            Some(test_served_model()),
+        )
+        .await;
+        assert!(relayed.starts_with("HTTP/1.1 503"), "{relayed}");
+        assert!(!relayed.contains("x-mesh-"), "{relayed}");
+    }
+
+    #[tokio::test]
+    async fn a_write_half_closed_downstream_still_receives_the_upstream_response() {
+        let body = "half-close response";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut upstream = ScriptedUpstream::new(vec![Ok(response.into_bytes())]);
+        let host_id = iroh::SecretKey::generate().public();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (client, _) = listener.accept().await.unwrap();
+            let mut client: ClientStream = client.into();
+            route_remote_attempt_after_forward(
+                &mut client,
+                &mut upstream,
+                host_id,
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                ResponseAdapter::None,
+                None,
+                None,
+                OpenAiRouteObserver::default(),
+            )
+            .await
+        });
+
+        let mut socket = TcpStream::connect(address).await.unwrap();
+        socket.shutdown().await.unwrap();
+        let mut relayed = Vec::new();
+        timeout(Duration::from_secs(1), socket.read_to_end(&mut relayed))
+            .await
+            .expect("write-half-closed client should still receive a response")
+            .unwrap();
+        let result = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("route should finish after relaying the response")
+            .unwrap();
+
+        assert!(matches!(result, RouteAttemptResult::Delivered { .. }));
+        assert!(String::from_utf8_lossy(&relayed).contains(body));
+    }
+
+    #[tokio::test]
+    async fn local_and_remote_forwarding_preserve_the_canonical_request_id_bytes() {
+        const REQUEST: &[u8] = b"POST /v1/chat/completions HTTP/1.1\r\nx-request-id: 4c3ca94d-bc1f-4759-912d-f4f6d77d5515\r\nContent-Length: 2\r\n\r\n{}";
+
+        for _route in ["local", "remote"] {
+            let (mut upstream, mut received) = tokio::io::duplex(REQUEST.len());
+            let forwarding = tokio::spawn(async move {
+                forward_buffered_request(&mut upstream, REQUEST)
+                    .await
+                    .unwrap();
+            });
+            let mut forwarded = Vec::new();
+            received.read_to_end(&mut forwarded).await.unwrap();
+            forwarding.await.unwrap();
+
+            assert_eq!(forwarded, REQUEST);
+        }
+    }
+}

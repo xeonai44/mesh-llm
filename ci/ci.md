@@ -1,9 +1,212 @@
 # MeshLLM CI topology
 
+All workflows disable Rust debug information with workflow- or job-level
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+`CARGO_PROFILE_RELEASE_DEBUG=0` and `CARGO_PROFILE_BENCH_DEBUG=0`.
+Each reusable workflow sets these values because caller workflow environments
+do not propagate through `workflow_call`. The Linux test, client and Fly Docker
+builders set the same environment inside their Rust build stages. Compiler-seed
+publishers and consumers use matching settings. Local development defaults,
+complete package tests, debug assertions and overflow checks are preserved.
+Cache epoch `v5` starts a fresh namespace. Batch jobs record filesystem space
+before each package and retained target/compiler-cache sizes even when tests fail.
+The upstream canary sets the environment in each executing job and its reusable
+family-pass workflow separately.
+
+## Standalone C++ API qualification
+
+The protected catalog admits `skippy/skippy_api/**` and
+`skippy/skippy-api-rs/**` as tooling owned by Quality. This admission must land
+as a catalog-only prerequisite, then dependent PRs must adopt the current
+protected catalogs; the byte-for-byte catalog comparison remains mandatory.
+
+The `skippy_cpp_api` job in the shared Quality slice validates the standalone
+C++ facade and its separate Rust workspace on the existing centrally selected
+Linux runner and pinned CPU image. Both PR and main invoke this same job. A
+dependency on the completed Quality contracts job preserves the existing peak
+worker count; native API validation starts after those contracts pass. A
+revision without either source tree records an explicit not-applicable result;
+partial trees, missing crate manifests and symlinked source roots fail admission.
+While the API is under review, the job runs for every selected Quality slice
+containing those sources, rather than relying on the root Cargo workspace to
+discover the nested workspace.
+
+The job compiles every optional API target, runs the full C++ suite and
+ASan/UBSan corpus replay, checks Rust formatting and warning-denying Clippy,
+and runs the full Rust test suite with mandatory embedding, rerank and causal
+models. The `skippy-cpp-api` model manifest pins MiniLM Q8, BGE reranker Q4_K_M
+and SmolLM2 Q8; shared model restoration verifies immutable revision, size and
+SHA-256 before use. The existing protected automation producer supplies model
+resolution; this job does not compile another xtask executable or publish a
+model cache. The all-targets build also supplies a real three-stage pipeline
+probe, which uses the pinned 30-layer SmolLM2 model and requires both boundary
+payloads and all 16 sampled tokens to match unsplit execution. A separate
+external-consumer smoke executes the built binary
+directly without Cargo's injected loader search paths.
+After Rust generates its bridge headers, the job builds and exercises the
+matching LLVM clang-tidy plugin and runs every configured C++/bridge lint;
+missing plugin tooling fails rather than silently reducing coverage.
+
+This adds no production dependency or ABI cutover. Candidate workflow syntax
+and finite source-admission contracts do not qualify the pinned Linux image's
+C++23/clang toolchain or model behavior. Activate the executor on protected
+main, update the four feature branches with the admitted catalogs and owning
+recipes, then retain successful PR-associated execution at their final heads.
+The dedicated `public-cpp-api` image entry binds only the `skippy-cpp-api`
+consumer role. Its immutable multi-architecture CPU index is
+`sha256:656e4874af027e0b437427f4415fdaab51ff8b1cda444dcdd4bc331794f703c5`;
+the existing `public-cpu` image, consumers, runtime rows and compiler seed keep
+their previous identities. Runner-images main run `41127631709`, attempt 1,
+successfully staged and verified AMD64/ARM64 CPU candidates at producer
+`2ca51592535c29ddbed768b75481451d3fa5a49e` and Mesh source
+`5e2fdddf6a6ea10d16e3689741483574f1274103`. The exact producer's
+`runner-cohort.py fetch` admitted the retained complete 16-index/23-platform
+cohort against current tool, cache and OCI-binding policy. Native
+`runner-identity bind` retained cohort bytes under
+`ci/runner-image-evidence/189f0408681bf999868a5a01cae3e5260c63d5aca0bbe613714cbb97b78ed2e8.json`.
+That producer's mandatory CPU verification checks LLVM 19 and plugin development
+inputs and executes sanitized C++23 and libFuzzer probes. The run staged exact
+digests without moving production aliases; consumer binding does not require
+promotion. This admission does not establish source-present API coverage,
+which still requires the protected-main executor rollout and real PR runs.
+
+### Libclang-capable CPU image
+
+The dedicated `public-cpu-libclang` image entry binds the compiler-seed
+cohort: the `rust-tests`, `rust-clippy`, `linux-host`,
+`safetensors-runtime-smoke`, `compiler-seed-publisher` and
+`runtime-seed-canary` consumer roles, the `linux-cpu` runtime row, and the
+compiler seed, which rolls forward to
+`mesh-llm-sccache-seed-linux-x86_64-img-aaa36843-epoch-aaa36843-v3-`. The
+image is the reviewed `libclang-dev` toolchain addition over `public-cpu`; it
+exists so `skippy-ffi`'s bindgen freshness gate (which dlopens libclang through
+clang-sys) runs with the tool baked in instead of a job-time install. Its
+immutable multi-architecture CPU index is
+`sha256:aaa3684385c53d0e41d67011da0a101e8a84420de490375f1e3ce5efb4ba7e60`;
+the previous `public-cpu` image remains admitted for the consumers that stay
+on it (including release-compose and SDK roles). Runner-images main run
+`41541864277`, attempt 3, successfully staged and verified AMD64/ARM64 CPU
+candidates at producer `45e0c35a191cc7026fb1b9a24700cc1b40be7ca6` and Mesh
+source `06f6347323552d07bdeffdb1bc1aba2808c26519`. Native
+`runner-identity bind` retained the complete cohort bytes under
+`ci/runner-image-evidence/032e84ac5046e246959adc937c125cf63c33da11fa2b6a2dda18a44032190153.json`.
+
+The L2 planner action and all five lane summaries now invoke Rust `ci plan`
+and `ci validate-lane` through the narrow `ci-controller` executable that
+`prepare-ci-controller` builds. Other automation uses `prepare-automation`'s
+explicit `hosted-bare` profile. Both are restricted to GitHub-hosted Linux, use
+the existing stable Rust selection and locked release Cargo without compiler
+wrappers or Just, and restore an exact-key cached release executable before
+compiling. The default image profile keeps its verification and cache setup.
+Metadata-only Cargo discovery remains permitted. Composition-only release
+jobs still consume immutable automation and never compile.
+
+Quality commit convention and environment-mutation checks use Rust repository
+owners. Runner-contract cleanup uses `ci-ops runner-cleanup`. Registry-pull
+summaries use `ci-ops registry-pulls`, with jq producing the observation JSON.
+Runtime-seed preflight, restore verification, measurement and summary use
+`ci-ops runtime-seed`. Its automation build precedes measurement and uses
+step-local Cargo home and target directories under runner temp, with compiler
+wrappers disabled; measured native/Cargo/package outputs and cache stay fresh.
+Protected pinned resolver and no-checkout authority callers remain transitional
+pending protected-main delivery. These source changes do not qualify live
+Linux measurements, provider isolation or protected rollout.
+
+Standalone Skippy CLI preparation verifies Unix and Windows host imports through
+`native verify-host-dependencies`, preserving the import report and checksum
+before the immutable input is handed to consumers.
+
+Cached Linux runtimes use `native verify-runtime-package` with the planned
+backend and exact target for both the directory and archive. Schema, integrity,
+native probes and directory/archive manifest equality remain required.
+Distributed canary repair uses native build admission for the exact previous
+producer and candidate-only feedback. The repair prompt's bounded summary is
+rendered from the admitted immutable snapshot before the wrapper starts.
+Attempt and final selection use native commands after frozen-controller
+preparation. Native aggregation and reconciliation bind run, controller,
+selected-source and family job results before publishing classified feedback.
+Infrastructure retry rows reuse controller placement over verified canonical
+plan bytes while preserving source row identity, order and unknown fields.
+
+L12 local reconciliation preserves the five PR/main entrypoints and protected
+executor boundaries. Quality runs Rust workflow permission, container-shell and
+expression guards plus the real build-script adapter tests. The native Windows
+focused owner remains selected by `just ci-legacy-contracts`; unused Quality
+interpreter setup and CI requirement installation are removed. SDK compatibility,
+blocked control-plane callers and live
+canary coverage still require their existing environments. This is not a claim
+that the required graph has no interpreter dependency.
+
+The CLI/website contract owner `lane_l2_quality_contracts` is selected by the
+required normal Rust roster in `ci/quality-rust-contract-targets.json`
+and `just ci-automation-contracts`; the full Rust suite alone does not satisfy
+this normal-path replacement obligation.
+
+The normal Rust contract roster selects all maintained xtask integration targets,
+including producer, release, QA-adapter, SDK-fixture, replay and agent-client
+fixtures. A source-owner census rejects an integration target absent from the
+roster, and the Just guard requires that exact roster without a test filter.
+Platform conditions remain in their owning tests. These finite fixtures do not
+replace live native, SDK, model, browser or hosted-runner acceptance.
+
+The trusted canary publisher freezes its prepared controller before checking out
+the certified candidate. `automation canary-receipts redact-publication-log`
+owns credential redaction of Git and pull-request diagnostics. The publisher
+waits for each redactor before releasing private state, preserves exact-commit
+publication and ambiguous-response reconciliation, and performs no candidate
+Cargo bootstrap in the credential-bearing step.
+
+Runtime reuse now honors the prepared automation executable through the shared
+adapter, including when the consumer is copied outside Cargo alias discovery.
+Local SDK fixtures execute that same adapter and reject incompatible runtime
+reports before readiness or artifact publication. Publication fixtures execute
+the real dependency projection against complete workspace metadata; fake Cargo
+is confined to metadata acquisition and publish transport.
+
+SDK fixture failures report the install, daemon and consumer process outcomes,
+exit statuses and cleanup facts separately. Diagnostics omit child output and
+rejection text from the summary so invite credentials remain private. A passing
+consumer does not waive daemon shutdown failure or forced cleanup.
+
+For isolated Unix whole-wrapper diagnostics, `automation sdk-compat run` owns
+execution of the current `scripts/ci-compat-smoke.sh`. Its named inputs include
+the exact product binary, runtime directory and model, the literal absolute SDK
+venv interpreter path, an explicit Node executable and OpenAI module directory,
+and fresh state/evidence locations. The wrapper must match the controller's
+compiled source; a controller built from a newer checkpoint may inspect an
+independently admitted older product without substituting that product's wrapper.
+Run command discovery through the existing Just facade:
+
+```bash
+just with-lld cargo xtool automation sdk-compat --help
+```
+
+The native owner supplies private HOME, config, runtime, cache and temporary
+paths only to its child environment, bounds the whole process and captures,
+retains the three Python SDK receipts and their captures, and admits success
+only after owned process and private-state cleanup. The shell parent's HOME
+is unchanged. OpenAI Python, LiteLLM, LangChain and the existing Node leaf keep
+their current SDK behavior and defaults; this owner installs no dependencies.
+Callers separately admit pinned dependencies and verify their declared seals
+before and after execution. Native input custody is not a complete SDK environment
+seal. Receipts retain `sdk_qualified=false`: source/fixture checks and a wrapper
+exit do not establish model, platform or SDK qualification. This available
+diagnostic owner does not claim that normal required callers have cut over or
+that protected bootstrap publication is complete.
+
 This is the checked-in implementation. Normative rules live in
 `.agents/skills/manage-ci/SKILL.md`; the factual inventory is in
 `.agents/skills/manage-ci/references/current-inventory.md`; the design record
 and acceptance criteria are in `.omo/specs/pr-ci-optimization.md`.
+
+The affected-crate fallback roster in `scripts/affected-crates.sh` includes
+`mesh-llm-moa-plugin` alongside its related workspace crates;
+`just ci-crate-lists` checks it against workspace membership. The publish
+chain publishes `mesh-mixture-of-agents` before `mesh-llm-moa-plugin`, and
+both before `mesh-llm-host-runtime`. The Lightning payment crates
+(`mesh-llm-wallet`, `mesh-llm-payments-types`, `mesh-llm-payments`,
+`mesh-llm-pay-lightning`) live in `Mesh-LLM/ln-payments-plugin` and are not
+part of this workspace or its publish chain.
 
 ## Entry points
 
@@ -14,6 +217,7 @@ and acceptance criteria are in `.omo/specs/pr-ci-optimization.md`.
 | `pr_linux.yml` (`PR · Linux`) | `pull_request` | Plans and calls the protected Linux lane |
 | `pr_macos.yml` (`PR · macOS`) | `pull_request` | Plans and calls the protected macOS lane |
 | `pr_windows.yml` (`PR · Windows`) | `pull_request` | Plans and calls the protected Windows lane |
+| `pr_ci_canary.yml` (`PR · CI canary`) | `pull_request`, `ci:canary` label | Optional non-required merge-source diagnostic for one hosted Linux CPU product chain |
 | `pr-cancel-sibling-runs.yml` (`PR · Cancel sibling lanes`) | protected `workflow_run` for `PR · Quality` | Watches one exact PR revision and cancels its other validation lanes after the first job failure |
 | `main_quality.yml` (`Main · Quality`) | push to `main` | Plans and calls the same-commit Quality lane |
 | `main_website.yml` (`Main · Website`) | push to `main` | Plans and calls the same-commit Website lane |
@@ -25,41 +229,373 @@ and acceptance criteria are in `.omo/specs/pr-ci-optimization.md`.
 | `ci-*-lane.yml` | `workflow_call`, `workflow_dispatch` | Composable Quality, Website, Linux, macOS and Windows graphs |
 | `nightly-stability.yml` / `nightly-stability-run.yml` | daily schedule, dispatch / reusable | GitHub-hosted live-endpoint evidence. The general stability and KV tool-loop/prefix-reuse harnesses run independently, upload both evidence sets, and preserve either failure. The reusable workflow accepts no runner label. |
 | `nightly-kv-coverage.yml` | daily schedule, dispatch | Trusted-`main`, read-only, GitHub-hosted expansion of deterministic radix lease/eviction and blob-ownership state machines. Seed/step budgets and the exact source SHA are uploaded; no secrets or privileged runner are used. |
-| `agentic-replay-nightly.yml` | daily schedule, trusted-main dispatch | Coding-agent replay benchmark on the persistent macOS `micstudio` runner. The fixed `[self-hosted, X64, macOS, family-certify, agentic-replay]` selector is backed by a fail-closed `RUNNER_NAME=micstudio` check; scheduled and manual execution is restricted to trusted `main`. It resolves exact model and trajectory revisions from the pre-warmed Hugging Face cache, verifies their SHA-256 digests, cross-checks the trajectory pin against the canonical harness before download, derives replay shape from `ci/agentic-replay-nightly/matrix.json`, fails closed on history lookup errors, writes the summary even when the regression gate fails, confines the write-capable HF token to the publish step, uploads immutable evidence, and keeps persistent-runner repair credential-free: the repair loop emits a patch, body and status artifact for its run/attempt, while a separate canonical-main, failed-run GitHub-hosted job validates the artifact, applies the patch with hooks disabled, and uses `CANARY_REPAIR_TOKEN` only to publish a deterministic run/attempt branch and PR. |
-| `llama-upstream-canary.yml` | daily schedule, dispatch | Trusted default-branch llama.cpp bump certification on the self-hosted `family-certify` runner. Its toolchain preflight prepends `/Users/lab/.local/bin` and executes `goose --version` before any changed-pin agent work. It never runs as ordinary push or PR CI. Canary runs share a non-cancelling concurrency group, so a scheduled run queues behind active manual or scheduled work instead of discarding the candidate workspace. `scripts/plan-family-battery.py` validates the generated `ci/llama-canary/family-certified.json` policy (sourced from `ci/model-artifacts/registry.json`) and every file's exact immutable cache blob identity and byte size before native compilation. Each target/draft artifact must have at least one metadata-bearing GGUF shard; every shard that carries architecture dimensions must match the declared runtime range and activation width, including Qwen4's `hyper_connection.count * embedding_length` boundary. Optional `mmproj_artifact` rows pin a projector GGUF sidecar (exact blob identity, exempt from trunk-dimension checks), and each family that pins one runs an additional multimodal smoke lane after its core lanes: the real-projector + deterministic-image harness in `crates/skippy-server/src/frontend/tests/multimodal.rs` (local monolithic and split stages) via `SKIPPY_MM_*`, reconciled against the plan like every other lane. It emits deterministic bounded matrix shards and records the plan with evidence. The current single-runner workflow consumes one selected-family shard and builds the certification binaries once. Scheduled, changed-pin, and forced runs all consume the same complete supported-family roster. Before any lane starts, the battery verifies shard/tensor scans, declared runtime/MTP layer counts, model bytes, disk headroom and certification ports. Native MTP/NextN heads remain part of the single target model; the battery does not reopen the model as a separate draft. Those rows require native draft sidebands in staged single-step and chain correctness, where each proposed token is verified against the target. Every certified profile must retain strict `single-step`, `chain`, and `state-handoff` parity. Filtered correctness stages derive their exact resident tensor names from the native stage graph planner, including GGUFs with non-finite metadata values. Single-step and chain exercise the sole shipping raw-f32 activation wire and any mismatch is a hard failure. Planned families, product-planner-selected cuts, and multimodal smokes are reconciled exactly against executed lanes and recorded results. Declared per-model or model-size-derived startup deadlines, complete-certification wall-clock limits and typed lane outcomes are recorded, and immutable plans/model manifests/preflight evidence/certification logs upload even on failure or cancellation. Manual dispatch can force this certification when the upstream SHA is unchanged. Persistent-runner execution is always a read-only checkout of trusted `main`. Changed pins give one agent session the complete developer task: repair or regenerate the queue, address ABI fallout, and validate repairs with focused checks before handing control to the trusted full candidate gates. The agent does not run an additional full battery; both trusted complete-roster passes remain mandatory. Both the repair and independent-verifier checkouts configure the same repository-local `mesh-llama-canary-bot` identity before invoking the harness, so candidate commit creation does not depend on persistent-runner global Git configuration. The repair loop has an 11.5-hour deadline while the complete roster runtime is measured, and the agent has no GitHub credentials. Goose uses its native text renderer for readable assistant, thinking, tool, and error output in the live Actions log and retained `agent.log`. A zero exit from the coding process only yields control to the trusted wrapper; the wrapper runs the full candidate gates and returns current failure logs to the same session until those gates pass or the deadline expires. Existing certification and parity rows remain immutable. The agent may only correct `resources.estimated_model_bytes`, which the immutable GGUF scan rechecks, and append classification-only parity rows for source files missing from the manifest; those rows cannot add artifact or certification authority. Only a green repair pass is snapshotted as an unreachable local commit and uploaded as a thin candidate bundle. A separate self-hosted verification job and checkout download that bundle, materialize its commit in a fresh detached worktree, and independently run one ordered `prepare -> manifest-policy -> build -> certify` pass with a 12-hour budget and new native-build and family-evidence directories. Only the exact passing commit is exported as the certified bundle. Before each changed-pin candidate gate, the trusted wrapper regenerates the architecture split certification roster for the candidate recipe; only a complete battery pass is snapshotted, and the independent verifier checks the roster against the llama pin, Skippy ABI, and ordered patch queue before publication. Unchanged-pin certification checks the roster without mutating it. A separate success-gated job on a fresh GitHub-hosted runner receives the repair token, validates the one-day bundle artifact, pushes a run-specific branch, and opens a normal exact-head PR as its final external mutation. Agent or verification failures retain logs and create no branch or PR. Successful publication leaves the canary green; changed pins are never pushed directly to `main`. Unchanged scheduled and forced certifications remain read-only and do not invoke the agent. Runner requires `HF_CACHE=/Users/lab/models/huggingface`, verifies its `hub` directory, exports `HF_HOME` and `HF_HUB_CACHE` from that root, and stays offline on the NFS-backed cache (`HF_HUB_OFFLINE=1`; no `flock`, so the runner never downloads). |
+| `agentic-replay-nightly.yml` | trusted-main dispatch; schedule paused for qualification | Coding-agent replay benchmark on the persistent macOS `micstudio` runner. The fixed `[self-hosted, X64, macOS, family-certify, agentic-replay]` selector is backed by a fail-closed `RUNNER_NAME=micstudio` check; scheduled and manual execution is restricted to trusted `main`. It resolves exact model and trajectory revisions from the pre-warmed Hugging Face cache, verifies their SHA-256 digests, cross-checks the trajectory pin against the canonical harness before download, derives replay shape from `ci/agentic-replay-nightly/matrix.json`, fails closed on history lookup errors, writes the summary even when the regression gate fails, confines the write-capable HF token to the publish step, uploads immutable evidence, and keeps persistent-runner repair credential-free: the repair loop emits a patch, body and status artifact for its run/attempt, while a separate canonical-main, failed-run GitHub-hosted job validates the artifact, applies the patch with hooks disabled, and uses `CANARY_REPAIR_TOKEN` only to publish a deterministic run/attempt branch and PR. |
+| `llama-upstream-canary.yml` | daily schedule, dispatch | Trusted default-branch llama.cpp bump certification on lab runners: separate macOS and Linux native builds, a combined candidate package, then a parallel family matrix placed by memory tier. Its toolchain preflight prepends `/Users/lab/.local/bin` and executes `goose --version` before any changed-pin agent work. It never runs as ordinary push or PR CI. Canary runs share a non-cancelling concurrency group, so a scheduled run queues behind active manual or scheduled work instead of discarding the candidate workspace. `cargo xtool automation family-battery-policy` validates the generated `ci/llama-canary/family-certified.json` policy (sourced from `ci/model-artifacts/registry.json`) and every file's exact immutable cache blob identity and byte size before native compilation. Each target/draft artifact must have at least one metadata-bearing GGUF shard; every shard that carries architecture dimensions must match the declared runtime range and activation width, including Qwen4's `hyper_connection.count * embedding_length` boundary. Optional `mmproj_artifact` rows pin a projector GGUF sidecar (exact blob identity, exempt from trunk-dimension checks), and each causal family that pins one runs an additional multimodal smoke lane after its core lanes: the real-projector + deterministic-image harness in `crates/skippy-server/src/frontend/tests/multimodal.rs` (local monolithic and split stages) via `SKIPPY_MM_*`, reconciled against the plan like every other lane. It emits deterministic bounded matrix shards and records the plan with evidence. The macOS and Linux native producers build candidate packages on lab runners; a managed lab controller combines them before the parallel family matrix certifies the complete roster. Scheduled, changed-pin, and forced runs all consume the same complete supported-family roster. Before any lane starts, the battery verifies shard/tensor scans, declared runtime/MTP layer counts, model bytes, and disk headroom; each lane selects OS-assigned loopback ports immediately before launch. Native MTP/NextN heads remain part of the single target model; the battery does not reopen the model as a separate draft. Those rows require native draft sidebands in staged single-step and chain correctness, where each proposed token is verified against the target. They also require a `native-mtp-heads` lane that requests the full immutable GGUF head count, compares every proposal position against target decoding, and checks target state against an independent MTP-disabled baseline. Rejected proposals are valid; missing heads or target-state divergence fail certification. Cache preflight rejects disagreement between declared and GGUF `nextn_predict_layers` counts before compilation. The current pinned roster has one head each for GLM-4.5-Air and Nemotron, and three for MiMo2. Native-head family budgets add two startup allowances for the integrated model and baseline loads while retaining the existing absolute cap. Every certified causal profile must retain strict `single-step`, `chain`, and `state-handoff` parity; non-chat profiles require their separate smoke and oracle lanes. Filtered correctness stages derive their exact resident tensor names from the native stage graph planner, including GGUFs with non-finite metadata values. Single-step and chain exercise the sole shipping raw-f32 activation wire and any mismatch is a hard failure. Planned families, product-planner-selected cuts, and multimodal smokes are reconciled exactly against executed lanes and recorded results. Declared per-model or model-size-derived startup deadlines, complete-certification wall-clock limits and typed lane outcomes are recorded, and immutable plans/model manifests/preflight evidence/certification logs upload even on failure or cancellation. Manual dispatch can force this certification when the upstream SHA is unchanged. Persistent-runner execution uses trusted `main` or an explicitly trusted `mesh_ref` selected by manual dispatch. Changed pins use Goose provider `zai_coding_plan` and model `glm-5.3-flash` by default, with `LLAMA_CANARY_GOOSE_PROVIDER` / `LLAMA_CANARY_GOOSE_MODEL` repository overrides. The runner must configure that provider; `goose info --check` verifies authentication and connectivity before repair starts. Changed pins give one agent session the complete developer task: repair or regenerate the queue, address ABI fallout, and validate repairs with focused checks before handing control to the trusted full candidate gates. The agent does not run an additional full battery; both trusted complete-roster passes remain mandatory. Both the repair and independent-verifier checkouts configure the same repository-local `mesh-llama-canary-bot` identity before invoking the harness, so candidate commit creation does not depend on persistent-runner global Git configuration. The repair loop admits coding turns within an 11.5-hour window, and every returned candidate receives a fresh 12-hour verification budget. Earlier gate time counts against further coding admission, not against the next complete verification pass. The repair step/job limits are 1,420/1,430 minutes, leaving evidence-upload headroom beyond the 23.5-hour maximum. The agent has no GitHub credentials. Goose uses its native text renderer for readable assistant, thinking, tool, and error output in the live Actions log and retained `agent.log`. A zero exit from the coding process only yields control to the trusted wrapper; the wrapper runs the full candidate gates and returns current failure logs to the same session while coding admission remains open; an already-admitted verification pass may finish after that window closes. Existing certification and parity rows remain immutable. The agent may only correct `resources.estimated_model_bytes`, which the immutable GGUF scan rechecks, and append classification-only parity rows for source files missing from the manifest; those rows cannot add artifact or certification authority. Only a green repair pass is snapshotted as an unreachable local commit and uploaded as a thin candidate bundle. A separate self-hosted verification job and checkout download that bundle, materialize its commit in a fresh detached worktree, and independently run one ordered `prepare -> manifest-policy -> build -> certify` pass with a 12-hour budget and new native-build and family-evidence directories. Only the exact passing commit is exported as the certified bundle. Before each changed-pin candidate gate, the trusted wrapper regenerates the architecture split certification roster for the candidate recipe; only a complete battery pass is snapshotted, and the independent verifier checks the roster against the llama pin, Skippy ABI, and ordered patch queue before publication. Unchanged-pin certification checks the roster without mutating it. A separate success-gated job on a managed lab runner receives the repair token, validates the one-day bundle artifact, pushes a run-specific branch, and opens a normal exact-head PR as its final external mutation. Agent or verification failures retain logs and create no branch or PR. Successful publication leaves the canary green; changed pins are never pushed directly to `main`. Unchanged scheduled and forced certifications remain read-only and do not invoke the agent. Every certification additionally runs the System One (OpenJEV) smoke (`scripts/skippy-system-one-smoke.sh`), which drives `POST /systemone` in two independent parts. The contract part is backend independent and runs through the `family-qwen3-dense` fixture: it asserts the typed error envelopes for an unloaded model, empty questions, and out-of-range choice (1/27) and score (1/11) criteria; the unsupported-feature rejections for `images`, multiple `steps`/`samples`, `think`, and `sequential` reads; the method-not-allowed fallback; and a successful causal read with single-token and multi-token questions, ordered finite log probabilities, matching tokenizer lengths and zero generated tokens. The pinned Qwen3 fixture now exercises supported causal execution; it no longer expects an architecture refusal. These are execution checks, not classification-quality certification. The full-model read part loads the pinned `unsloth/diffusiongemma-26B-A4B-it-GGUF` Q4_K_M artifact on exactly one runtime lane and asserts `noul`, `choice`, `score`, and mixed-question answers with finite, normalized label distributions, valid answer ranges, positive input tokens with no generated output tokens, and repeat/interleaved determinism that a leaked diffusion state would break. Both artifacts are resolved through the shared test-model manifest contract (`ci/model-artifacts/manifests/skippy-system-one-smoke.json`), which enforces the authorized cadence and verifies the pinned revision, byte size, and SHA-256 before load; a mismatch is a hard failure, never a skip. The read part is admitted only by a declared qualified execution backend. The `family-certify` runner now requires Metal explicitly (`SYSTEMONE_SMOKE_BUILD_BACKEND=metal`, `SYSTEMONE_SMOKE_CERTIFIED_BACKENDS=metal`, and `SYSTEMONE_SMOKE_REQUIRE_QUALIFIED=1`), so Jev must complete its full read battery and can no longer finish as `NOT CERTIFIED`. A red contract part, or a red read on a declared-qualified backend, fails the unchanged-pin run, the changed-pin repair gates, and the independent verification pass, and therefore blocks publication. The smoke adds no `family-certified.json` roster row and claims no split or profile support. Runner requires `HF_CACHE=/Users/lab/models/huggingface`, verifies its `hub` directory, exports `HF_HOME` and `HF_HUB_CACHE` from that root, and stays offline on the NFS-backed cache (`HF_HUB_OFFLINE=1`; no `flock`, so the runner never downloads). |
 
-The changed-pin canary wrapper owns the target-pin transition: it writes the
-sole upstream selector, `third_party/llama.cpp/upstream.txt`, before the agent
-starts. The agent cannot change that selector or the harness control files.
-The wrapper retains one named Goose session, runs the ordered candidate gates
-after each response, and returns the exact failure logs to that session while
-the shared deadline remains. A narrow trusted policy permits only scanned
-tensor-byte corrections in the fixed certification roster and additive,
-classification-only rows for newly observed llama.cpp model sources; each new
-row is limited to `llama_model`, `family`, `status`, and optional `notes` or
-`unsupported_reason` metadata, with no artifact selectors, revisions, integrity
-records, execution settings, or model pins. After the
-repair gates pass, the job snapshots the candidate as an unreachable commit and
-uploads a thin bundle. A separate self-hosted verification job and
-checkout materialize that commit in a fresh detached worktree, prepare through
-the checked-in `pinned` selector, verify the prepared-upstream stamp, and execute
-the complete manifest-policy, build, and certification sequence with new
-native-build and family-evidence directories. The verifier resolves and exports its own Homebrew
-LLVM prefix before the generated-family rewriter check because job environment
-files are not shared with the repair job. Only that passing commit is exported
-as the certified bundle. A later job on a fresh GitHub-hosted runner validates
-it, uses an environment-sourced askpass helper so the repair PAT never appears
-in the push URL or process arguments, pushes without force, and opens a ready
-PR as its final external mutation. If either the agent or trusted verification
-fails, the distinct `llama-canary-changed-pin-*` evidence artifact is retained.
-Evidence uploads explicitly admit success, failure, or cancellation so an
-operator cancellation still preserves the available repair and verification
-logs without making publication or status-reporting steps resist cancellation.
+The llama canary's decision-model gate is mandatory on its Metal runner. It
+sets Metal as the required DiffusionGemma backend, so the complete Jev read can
+no longer finish as `NOT CERTIFIED`, and then runs
+`scripts/skippy-laya-smoke.sh` against the registry-pinned Laya Multilingual
+F16 GGUF through the static `llama-laya-cli` on its explicit `CPU` device;
+the platform smokes separately prove packaged Metal execution. Both real-model
+reports are retained in the
+`llama-canary-system-one-*` evidence artifact; a missing offline-cache entry or
+failed read blocks unchanged-pin certification, repair, and verification.
 
-Scheduled, changed-pin, and forced certification runs all consume the same
-complete supported-family roster. Cadence labels describe why the workflow
-ran; they do not filter model coverage. The
-competitive benchmark can optionally download exact-cohort history from
+The canary's environment preflight now owns disk headroom only. Certification
+lanes select distinct OS-assigned loopback ports immediately before launch; no
+fixed range is scanned or reserved.
+
+Agentic replay is manual-only while the full-session, long-context workload is
+qualified. Restore the former `14:23 UTC` schedule only after reviewed live
+calibration. It can queue while the llama canary occupies micstudio. Runner labels retain the
+registered `X64` label, but a pre-checkout guard requires native arm64 execution
+and working Git/xcrun. The toolchain uses the canonical shared HF cache at
+`/Users/lab/models/huggingface`, checks that it is writable, and explicitly sets
+`HF_HUB_OFFLINE=0` so missing pinned models and trajectories can be downloaded.
+Pinned input verification uses the installed `hf download --format quiet` CLI
+for path-only stdout; it does not require Hugging Face in system Python.
+The replay toolchain gate requires the installed `hf` CLI without separate
+`python3` or `uv` command checks; runner provisioning owns the CLI and its runtime.
+Model
+and trajectory downloads retain revision and SHA-256 checks. The native `trajectory-reader` supplies the compressed Parquet reader. The
+history existence probe uses the typed native HTTP owner and permits bootstrap
+only on 404.
+Replay and repair raise their descriptor limit to 65,536 and use a run-specific
+sccache socket, retaining the shared on-disk compiler cache.
+Public history reads receive no HF token. The workflow grants repair eligibility
+only after successful replay and history retrieval, complete pass/concurrency
+coverage, and a gated performance regression against matching hardware history.
+Infrastructure errors retain evidence without starting code repair. Cancellation
+also preserves available artifacts. The three models run in separate serial steps, each with a 360-minute ceiling,
+within a 1,800-minute job. Repair retains its separate 360-minute ceiling.
+These ceilings are not measured runtime estimates; calibration must establish
+that original and repair verification workloads fit before scheduling.
+The repair budget includes both Goose and its complete verification replay.
+The agent invocation is bounded to one hour and logged. Goose uses the canary's provider/model settings
+(`LLAMA_CANARY_GOOSE_PROVIDER` / `LLAMA_CANARY_GOOSE_MODEL`, default
+`zai_coding_plan` / `glm-5.3-flash`), an authentication preflight, the developer
+builtin, and a run/attempt-specific named session. Failed or
+unchanged agent output and edits to verification/control files publish no PR.
+Only a passing repaired benchmark emits a publication artifact. The hosted
+publisher uses Conventional Commit titles. Independent verification in a fresh
+job, as used by the llama canary, remains a follow-up for this older repair path.
+
+**Llama Upgrade** (`llama-upstream-canary.yml`) runs daily or on trusted-main dispatch.
+Successful same-candidate infrastructure reconciliation emits
+`retry_recovered=true`. In that case `verify_1`, `verify_2`, and `verify_3`
+skip their native builds and complete family matrices; selection retains the
+certified package and can continue to publication. This retry exception also
+applies to explicit selected-source publication. Other candidates retain the
+independent-pass requirements described below, and changed producer identities
+cannot reuse prior receipts.
+
+The controller freezes one main source SHA and the upstream target before any
+hardware work. The
+default target is the newest published llama.cpp release or prerelease, resolved
+by the Rust `repository llama-upstream-release` command. The managed resolver
+compares publication times across the paginated metadata feed, excluding drafts.
+It reads every page of the feed before selecting and records the selected
+release's kind, publication time, tag and SHA in the summary, because the feed
+is ordered by creation time and a draft created long ago but published recently
+sits on a late page. It peels the selected tag to an exact commit. API errors,
+missing releases and moving tags fail before hardware work;
+there is no `master` fallback. The managed upstream selection step receives the
+workflow's read-only token via `GH_TOKEN`; workers
+remain credential-free. Runner placement uses managed memory labels and does
+not query the repository runner API.
+Fixed read-only GraphQL queries fetch metadata
+without assets; REST resolves the tag. A 180-second total budget, 1 MiB response
+cap and 1000-page ceiling bound the lookup; incomplete pagination fails without
+choosing a partial result. An explicit full `upstream_sha` remains a deliberate override;
+empty or `latest` means the newest release or prerelease. `mesh_ref` bypasses
+this lookup and certifies its existing pin.
+Release selection does not waive our candidate or independent verification.
+Unchanged
+scheduled/forced runs build once and certify the complete roster. Every
+certification first runs a deterministic immutable-plan and pinned-cache
+preflight. It validates pinned model revisions, byte sizes, cache containment and
+GGUF metadata for both regular snapshot files and symlinks. Content-addressed blob
+paths retain the immutable-cache identity check. Other files require SHA-256
+verification; private Unix job-account receipts avoid rereading unchanged payloads
+by binding the canonical path, digest, device/inode, size, mtime and ctime. Missing,
+invalid or stale receipts trigger verification again. Receipts live in the account's
+local cache and do not modify the read-only model store; they are account-trusted
+accelerators, not portable attestations.
+On macOS they live under
+`~/Library/Caches/mesh-llm/canary-payload-integrity-v1`; Linux uses
+`$XDG_CACHE_HOME/mesh-llm/canary-payload-integrity-v1` or `~/.cache` when unset.
+The first admission of a copied file reads its full contents once per account
+and machine. The preflight job allows 180 minutes for this cold verification of
+the full roster. Removing receipts forces verification again. Without usable private
+local state, including on Windows, regular files are verified on every admission.
+Silent storage corruption that preserves file identity and timestamps still
+requires a separate content audit.
+It does not rehash admitted content-addressed blobs: repeatedly reading the complete
+roster is too expensive for the NAS-backed immutable cache. Same-size corruption
+of those blobs requires cache-population verification or a separate audit; plan, executable
+handoff and evidence hashes remain checked.
+Changed pins use up to three distributed repair attempts. Each
+attempt runs one complete candidate family pass followed (only when all
+families pass) by one independent build and complete verification pass on the
+exact same commit. A candidate-class family failure emits digest-bound evidence
+and resumes from that exact candidate in the next bounded agent session.
+Runner/workflow failures or missing receipts receive one targeted retry of only
+the affected families on the same immutable package without Goose or a rebuild;
+candidate failures from a mixed pass remain retained. Repeated infrastructure
+failure, corrupt/foreign/invalid evidence, or exhaustion after attempt three
+stops without invoking Goose and denies publication.
+
+
+Manual `mesh_ref` dispatches accept an explicitly trusted same-repository branch
+or full commit SHA. Resolution freezes the SHA once, requires it to be reachable
+from a repository branch, and reads its existing llama.cpp pin. In certification
+modes, `upstream_sha` cannot be combined with this input. Keep the Actions workflow ref on `main`.
+The default `mesh_action=certify` runs one complete pass without repair or
+publication. Explicit `mesh_action=certify-and-publish` runs that pass, then a
+fresh independent build and complete family pass on the same frozen commit.
+Two green passes, or the successful same-candidate retry exception above,
+permit the managed lab publisher to create a PR to `main`
+with that exact commit. Both modes keep its existing pin and never invoke Goose.
+The independent selected build admits the digest-bound first-pass package; each
+pass has separate build directories and evidence. Failed certification publishes
+no branch or PR. Publication refuses a selected revision with no diff from main's
+merge base. Closing an earlier PR and merging the replacement remain operator actions.
+The publisher explicitly checks `!cancelled()`, successful `resolve` and `result`
+jobs, and `publish=true`, so skipped optional repair attempts do not suppress it.
+The approved Rust source-plan API uses the current controller planner for every
+selected SHA; source build scripts and the battery remain selected-source code.
+Rust `gguf_metadata` yields `metadata_admitted`; other modes stay `pending`, with downgrade rejection.
+Python callers remain unchanged; metadata is not environment readiness. The package binds both revisions, and workers
+reject any changed source identity. This is an operator-authorized trusted-code
+path on persistent lab machines, not isolation for untrusted PRs or fork code.
+Leaving `mesh_ref` empty preserves scheduled and upstream-upgrade behavior.
+
+Explicit `mesh_action=upgrade` instead upgrades from the selected branch. It
+requires an exact lowercase 40-hex `upstream_sha` different from that branch's pin.
+The controller remains on protected `main`; the frozen selected SHA becomes the
+repair base. Candidate bundles, workers, retries and independent verification
+retain that base and the separate controller identity. The normal bounded repair
+loop must complete a candidate family pass and a fresh independent family pass
+on the same changed commit before the managed lab publisher opens a PR. Certification
+modes retain their unchanged-source requirements.
+
+```sh
+gh workflow run llama-upstream-canary.yml --ref main \
+  -f mesh_ref=TRUSTED_REPAIR_BRANCH -f mesh_action=upgrade \
+  -f upstream_sha=FULL_UPSTREAM_COMMIT_SHA
+```
+
+To certify a recovered branch without publication:
+
+```sh
+gh workflow run llama-upstream-canary.yml --ref main \
+  -f mesh_ref=scammed/recover-llama-pin-35582541955
+```
+
+To independently certify and publish a trusted revision:
+
+```sh
+gh workflow run llama-upstream-canary.yml --ref main \
+  -f mesh_ref=FULL_MESH_COMMIT_SHA -f mesh_action=certify-and-publish
+```
+
+The run summary records the resolved MeshLLM SHA and existing llama.cpp pin;
+a branch moving later cannot change the selected source for that run.
+
+`llama-canary-family-pass.yml` runs macOS and Linux native builds concurrently
+for the first unchanged selected-source certification pass. Both independently
+prove the frozen selected commit; combination requires matching candidate,
+source, plan and manifest identities before the memory-tier family matrix.
+Changed-pin repair and independent verification keep the Mac → Linux
+dependency: Mac freezes the candidate, then Linux rebuilds that exact candidate.
+Both producers perform prepare, manifest-policy, full native and Rust
+builds, generated-family validation, smoke, and split-roster checks. It reads
+Git manifest, path-list and diff payloads through bounded raw capture, separately
+from redacted diagnostics, so ordinary model names containing `token` retain
+their exact bytes. Capture overflow or incomplete output fails admission. It validates
+the immutable HF cache before compilation. After preparing the exact llama.cpp
+pin, it reads GGUF tensor descriptors with that pin's GGML type table and
+compares each target's tensor byte sum with the manifest before any build.
+After the build, seven pinned models exercise dense parity, recurrent and
+MoE replay, embedding and rerank startup, encoder-decoder ordering, and image
+response content on each backend before the 95-family matrix is submitted. The full matrix
+and independent verification retain publication authority. The producer exports a candidate Git bundle,
+one-family-per-shard plan, four arm64 certification binaries, a prebuilt
+multimodal library-test executable, and the run-scoped CPU workload oracle
+closure for each OS. Static Metal resources are embedded; an unpackaged
+non-system dylib or unsafe Linux ELF loader path makes the handoff fail. SHA-256
+digests bind both native payloads to one candidate,
+main base, run/attempt, and pass identity.
+The native generator gives each whole-source rewriter pass a 600-second
+deadline, separate from the 60-second Git command default. An explicit
+`--timeout` overrides both. Generation and idempotence each remain required;
+deadline failures report readable retained output and process cleanup status.
+
+The macOS build job sets `CTEST_PARALLEL_LEVEL=16` for complete upstream CTest
+runs in the repair session and trusted build. The Linux build job uses 4 to
+limit concurrent CUDA test memory pressure. The per-case timeout remains 900
+seconds.
+Non-chat certification uses ordinary `skippy serve --model-path` startup and
+binds oracle evidence to the same candidate `skippy` executable. It does not
+generate a stage configuration or supply cache-admission labels.
+
+Before compilation, the controller runs the selected battery in cache-free
+`--dry-run --skip-build` mode against its own planner output. This checks the
+actual producer/consumer plan contract, without historical planner emulation and with
+source-relative manifest paths. Handoff schema 3 also carries a digest-bound,
+one-commit prepared llama.cpp bundle and preparation markers. Workers restore
+and verify that source against the selected pin and patch queue before lanes
+start; they cannot accidentally depend on a previous runner checkout.
+The agent supervisor terminates remaining process-group members after normal
+completion and waits for live members to stop before handing the workspace back.
+If the repair agent or trusted gates fail, the build evidence retains an
+unverified `recovery/` source snapshot (`tracked.patch`, `untracked.tar.gz`,
+and `manifest.json`), including the prepared `.deps/llama.cpp` checkout when
+present. A reviewer can reapply it at the recorded base commits;
+it is never accepted as a certified candidate or sent to family workers.
+Repair snapshots first verify the workload producer against the dirty source,
+then bind its unchanged files to the identical committed candidate tree.
+Pinned and independent verification builds keep their original source identity.
+Bundle-backed native builds inspect parity against the admitted exact candidate;
+the controller parity inventory checks only the frozen selected source.
+
+The family matrix is submitted in ascending estimated model bytes, with family
+name breaking ties. Balanced shard membership remains unchanged. This puts
+small models first in the canary's one-family-per-job matrix; parallel runner
+availability can still change actual start and completion order.
+
+The native build adapter keeps arch/lipo and OSX CMake options on macOS only;
+Linux uses its selected CUDA backend with the ordinary shell.
+
+Partial reruns reuse the successful producer's exact identity digest from the
+same run even when native producer attempts differ. Combination retains the
+macOS producer's attempt and rejects either producer from a future attempt.
+Family artifacts include that digest and their worker attempt; aggregation downloads all attempts for
+that identity and pass, then selects the latest receipt per family. Newer
+failures supersede older successes; duplicate same-attempt receipts, missing
+families, foreign identities, and out-of-range attempts fail closed. The matrix
+job-result gate also rejects failed/cancelled jobs whose receipts never upload.
+Rebuilt producers have distinct identities and cannot reuse old receipts.
+Failed certifications upload their evidence and then fail the family job, so
+GitHub's failed-job rerun can select them instead of only retrying aggregation.
+Reruns retain attempt-labelled family/build history. These diagnostics never
+substitute for either complete certification pass. The managed aggregate emits
+a digest-bound classification artifact for candidate repair or a single
+targeted infrastructure recheck. That recheck runs only runner/workflow-failed
+or missing families against the exact producer package, without Goose or
+compilation. Reconciliation retains valid candidate failures from a mixed pass
+and emits automatic-repair input only when every remaining failure is proved
+candidate-class.
+The memory receipt distinguishes host admission and guard success from the
+battery process exit, so a guarded family test failure enters candidate repair.
+Failed admission, guard, output capture, cancellation, and cleanup retain infrastructure routing.
+Projector smokes allow up to 256 tokens with reasoning disabled and require a
+parsed, user-visible image answer. Reasoning-only output or raw protocol
+markers fail the local and split smoke.
+Hybrid and recurrent decoders synchronize an async backend graph before
+advancing to another internal microbatch, so the next graph reads completed
+recurrent state while model layers remain on their selected GPU device.
+
+Each named family job runs `--skip-build --shard-index` on the matching
+`family-certify` pool, with max-parallel 8 and fail-fast disabled. Workers
+restore the executable handoff, including the workload oracle closure, and
+point the battery's `SKIPPY_WORKLOAD_*` variables at the restored closure, so
+no worker compiles or downloads. No build runner is held while workers queue:
+one machine can execute all jobs serially, and more machines can run them
+concurrently. Each machine must have the same arm64/Metal toolchain/runtime
+compatibility and an existing readable HF cache.
+The shared `use-canary-cache` action loads the runner account's interactive login
+shell for both producer and family jobs. It uses `HF_HOME` (falling back to legacy
+`HF_CACHE` or the standard user cache), validates its `hub` directory and any
+explicit `HF_HUB_CACHE`, and exports the resolved paths for the planner. A missing
+mount fails with its actual path; the workflow never creates or seeds a model
+cache. Existing `HF_TOKEN`/`HF_TOKEN_PATH` configuration is preserved, with tokens
+masked before export. `HF_HUB_OFFLINE=1` is applied as certification policy rather
+than required in the machine environment. Compiler-cache and local-tool defaults
+use the runner account's home directory instead of a fixed username. Runner
+services sharing a physical certification machine serialize model loads through
+a pre-provisioned cross-account host lock in the root-owned
+`/Library/Application Support/MeshLLM/locks` directory.
+Certification endpoints use distinct OS-assigned loopback ports selected when
+each lane starts, so an unrelated listener does not reject a family preflight.
+An address-in-use startup failure receives at most two retries with newly
+selected ports; other startup errors fail immediately.
+There is no Actions model cache and no worker-side compilation or download.
+
+The aggregate requires every planned family exactly once, successful worker
+status, matching candidate/plan/build digests, and each family's required
+lanes from the plan — split-parity lanes for causal rows, class-specific smoke
+plus oracle lanes for the non-chat rows — plus any required multimodal result,
+so a failed or missing non-chat smoke/oracle lane fails the pass. The battery
+itself reconciles the production
+planner's selected cuts, immutable revisions, tensor bytes, and native MTP
+requirements. Missing, cancelled, duplicate, or stale evidence cannot certify.
+Aggregation reports every failed receipt, including its runner and outcome, in
+the job log and Actions summary before rejecting the pass. Candidate-class
+worker failures remain recoverable by later bounded repair passes;
+runner/workflow failures receive one targeted same-candidate recheck. A clean
+recheck plus retained initial successes completes that immutable full pass;
+repeated infrastructure failure or invalid aggregate evidence stops. Only
+complete independent success or successful same-candidate recovery permits publication.
+Full worker/build logs remain for 14 days; executable handoffs remain for seven
+days so a single-machine queue can complete later passes.
+Build evidence explicitly includes hidden run-owned `.deps` state and native
+CTest results before cleanup. Live controller output retains up to 16 MiB per
+stream; the artifact contains the complete gate logs when that bound is exceeded.
+Agent-run build and test commands save complete individual logs and exit statuses
+under `agent-commands/` in the build evidence artifact. The console shows
+Goose’s normal text output.
+The command wrapper also snapshots available CTest result files after each run.
+
+Llama repair invokes Goose in normal text mode and streams its stdout and stderr
+once to the job console while saving the same output in `agent.log`. It does not
+project JSON events, add activity messages or repeat tool output. GitHub workflow
+commands are disabled around this stream so model/tool text cannot alter the job.
+Full per-command logs remain in the existing 14-day build artifact. They can be
+inspected on the runner during a job and downloaded after artifact upload.
+Logging failure stops the supervised turn. The worker credential boundary and
+certification gates are unchanged.
+
+See [Following a Llama Upgrade repair](llama-canary/PROGRESS.md) for console and detailed-log examples.
+
+Within each candidate build job, Goose resumes the same session for
+prepare/build failures under the existing 11.5-hour coding-admission and
+12-hour per-gate budgets. A repairable distributed or independent-verification
+failure starts a new bounded session on the next attempt after restoring the
+exact prior candidate as uncommitted changes on the frozen base. Every edit
+invalidates all prior family results. Candidates are local, uncertified commits
+until both full family passes are green. The separate managed lab publisher
+alone receives `CANARY_REPAIR_TOKEN`; it publishes no failed/incomplete state.
+No Actions-write credential or dispatch controller is needed. Feature-ref
+manual dispatch is rejected before persistent-runner work. The workflow-level
+non-cancelling concurrency group serializes canary runs, not individual families.
+
+Scheduled, changed-pin, and forced certification runs consume the same full
+roster: 83 causal split targets and six non-chat workload rows. Cadence labels
+describe the trigger, not a model filter. Each pass builds a run-specific CPU
+oracle closure with `just skippy-workload-oracles-build`: pinned monolithic
+server/completion/TTS references and a separate static CPU candidate, without
+replacing Metal outputs. The closure ships in the executable handoff, family
+workers restore it, and its source- and executable-bound `producer.json` is
+re-verified before consumption. Non-chat rows require both class-specific
+smoke and oracle evidence, not split certification. Every selected
+GGUF/projector must exist in the verified read-only lab cache; provisioning
+that cache is an external runner operation.
+
+Every family row declares its workload `class` and GGUF `architecture`
+separately. Cache preflight compares the target's architecture with its
+immutable GGUF metadata. Only causal rows with complete split-parity policy
+contribute to the architecture admission roster; a non-chat row sharing an
+architecture with a causal model does not provide split-certification evidence.
+
+Dry runs print workload commands without requiring oracle binaries. Executable
+runs record missing-oracle failures and continue with the remaining rows. Each
+row applies its startup deadline separately to candidate and reference HTTP
+servers. Embedding certification also requires the official Python SDK smoke;
+a missing SDK is a failure, not a skipped passing check.
+
+The competitive benchmark can optionally download exact-cohort history from
 `MESH_PERFORMANCE_HISTORY_DATASET`, validate the checked-in schema, report
 regression candidates, and append one immutable run shard using
 `MESH_PERFORMANCE_HISTORY_HF_TOKEN`. Performance thresholds are report-only
@@ -92,8 +628,8 @@ PR-controlled routing out of the protected planner.
 
 ### Required PR shape and visibility
 
-The five-way split is a hard CI architecture invariant. Keep exactly these PR
-validation entry workflows: Quality, Website, Linux, macOS, and Windows. PR
+The five-way split is a hard CI architecture invariant. Keep exactly these
+required PR validation entry workflows: Quality, Website, Linux, macOS, and Windows. PR
 metadata, cleanup, auto-assignment, and sibling-cancellation workflows such as
 `pr_cleanup.yml`, `pr_auto_assign.yml`, and `pr-cancel-sibling-runs.yml` are
 outside this validation census. Every validation
@@ -113,6 +649,42 @@ Do not add path filters to these entrypoints. They all start for each relevant
 PR synchronization so their stable results exist; the canonical plan suppresses
 unselected expensive work inside each run. Do not add another all-lanes PR
 composer or restore retired compatibility entrypoints.
+
+### Optional PR CI canary
+
+`pr_ci_canary.yml` is an optional, non-required diagnostic exception to the
+five-entry validation census. Apply the `ci:canary` label when a pull request
+changes workflow YAML, local actions, planner contracts, runner selection, or
+other CI plumbing and you want a real pre-merge signal. The label is
+operational opt-in, not a security boundary. It starts on the normal PR
+revision events and on the matching label event; unrelated label events use a
+separate concurrency group and cannot cancel an active canary. Removing the
+label starts an inactive no-op in the active group so a running canary is
+cancelled.
+
+The entrypoint calls the protected reusable lane at
+`Mesh-LLM/mesh-llm/.github/workflows/ci-pr-canary-lane.yml@main`. That lane
+passes the pull-request merge commit (`github.sha`) as the source built by the
+product jobs while keeping runner-policy checkouts on the protected default
+branch. The PR head SHA remains separate identity evidence; it is not a
+substitute for the merge source. The planner and changed-file action may inspect
+the merge-source checkout, while the canary rejects changes to the ownership
+and slice catalogs unless the base already contains the same catalogs. Its
+fixed graph derives one `linux-cpu` row from `ci/slices.yml` and calls the
+existing UI-artifact, Linux-host, Linux-native-runtime, and Linux-product
+slices. This is one real production chain, including the native runtime-event
+gate; it does not copy build commands or call `ci-linux-lane.yml`.
+
+The canary is intentionally bounded: Quality, Website, macOS, Windows, GPU,
+SDK, standalone product smoke, Linux lane orchestration, and release paths are
+not covered. The caller, policy jobs, and summary use only read-only
+`contents`/`packages` permissions. There are no checks writes, secrets,
+environments, OIDC, Depot, or persistent self-hosted runners. The protected
+workflow reference and default-branch runner-policy checkout keep PR-controlled
+workflow/action changes out of runner-owning jobs. Hosted placement and a
+read-only token remain containment controls, not a reason to relax that
+boundary. Any future persistent-runner rollout must first restrict the shared
+runner group to protected main-owned workflow references.
 
 ### Required main shape and visibility
 
@@ -137,17 +709,48 @@ main.
 
 ### Release source and version ownership
 
+Release packaging and product composition now invoke typed xtask `native`,
+`product`, and `artifact` commands through `MESH_LLM_AUTOMATION_BIN` or
+`cargo xtool`. Release host producers build and upload one source-bound automation
+artifact per OS/architecture through `upload-automation`. All eight release
+composition jobs restore the immutable executable through `restore-automation`,
+verify its checksum and source identity, and export `MESH_LLM_AUTOMATION_BIN`.
+Their existing host-producer `needs` edges provide the artifact dependency; no
+composer invokes Cargo. L2 bare-hosted callers use explicit automation preparation.
+Windows composition jobs restore rather than build;
+release jobs no longer install Python. Runtime-package verification embeds the
+checked-in GLIBC ceiling and retains native dependency probes when copied
+outside the source checkout. `repository publish-order --dependency-pairs`
+projects publishable workspace edges, including optional dependencies, for the
+publisher's dry-run checks. The fixed publication roster remains checked by
+`repo-consistency publish-crates`. The L8 smoke restore action uses Rust product
+composition and the transitional Python composer is deleted.
+
 If crates.io accepts only a prefix of the stable package chain,
 `resume-crates-release.yml` resumes publication from the existing immutable
 release tag. The operator supplies both the stable tag and its exact peeled
-commit SHA. The workflow runs only from the default branch, verifies those two
+commit SHA. The workflow has `packages: read` to pull its pinned GHCR runner
+image. It runs only from the default branch, verifies those two
 identities against the remote tag and checkout, and uses the trusted
-default-branch `publish-crates.sh` controller against the tagged source. Resume
+default-branch `publish-crates.sh` controller against the tagged source. The
+controller checkout is pinned to the workflow commit. Current Rust automation
+consumes locked Cargo metadata and the tagged source's literal publication
+roster, checking package metadata, dependency versions and order, packaged
+includes, and catalog consistency. It does not require a Cargo automation alias
+or execute automation from the historical checkout. The publisher uses that
+validated historical roster while Cargo runs from the tagged source. Resume
 mode skips versions that crates.io confirms are already published and falls
 back to Cargo for unknown registry responses. Cargo verification links against
 the checksummed CPU runtime libraries from that same GitHub release, preserving
 isolated binary-crate verification without rebuilding native inputs. The
 workflow does not move or recreate the release tag.
+
+The recovery Python workflow test module is retired with its core roster entry.
+Required Rust tests execute the source-admission and runtime-restore steps using
+owned data, reject corrupt archives and missing libraries, and invoke the current
+publisher from a historical source directory. Typed workflow guards retain the
+controller, token and cache boundaries. These local fixtures do not establish a
+hosted recovery run or actual crates.io publication.
 
 Release efficiency TODOs:
 
@@ -172,12 +775,27 @@ Release efficiency TODOs:
   canary. QA: verify all host/runtime hashes, no-driver readiness, SDK resources,
   and per-phase timings on Linux amd64/arm64, macOS, and Windows.
 
+Protected `main` requires the complete version update to land through a PR
+with successful checks before dispatch. The workflow reapplies the same script
+idempotently and pushes the unchanged commit. If version preparation has not
+landed, branch rules can reject the workflow's new version commit; the release
+process does not bypass those rules.
+
 `scripts/release-version.sh` is the single owner of the tracked release-version
-surface. On a non-canary `release.yml` dispatch, the metadata job applies that
-script, creates a linear release-source commit when needed, and fast-forwards
-`main` before the build graph begins. `just release` only performs local
-preflight, dispatches that workflow, and waits for its result. Canary dispatches
-do not mutate `main` or publish. Release tags and releases are immutable on
+surface. It runs cargo, and `.cargo/config.toml` wraps `rustc` with sccache, so
+every release job that can reach cargo — including `metadata`, which runs on
+canary dispatches too, and the canary-skipped `publish` and `release_notes`
+jobs — initializes sccache before its first cargo call. The artifact-only
+composition jobs never call cargo, and `tools/xtask` enforces both halves. The
+Cargo-reach check recognizes direct `cargo` invocations and the named helpers
+`release-version.sh`, `publish-crates.sh`, `release-notes-generate.sh` and
+`package-release.sh`; other scripts that invoke Cargo are not covered unless the
+validator is extended to detect them. On a non-canary `release.yml` dispatch,
+metadata reapplies the prepared version. If a diff remains, it attempts a new
+release-source commit and main push; protected `main` rejects that unreviewed
+update before the build graph begins. `just release` only
+performs local preflight, dispatches that workflow, and waits for its result.
+Canary dispatches do not mutate `main` or publish. Release tags and releases are immutable on
 the manual release path: a non-canary dispatch refuses an already-existing tag
 and fails closed if it cannot verify the remote tag state. The release
 workflow is dispatch-only, so re-pushing a tag does not start a second release
@@ -195,6 +813,14 @@ and host. Swift resource assembly and the release-tag SDK resources consume the
 same bytes with `--skip-build`. Missing manifests, mismatched source/version,
 changed files and placeholder HTML fail before host compilation. UI artifacts
 use `prepared-release-ui-*`, outside the published `release-*` asset namespace.
+The build job first uploads `<artifact_name>-raw`. Release-only `ui_stamp`
+checks out the protected automation source, bootstraps xtask in the existing
+CPU image, downloads the raw distribution and adds only the release manifest
+through `prepared-input ui-distribution stamp`. Its final artifact retains the
+original name and dist layout; no Node install or UI rebuild occurs there.
+Ordinary PR/main callers keep their direct unstamped artifact and skip this job.
+`restore-release-ui` verifies with the prepared automation binary when present
+or the existing Cargo xtool alias in a Rust-capable consumer checkout.
 
 Linux CUDA, ROCm and Vulkan release composition jobs use the pinned `public
 cpu` image, retaining producer checksum/import checks, attestation verification,
@@ -207,17 +833,22 @@ claiming a wall-time improvement.
 The later publish job checks out the canonical source commit, adds only the
 generated SwiftPM/binding and SDK console resources needed by the immutable
 release tag, publishes the assets, and enables GitHub-generated release notes.
-The metadata job selects the highest stable `vMAJOR.MINOR.PATCH` tag below the
-target as the explicit comparison base. It excludes every prerelease tag, so
-release candidates and their final stable release use the same stable baseline;
+The metadata job runs `cargo xtool release notes-base` to select the highest
+stable `vMAJOR.MINOR.PATCH` tag below the target as the explicit comparison base.
+It excludes every prerelease tag, so release candidates and their final stable
+release use the same stable baseline;
 the final notes retain the RC changes and add any post-RC changes.
 The workflow-scoped token push does not fan out another main CI run; the release
 graph is the evidence for that version-only source commit.
 
 After a stable release publishes, the `release_notes` job regroups the
-GitHub-generated body into Keep a Changelog sections. A deterministic pass
-classifies each entry from the Conventional Commits type on the canonical
-squash-merge commit between the comparison base and the tag; an optional agent
+GitHub-generated body into Keep a Changelog sections through the Rust `cargo
+xtool release` notes-link, notes-classify and notes-regroup commands. The job
+uses the pinned Rust toolchain and job-local sccache initialized before the
+notes helper runs. The release compiler contract checks this helper's indirect
+Cargo calls. The deterministic pass classifies each entry from the Conventional
+Commits type on the canonical squash-merge commit between the comparison base
+and the tag; an optional agent
 review pass then reclassifies what commit metadata could not place. Both passes
 render through the same validator, which refuses a plan that does not cover the
 published body exactly, and the job re-verifies the live body after editing.
@@ -236,6 +867,8 @@ That repository secret is external GitHub configuration. The checked-in
 workflow can report a missing or insufficient credential, but it cannot grant
 the token access or replace the secret.
 
+The non-canary path below assumes the version-preparation PR has merged.
+
 ```mermaid
 flowchart TD
     JUST["just release VERSION<br/>preflight + dispatch + wait"] --> DISPATCH["Release workflow dispatch"]
@@ -243,8 +876,8 @@ flowchart TD
     DISPATCH --> META["Resolve version and highest prior stable notes tag"]
     META --> PATH{"Canary?"}
     PATH -- "canary dispatch" --> CANARY["Use dispatch SHA<br/>do not update main"]
-    PATH -- "non-canary dispatch" --> BUMP["Run release-version.sh"]
-    BUMP --> VERSION_COMMIT["Commit tracked version surface<br/>fast-forward main"]
+    PATH -- "non-canary dispatch" --> BUMP["Reapply release-version.sh"]
+    BUMP --> VERSION_COMMIT["Use prepared main SHA<br/>unchanged main push"]
     CANARY --> BUILD["Build, compose, and smoke artifact matrix"]
     VERSION_COMMIT --> BUILD
     BUILD --> PUBLISHABLE{"Canary?"}
@@ -255,6 +888,12 @@ flowchart TD
     KIND -- "yes" --> RC_DONE["Stop after GitHub prerelease"]
     KIND -- "no" --> DOWNSTREAM["Publish crates and dispatch<br/>packages, images, and npm"]
 ```
+
+The stable crates.io preflight and publisher each verify the checksummed Linux
+x86_64 release archive and restore its native runtime libraries before Cargo
+package verification. Their `LLAMA_STAGE_LIB_DIR` points at the restored `libmtmd.so`,
+`libllama-common.so`, and `libllama.so`. The same archive gate is used when
+resuming a partial crates.io publication.
 
 ## Graph shape
 
@@ -287,6 +926,9 @@ flowchart TD
     MONITOR -. "cancel remaining siblings" .-> LINUX
     MONITOR -. "cancel remaining siblings" .-> MAC
     MONITOR -. "cancel remaining siblings" .-> WIN
+    CANARY_LABEL["ci:canary label"] --> CANARY_PLAN["merge-source canary plan"]
+    CANARY_PLAN --> CANARY_GRAPH["Linux amd64 CPU UI + host + runtime + product"]
+    CANARY_GRAPH --> CANARY_RESULT["Canary / CI (non-required)"]
     QC --> MQ["Main / Quality"]
     WC --> MW["Main / Website"]
     LC --> ML["Main / Linux"]
@@ -306,7 +948,35 @@ native inputs. No workflow YAML is generated and no lane allocates a planner.
 
 ## Planner and profiles
 
-`scripts/plan-ci.py` is the only source of slice eligibility. It reads the
+The local `scripts/hooks/commit-msg` hook now invokes the Rust
+`repository conventional-commits` command through the repository Cargo alias.
+The workflow commit check, planner and five lane summaries use Rust owners
+through `prepare-ci-controller`. The local package resolver requires
+prepared or restored automation and invokes metadata-only discovery. Protected
+callers still pin the old resolver and retain its Python implementation until
+rollout. Pre-checkout audit and no-checkout sentinel jobs must not build
+candidate code and remain blocked on protected delivery. Registry-pull summaries
+use the Rust owner. No provider, cache authority or required result changed.
+
+The seven former optional inline observations in `mesh/evals/ab-test.sh` and
+`skippy/evals/latency-benchmarking/{bench,bench-b2b}.sh` now use prepared or
+source-built native automation. `automation smoke-observation model-count`
+counts admitted Models JSON; `automation wan-observation tensor-split` emits
+checked allocation fractions, and `automation wan-observation latency-summary`
+projects measurement JSON to the existing TSV fields. The callers retain their
+failure and missing-field behavior. `migration_optional_observations` is selected
+by the normal Rust contract roster and `just ci-automation-contracts`. This
+language cutover does not qualify the research runtime or remove its separately
+classified proxy, measurement, or upstream reference interfaces.
+
+The five protected package resolver callers retain their published immutable
+legacy action pin. Native resolver fixtures bind all five package/generation
+inputs, platform conditions, batch correlation and admitted executable identity;
+they do not establish a published protected caller cutover. The separate 27
+pre-checkout audit callers retain the same rollout boundary. Native source fixtures do not
+qualify their environments, datasets, or live model behavior.
+
+`tools/ci-controller/src/plan` is the production source of slice eligibility. It reads the
 JSON-compatible YAML manifests `ci/ownership.yml` and `ci/slices.yml`, validates
 their schema and dependency graph, and emits `ci/ci-plan.schema.json` output.
 Its optional manifest root changes only those two reads. All workspace and
@@ -318,9 +988,12 @@ semantic domains, signals, selected slices, reasons, typed matrices, runner
 roles, cache modes and fan-out budgets. Unknown paths and malformed inputs fail
 closed.
 
-`scripts/plan-ci.py` is the sole Clippy and Rust-test batch allocator;
+The Rust CI planner is the sole production Clippy and Rust-test batch allocator;
 `ci-crate-lists` validates that the main `matrices.rust_tests` covers every
-workspace crate exactly once.
+workspace crate exactly once, except the `CONTRACT_TESTED_CRATES`
+(`ci-controller`, `process-supervision`, and `xtask`). `just
+ci-automation-contracts` runs their tests in the Quality slice, so each runs
+exactly once.
 
 Control-plane changes fail open through the selected profile. When they
 require the `web` slice, both console and website rows execute even without a
@@ -342,6 +1015,44 @@ select no build rows. Trust-derived placement, cache mode, artifact namespace
 and optional credentials may differ, along with row selection and bounded
 parallelism.
 
+## Native contract execution
+
+Quality runs both `just ci-automation-contracts` and `just ci-legacy-contracts`,
+with pinned external SDK and research source preparation. Model-resolution
+steps call the native resolver directly. The compatibility changes merged in
+PR #2312 allow main's protected workflows to validate this native source before
+the separate full migration rollout.
+
+Native managed work starts only after preparing and admitting a source-bound
+cleanup controller. A private, read-only executable copy under `RUNNER_TEMP`
+retains its digest even if later Cargo work replaces the build output. Cleanup
+requires the managed-work marker and rechecks source and controller digests;
+bootstrap failure refuses owned work and does not compile a cleanup fallback.
+These are explicit budget changes: Quality has a 60-minute job with a
+40-minute native contract step; the runner-contract job
+has 45 minutes, including 20-minute native preparation and 5-minute cleanup.
+The three accelerator Laya jobs have a 100-minute floor, preserving larger
+caller limits: 20-minute preparation, 70-minute aggregate restore/read work,
+5-minute cleanup and 5-minute setup reserve. Workload arguments remain
+unchanged. The aggregate Laya allowance does not
+create a separate internal acquisition deadline.
+
+The five normal PR/main authority boundaries and all existing audit and package
+resolver immutable references remain unchanged. Hosted two-source diagnostic
+[37725709469](https://github.com/Mesh-LLM/mesh-llm/actions/runs/37725709469)
+passed legacy `d18311f1` and native `db506f7f` contract execution, including
+skipped local actions absent from the legacy checkout. Those results are
+separate from qualification of the rebased migration and its product workloads.
+
+Windows readiness uses the Rust supervisor's retained child handle and owned
+job object. Failed CTRL_BREAK delivery, nonzero exits, forced shutdown and
+incomplete cleanup fail admission. Its default graceful-shutdown window is
+15 seconds. After output and process handles close, Windows private state
+deletion allows five attempts with one-second waits between them; persistent
+locks fail cleanup and retain remaining state. Native lifecycle and deletion
+fixtures cover these contracts. Actual Windows handle-lock fixtures and product
+checks require a Windows host and provide separate platform evidence.
+
 ## Slice catalog
 
 The five lane workflows organize the catalog without changing selected rows:
@@ -350,7 +1061,30 @@ The five lane workflows organize the catalog without changing selected rows:
 runtime, composition and smoke dependency chain inside one run, so native
 runtime producers are not duplicated.
 
-- `ci-quality-slice.yml` — action/packaging/consistency contracts, format,
+Native source-contract and persistent-runner phases have separate budgets.
+Quality allows 60 minutes for the job and 40 minutes for the complete native
+contract step. Trusted runner-image checks allow 45 minutes: automation
+preparation is bounded to 20 minutes before managed package work, package work
+to 15 minutes, cleanup to five minutes, and setup has a five-minute reserve.
+The neutral macOS host producer has a 60-minute job ceiling for cold Rust
+compilation.
+The three hardware-backed Linux Laya rows retain a larger caller timeout and
+otherwise use a 100-minute job floor: 20-minute automation preparation before
+artifact restoration, a 70-minute restore/read composite, five-minute cleanup,
+and five-minute setup reserve. The composite retains the 300-second startup
+and eight 300-second read limits; its acquisition and inference share one
+70-minute cap. These are execution limits, not measured completion guarantees.
+
+Persistent cleanup uses the selected source's controller prepared through
+`just automation-bootstrap` before managed work. The workflow checks the
+selected checkout revision and controller SHA-256 before starting work and
+again during cleanup. Cleanup does not compile Cargo or fall back to another
+controller. If preparation never admitted managed work, cleanup refuses to
+claim owned-work cleanup. Existing runner selection, cache authority, Laya
+model cadence, device gates and protected action references remain unchanged.
+
+- `ci-quality-slice.yml` — action/packaging/consistency contracts (including
+  product-crate README presence, manifest descriptions, and local Markdown links), format,
   unused-dependency check (cargo-machete), bounded Clippy batches and
   generated CLI inventory freshness.
 - `ci-web-slice.yml` — console lint/type/test, console Playwright E2E, public
@@ -359,13 +1093,16 @@ runtime producers are not duplicated.
 - `static-abi-artifact.yml` — one verified portable static llama ABI producer
   that exports the exact toolchain epoch recorded in its artifact.
 - `ci-rust-tests-slice.yml` — deterministic affected or all-workspace Cargo
-  test batches consuming the static ABI artifact and its producer-owned
-  toolchain epoch. Batches that exercise Skippy correctness tests restore an
+  test batches that prepare patched llama before consuming the static ABI
+  artifact and verifying its patched revision and producer-owned toolchain
+  epoch. Batches that exercise Skippy correctness tests restore an
   exact revision- and SHA-256-pinned model cache, verify the file before use,
   and leave publication to one trusted-main batch. Related Skippy crate changes
-  on pull requests also compile one fully qualified runtime test, fail if that
+  on pull requests also compile the adapter-owned
+  `config::hardware_translation_tests::safetensors_checkpoint_reaches_mesh_host_runtime`
+  library test in `mesh-llm-skippy-adapter`, fail if that
   test is absent, then run its binary against an immutable SmolLM2 revision
-  through the complete Mesh config/resolver/server/native SafeTensors path
+  through the Mesh config/adapter/Skippy serving/native SafeTensors path
   through tokenizer, sampled prefill, and decode with every supported load-time
   quantization. Its compiler-cache evidence is observational: a restored seed
   is marked warm with a zero hit-rate floor, and a no-request result warns
@@ -373,10 +1110,13 @@ runtime producers are not duplicated.
 - `ci-{linux,macos,windows}-host-slice.yml` — one platform-pure neutral host
   producer consuming that lane's immutable UI distribution.
 - `ci-{linux,macos,windows}-runtime-slice.yml` — platform-pure native runtime
-  producers selected by backend rows. The Linux CPU row additionally runs the
-  native runtime-event gate
-  (`scripts/ci-runtime-events-native-gate.sh`) against the runtime it just
-  built and the `family-qwen3-dense` fixture from `skippy-ci-smoke.json`,
+  producers selected by backend rows. The `native-abi` domain routes through
+  `linux-cpu`, `windows-cpu`, and `windows-vulkan`; the Windows Vulkan row
+  feeds the Windows product/smoke consumers, while Windows CPU also selects
+  the `windows-skippy-probes` platform check below. The Linux CPU row
+  additionally runs the native runtime-event gate
+  (`scripts/ci-runtime-events-native-gate.sh`) against its verified runtime
+  and the `family-qwen3-dense` fixture from `skippy-ci-smoke.json`,
   authorized for pull-request, main, and manual cadences, and uploads its
   evidence file. It resolves that evidence file to an absolute path before
   Cargo starts, so the crate-local test writer and the lane check read the same
@@ -384,45 +1124,125 @@ runtime producers are not duplicated.
   so PRs using the protected main workflow consume the same fix. The separate
   family-certification cadence remains unchanged. That gate is
   env-gated so an ordinary `cargo test` never touches a native symbol, which
-  is why it needs a lane of its own; this is the only lane that already has a
-  freshly built native runtime. CPU only — the reporter is
+  is why it needs a lane of its own; this lane owns the native runtime. CPU
+  only — the reporter is
   backend-independent, so another backend would buy a duplicate of the same
   evidence.
 - `ci-{linux,macos,windows}-product-slice.yml` — composition-only consumers
   that join only their matching immutable host and runtime artifacts.
-- `ci-platform-checks-slice.yml` — macOS portable/unit, Windows portable, and
-  focused Windows log-store privacy ACL checks.
-- `ci-linux-product-smoke-slice.yml` and
-  `ci-macos-product-smoke-slice.yml` — platform-local callers of the typed
-  product-integration suite and the model-download consumer. The suite stages
-  its registry-derived pair exactly once: dense SmolLM2-135M Q8 and recurrent
-  IBM Granite 4.0 H 350M Q4. Its ordered phases cover dense standalone,
-  OpenAI/SDK, constrained-Tokio restart, and a dense seed/worker/passive-client
-  topology followed by a separately evidenced strict Granite `KvRecurrent`
-  phase. Each split phase persists strict-whitelist seed and worker status
+- `ci-platform-checks-slice.yml` — macOS portable/unit, Windows portable/unit,
+  focused Windows log-store privacy ACL checks, and the Windows CPU native
+  Skippy probes (`windows-skippy-probes`, #2222 item 2). That row is selected
+  by the `native-abi` platform domain and on every main run. The macOS and
+  Windows unit rows filter their resolved package lists against the checked-out
+  workspace's `cargo metadata` members before the test loops consume them, so a
+  crate removed from the workspace is skipped with a `::warning::` instead of
+  aborting with a missing-package failure; that filter cannot distinguish an
+  intentional removal from an accidental one. The `native-abi`
+  domain selects `static-abi`, `runtime-product`, `product-smoke`,
+  `rust-tests`, and `platform-checks`; its `domain_rows` are `linux-cpu`,
+  `windows-cpu`, and `windows-vulkan` for changes to the patch queue and llama
+  build scripts, its `smoke_domain_rows` selects `core`, and its
+  `platform_domain_rows` selects `windows-skippy-probes`. It replays the
+  pinned patch queue, builds the static CPU ABI
+  with `LLAMA_STAGE_BUILD_TESTS=ON`, and lets `build-llama.sh` run every
+  `^skippy_` test; nothing is skipped. The same row then runs the
+  `skippy-runtime` and `skippy-serving` lib tests linked against that static
+  ABI (#2137), so Windows covers both crates without a runtime bundle. It runs them with the image's 64-bit
+  CMake (`C:\Program Files\CMake`) rather than the 32-bit ctest that
+  `msvc-dev-cmd` puts first on `PATH`, which dies on the graph-contract
+  probes' output. The row's `ctest_parallel` is sized by memory, not cores:
+  Windows charges every allocated byte against the commit limit, touched or
+  not. Measured on Windows 11 with MSVC 14.44, each of the 96 graph contracts
+  in its own ctest call: median 3.1 GiB committed (0.8 GiB touched), 12 above
+  6 GiB, and at most 13.0 GiB (`glm53_synthetic`; `qwen4exp` 11.4,
+  `minimax-m3` 10.2). The row starts serial (`ctest_parallel: 1`), so its
+  ceiling is that 13 GiB contract; the whole suite (271 tests) took about 45
+  minutes serially on 16 threads, within the row's 150-minute timeout. At 2
+  the two largest can run together: two runs took about 25 minutes and added
+  17 and 24 GiB to the system commit at their peaks, so raising it needs
+  evidence that the selected runner leaves about 25 GiB of commit free. A
+  step before the probes logs the runner's physical memory, commit limit,
+  committed memory and headroom (also in the job summary), and warns when
+  the headroom is under 13 GiB, so the first runs show what the runner offers
+  and a memory failure can be read against it rather than retried. Each
+  probe is also bounded at 15 minutes (`--timeout 900`, like the other ctest
+  calls in `build-llama.sh`). The same native build includes the small
+  `skippy_selected_logits` numerical contract for causal decision scores and
+  invalid-output rejection. The slowest contracts are single-threaded:
+  pinned to one logical CPU, `glm53_synthetic` took 187 s, `qwen4exp` 145 s
+  and `minimax-m3` 133 s, the same as with all 16, so the bound depends on
+  the runner's per-core speed rather than its core count.
+- `ci-linux-product-smoke-slice.yml`, `ci-macos-product-smoke-slice.yml`, and
+  `ci-windows-product-smoke-slice.yml` — platform-local callers of the core,
+  scripted, model-download, and Laya smokes. The registry-pinned Laya
+  Multilingual F16 GGUF runs startup plus every upstream golden `/systemone`
+  read on Linux CPU/CUDA, conditional `gpu-nvidia` Vulkan and `gpu-amd` ROCm,
+  macOS Metal, and
+  Windows CPU. Each row consumes its composed backend product and selects the
+  exact native device name, so an unavailable backend fails at model load.
+  The Vulkan Laya row requires `MESH_VULKAN_INFERENCE_RUNNER_ENABLED` to be
+  exactly `true` (lowercase) after `verify-vulkan-device` passes in a live
+  runner pod; the ROCm row requires the same exact
+  `MESH_ROCM_INFERENCE_RUNNER_ENABLED` gate before it uses the
+  repository-scoped `gpu-amd` role. A GitHub Actions expression cannot compare
+  strings case-sensitively, so the slice validates both raw values in a shell
+  step and both rows depend on the normalized result instead of comparing the
+  variable directly. The Vulkan row enables the explicit Vulkan profile when
+  its runner lacks `vulkaninfo`; model startup and golden reads still exercise
+  the device. The source-checked Laya action repeats the gate from that same
+  normalized input so an older protected workflow cannot run the smoke on an
+  uncertified PR runner before the workflow gate reaches main. Because a
+  gated row that stays skipped only shows as a skipped job, the gate job also
+  writes each planned Vulkan or ROCm row to its step summary from the same
+  normalized result, either as scheduled on its qualified runner or as skipped
+  with the variable that is not `true`, so packaging success is never read as
+  inference coverage.
+  Windows product restore passes LF-terminated manifest fields to Git Bash so
+  its runtime path does not retain Python's Windows carriage return. The Laya
+  parity driver is Rust `automation laya parity`, with UTF-8 fixture decoding
+  and source-order-preserving request objects. `automation laya product`
+  owns startup, a bounded golden-read worker, and process-tree cleanup through
+  the shared retained-session supervisor. On failure it includes bounded tails
+  of native logs before deleting private state, preserving allocation errors
+  that do not reach stdout or stderr without collecting unrelated log files.
+  The canary shell uses the same parity
+  owner through the automation adapter. The replaced Laya Python drivers and
+  their tests are deleted; hardware qualification remains a CI operation.
+  Windows CUDA/ROCm/Vulkan remain build-only because CI has no matching Windows
+  accelerator runners. The core smoke restores the
+  registry-derived dense SmolLM2-135M Q8 and recurrent IBM Granite 4.0 H 350M
+  Q4 pair once, then runs both through standalone inference, OpenAI client
+  compatibility, and constrained-Tokio restart. The two-node split smoke uses
+  the same pair for dense KV and strict Granite `KvRecurrent` coverage. It
+  persists strict-whitelist seed and worker status
   snapshots containing only node, mesh, and peer identity, plus runtime-stage
   and OpenAI model-list snapshots. The network-free reconciler fails closed
   unless both distinct observers report the same mesh, non-empty
   topology/run/model/package/manifest identity, the same exact two-stage
   contiguous cut on distinct nodes and bind addresses, two matching `ready`
   statuses, and the same sole served model. It atomically records
-  `split-evidence.json`. Readiness uses a capped five-minute wall-clock deadline
+  `split-evidence.json`. The split smoke pins Auto payload expectations to the model manifest,
+  checks loaded state and exporter capability on both current run stages, and
+  persists a per-stage selection result; a wrong second stage fails even when
+  the first stage selects correctly. `xtask split-payloads` owns the model-SHA
+  lookup and stage certification; the scripted workflow passes its immutable
+  `source_sha` into the result and rejects a missing revision. The Linux CPU
+  row also enables the durable-L3 restart probe: it preserves each node's cache
+  root and identity across a full process restart, requires a post-restart L3
+  fill with cached tokens and exact output,
+  exercises `kv-cache status` and `clear`, and writes digest-bound evidence.
+  Readiness uses a capped five-minute wall-clock deadline
   and parallel endpoint captures bounded to two seconds by default; timeout or
   process-exit diagnostics retain the final snapshots, failed reconciliation,
   and both server log tails. The status projection never persists invite
   tokens, nested fields, or unrelated path fields.
-  The product suite independently replays reconciliation from the persisted
-  snapshots, records each split evidence path and SHA-256 in
-  `phase-results.json`, and rejects missing, modified, or self-inconsistent
-  evidence. All JSON snapshots and reconciled evidence upload with the phase
-  logs on success or failure. The existing Qwen3.5 recurrent job remains
-  required until Granite passes that live contract. The typed runner supports
-  CPU, CUDA, Metal, Vulkan, and ROCm,
-  but only CPU is selected during the first qualification stage; the existing
-  CUDA inference and Metal model-load signals remain required until their typed
-  product rows pass live qualification in that order. CUDA and Metal request
-  their explicit accelerator device and reject unsupported typed selections.
-  CUDA inference uses the
+  The scripted workflow uploads the snapshots, reconciled evidence, and logs on
+  success or failure. There is no separate product-integration lane or Qwen3.5
+  migration gate: the existing CPU, CUDA, and Metal core rows own the paired
+  model contract, while the CPU two-node row owns dense and recurrent cache
+  semantics. CUDA and Metal request their explicit accelerator devices. CUDA
+  inference uses the
   approved `gpu-nvidia` ephemeral self-hosted scale set, including for
   same-repository PRs. That hardware-qualified exception executes only through
   protected default-branch reusable workflows, receives no repository secrets or
@@ -439,13 +1259,10 @@ runtime producers are not duplicated.
   inference, it records CUDA visibility variables, host driver-library
   resolution and NVIDIA device nodes, then runs the packaged benchmark's
   device-count probe without benchmark allocations, using inherited and
-  strict packaged-library resolution. Vulkan uses
-  the same approved `gpu-nvidia` host
-  with the explicit `Vulkan0` device. ROCm uses `ROCm0` and its reusable job is
-  skipped unless `MESH_ROCM_INFERENCE_RUNNER_ENABLED` is exactly `true`; the
-  corresponding repository-scoped `gpu-amd` runner could not be verified from
-  the current GitHub token. Accelerator product-integration rows remain absent
-  from the checked plan until their live qualification is accepted.
+  strict packaged-library resolution. The composed-product restore also
+  requires the manifest backend to match the smoke row, and all product smokes
+  force native-runtime discovery through the runtime bundled beside the host
+  rather than a published manifest.
 - `ci-linux-sdk-slice.yml` and `ci-macos-sdk-slice.yml` — platform-local
   Rust, Kotlin and Swift consumers. Each smoke downloads the matching
   platform lane's immutable UI artifact before packaging SDK resources;
@@ -458,13 +1275,25 @@ runtime producers are not duplicated.
 Lower-level producers (`native-sdk-artifact.yml`, `swift-sdk-artifact.yml`) and
 consumers (`smoke.yml`, `scripted-binary-smoke.yml`, `sdk-smoke.yml`,
 `hf-download-smoke.yml`) remain reusable building blocks.
-The full Swift producer fans the seven Apple Rust targets into separately
+`.github/actions/run-laya-product-smoke` centralizes composed-product restore,
+immutable fixture verification, and the cross-platform Laya harness behind
+bounded backend/device/cadence inputs.
+The full Swift producer fans the four arm64 Apple Rust targets into separately
 cached jobs, bounded by the lane's macOS `max-parallel` budget, then assembles
 their immutable static libraries into one verified XCFramework. Host-only PR
-production remains a single job.
+production remains a single Apple Silicon job.
 The Swift SDK smoke consumes the lane's immutable UI distribution with
 `--skip-build`; it does not install Node or pnpm and owns no package-manager
 cache.
+
+SDK packaging and Swift metadata adapters invoke xtask through the prepared
+`MESH_LLM_AUTOMATION_BIN` or `cargo xtool`. Native SDK manifest/identity/library
+checks and console resource manifests belong to `prepared-input`; SwiftPM
+checksum/update/verification, privacy plist and XCFramework checks belong to
+`release`. Archive extraction and sidecar verification belong to `artifact`.
+The Python XCFramework verifier and its duplicate Python tests are deleted.
+This caller cutover does not qualify native SDK, Xcode, Gradle or SDK-fixture
+lifecycle execution, and does not remove another lane's interpreter setup.
 
 ## Fan-out and timing controls
 
@@ -483,7 +1312,7 @@ artifact build per active platform workflow because artifacts are run-scoped;
 UI tests still execute only in the Website graph and host producers never
 rebuild the UI themselves.
 
-Timing evidence is collected read-only with `scripts/collect-ci-metrics.py`.
+Timing evidence is collected read-only with `cargo xtool ci-ops collect-metrics`.
 Schema-v3 reports keep workflow wall/queue, runner queue, dependency wait,
 execution, runner-minutes, cancelled runner-minutes and peak workers separate,
 and group results by provider, OS, architecture, semantic runner role and
@@ -534,6 +1363,15 @@ terminal results that release their runner capacity.
 
 ## Artifact contract
 
+L3 build/cache and prepared-input callers use xtask. Just bootstraps the tool
+before entering cache locks, so Cargo is not left running as the pruning
+command's parent. Static ABI producer/test jobs prepare the automation binary;
+model restore uses typed resolution and preserves its exact cache identities.
+The five cache/stamp/model/sccache Python implementations are deleted. Generic
+Python contract discovery remains assigned to L12. Windows host/runtime and
+cache-warmer interpreter setup is removed after the concurrent L5 runtime
+package verifier cutover closed those transitive callers.
+
 Every product has three immutable layers:
 
 1. prepared UI assets;
@@ -542,6 +1380,7 @@ Every product has three immutable layers:
 
 `compose-product-input` verifies checksums, manifests and host import policy,
 then composes exact producer bytes without compiling or substituting inputs.
+Nothing builds those plugins in this repository.
 Smoke and SDK consumers download those artifacts and never rebuild a missing
 producer. PR and smoke artifacts retain for one day; caches are acceleration,
 not correctness contracts.
@@ -551,13 +1390,13 @@ Linux CPU composition readiness runs the composed host's `runtime list
 (`ci-prepare-native-runtime.sh`) with fallback building disabled. This protects
 that CLI/consumer boundary without selecting full SDK suites for every runtime
 change or requiring accelerator drivers on composition workers.
-`test_ci_sdk_json_consumer.py` checks the original #1675 changed paths select
+`migration_lifecycle::sdk_json_consumer` checks the original #1675 changed paths select
 this product and its producers, and that invalid CLI JSON blocks publication.
 The protected workflow checks out candidate source before invoking the existing
 composition action; no catalog or workflow-definition change is needed.
 
 Non-Windows native runtime artifacts include the checksum-bound
-`skippy-model-package` tool under `tools/`. Split-serving smoke consumers use
+`skippy-package-builder` tool under `tools/`. Split-serving smoke consumers use
 that producer-owned tool to convert registry-pinned GGUF fixtures into verified
 package-v2 directories before starting either node; the smoke job never
 compiles a missing converter. Windows runtime producers omit this tool because
@@ -569,11 +1408,34 @@ Runtime and product artifact IDs preserve every compatibility discriminator:
 `ci-product-<platform>-<architecture>-<backend>`. Consumers download the exact
 platform, architecture, and backend identity selected by the plan.
 
+For configured Windows ROCm targets, the typed manifest writer admits only
+architectures with staged rocBLAS code objects when `rocblas.dll` is declared.
+Those objects join `runtime.files` with SHA-256 checksums, not the loadable DLL
+list. A missing kernel directory or empty target intersection fails packaging.
+The existing shell copy step and producer/composer topology are unchanged;
+supported-GPU inference and unsupported-GPU fallback still require hardware
+qualification.
+
 Release-profile hosts are used for both selected PR rows and main rows. Besides
 keeping product semantics identical, this prevents unstripped debug binaries
 from being duplicated into every composed product artifact.
 
 ## Provider and cache policy
+
+After successful runtime package verification, Windows release CPU/GPU jobs
+publish and verify an exact-key ABI cache miss under the current ref. These
+two jobs grant only `actions: read` for the publication probe; cache writes use
+the scoped runtime cache token. Failed/cancelled packaging never saves a
+partial ABI build. Publication verification is idempotent: an exact key/ref,
+non-empty entry counts even when a concurrent writer (the main cache warmer)
+published the immutable key first, and the lookup-only restore still fails
+closed unless the current cache version resolves. A lookup-only version probe before the retry prevents an API-visible older version from suppressing the single recovery save. Hosted placement, architecture matrices, and PR cache policy
+are unchanged. Windows release jobs enable GitHub-backed compiler caching during
+native runtime preparation. Hosted CUDA 13 evidence and exact ABI-cache reuse
+are recorded in PR #2662; cache compatibility remains tied to the runner image.
+
+Windows platform checks apply the shared sccache policy immediately after
+installation, using the selected runner's native and Depot cache permissions.
 
 The checked-in Cargo configuration is the repository-wide Rust accelerator
 owner: `sccache` is mandatory, Linux final links prefer the probed mold driver
@@ -597,7 +1459,8 @@ release row no longer disables sccache.
 Fork pull requests use GitHub-hosted runners. Eligible same-repository PRs may
 use Depot while the repository-wide gate and time-bounded cache-risk exception
 in `ci/DEPOT_PR_RISK_EXCEPTION.md` are active. The
-other current exception is uncredentialed CUDA or Vulkan smoke on the approved
+other current exception is uncredentialed CUDA smoke, plus Vulkan smoke when
+`MESH_VULKAN_INFERENCE_RUNNER_ENABLED` is exactly `true`, on the approved
 ephemeral `gpu-nvidia` scale set described above. A future ROCm row uses the
 repository-scoped `gpu-amd` role only when
 `MESH_ROCM_INFERENCE_RUNNER_ENABLED` is exactly `true`. PRs use the same protected reusable
@@ -616,7 +1479,8 @@ architecture and policy make eligible for Depot; the numerator is the subset
 that actually receives a `depot-*` label. Control-plane planning,
 runner/selector diagnostics and lane summaries are outside the denominator;
 credential-bearing smokes, `gpu-nvidia` hardware, and unsupported or Intel
-macOS rows without a Depot-equivalent remain documented provider exceptions
+macOS rows without a Depot-equivalent, plus the hosted Linux CPU runtime cache
+producer, remain documented provider exceptions
 and are reported separately. Therefore “100% Depot” means 100% of eligible
 ordinary executor rows, not that every check or job is hosted by Depot.
 
@@ -629,6 +1493,30 @@ Depot build-tool remote cache remains disabled. This is a conscious iteration-
 speed tradeoff and the shared cache is treated as attacker-controlled input,
 not a correctness or authority boundary. Hosted release and cache-warmer
 workflows retain their existing GitHub cache behavior.
+
+The Linux CPU runtime producer uses the central selector's forced-hosted
+placement on PR and main, while accelerator runtime rows retain ordinary
+provider selection. It restores an exact packaged-runtime cache on those
+GitHub-hosted jobs. Its key includes the target, pinned toolchain/image
+epoch, Skippy tree and native build/package inputs; Mesh-only source changes
+do not invalidate it. A hit must pass the runtime manifest, archive checksum,
+library/dependency, backend and target checks before the runtime-event gate
+and run-scoped artifact upload. A miss builds through the same native runtime
+action. Only a successful trusted-main push on a GitHub-hosted runner saves
+the package; PRs are restore-only and Depot jobs neither restore nor publish
+this cache. The release producers remain independent of this CI cache.
+
+Skippy and MeshLLM are separate products in the shared source tree. Each
+platform host slice first builds one backend-neutral standalone Skippy CLI and
+uploads `ci-skippy-cli-<platform>-<architecture>` with a checksum and
+`host-imports.json` after verifying host imports, then builds the MeshLLM host.
+Native-runtime slices build or restore one Skippy llama.cpp
+runtime per selected backend; product composition and downstream tests consume
+the platform host/runtime graph, not per-test rebuilds. Release host jobs use
+the same Skippy CLI producer and publish separate versioned CLI archives while
+MeshLLM continues to package its own host, console and selected runtime. The
+standalone CLI archiver checks the report against the executable SHA-256 and
+includes it in the archive.
 
 The admin-verified organization switches have a narrower meaning than that
 consumer policy: disabling automatic Depot Cache and Registry Actions
@@ -723,12 +1611,20 @@ The implemented policy uses that isolation selectively:
 | Linux sccache compiler objects | Exact trusted 2 GiB seed plus job-local writes on GitHub-hosted jobs | Main Quality completion owns publication; PRs mutate only their ephemeral copy |
 | Linux Cargo `target` directories | Disabled for Clippy, Rust tests, host, and runtime | Avoids sharded multi-GiB generations and their restore/upload latency |
 | Skippy correctness model | Restore-only for PRs; one exhaustive trusted-main Rust-test batch publishes an exact file-SHA/cache-version key | Every consuming batch verifies the pinned Qwen file SHA-256; denied-cache runners download the immutable revision without publishing |
-| Static Linux ABI and Swift native ABI | Exact PR-scoped cache on miss | Same-PR reruns reuse the verified native input when its full recipe/toolchain key is unchanged |
-| macOS Metal unit ABI and Windows native ABI | Exact PR-scoped cache on miss | Same-PR reruns avoid the native rebuild; no restore prefixes cross an ABI boundary |
+| Static Linux ABI and Swift native ABI | Exact PR-scoped cache on miss | Same-PR reruns reuse the verified native input when its full recipe/toolchain key is unchanged; the Linux static ABI key includes the prepared patched llama.cpp SHA, which the restore step checks against the archive stamp |
+| macOS Metal unit ABI and Windows native ABI | Exact PR-scoped cache on miss | Same-PR reruns avoid the native rebuild; macOS keys include the prepared patched llama SHA and validate hits before use; no restore prefixes cross an ABI boundary |
 | Console pnpm store | None -- `ui_quality`, `ui_e2e`, and `ui_artifact` all point `store-dir` at the runner image's baked pnpm store instead of an Actions cache | Every run installs warm from the image; no cache to publish, restore, or race |
-| Website npm store | None -- the `website` job runs in the prebuilt `public web` image (baked npm/node) with no bare-metal row, so its `setup-node` cache was deleted outright rather than kept | Every run does a fresh `npm ci`; no cache to invalidate or race |
+| Website npm store | None -- the `mesh/website` job runs in the prebuilt `public web` image (baked npm/node) with no bare-metal row, so its `setup-node` cache was deleted outright rather than kept | Every run does a fresh `npm ci`; no cache to invalidate or race |
 | SDK Rust Cargo registry/target | `Swatinem/rust-cache` restores the exact `mesh-llm-sdk-rust-cargo-v1` identity (OS/arch, target, pinned image and toolchain epochs, debug/LLD recipe, Cargo/manifest/script inputs, and cache-version) and only saves on `main` | PRs restore the trusted main seed without publishing; a miss still rebuilds the SDK test graph |
 | GitHub artifacts | Never used as cross-run caches | Immutable producers/consumers remain correct within one run; reruns recreate run-scoped artifacts |
+
+On a restore-key (partial) hit, `Swatinem/rust-cache` cleans the restored
+target profile and deletes top-level binaries such as `target/debug/xtask`.
+A job that combines `prepare-automation` with rust-cache must therefore run
+every rust-cache restore before every automation preparation; the
+`artifact_automation_is_prepared_after_rust_cache_restore` contract enforces
+this for all occurrences (release run 40804094970 lost
+`MESH_LLM_AUTOMATION_BIN` in `Swift target` through the reverse order).
 
 Outside the bounded exception, a Depot-selected run emits
 `allow_native_github_cache=false` and `allow_depot_remote_cache=false`. Every
@@ -760,12 +1656,16 @@ explicitly skip seed restoration after three verified CPU warm samples observed
 zero reuse in run `34272984200/1`.
 The warmer's `just ci-sccache-seed-build` recipe covers the dominant
 `mesh-llm` Clippy graph, the release-profile backend-neutral `mesh-llm` host
-graph, and the isolated `mesh-llm-cli` test graph used by the Rust-test matrix;
-its `Justfile` and `just/**` inputs are part of the exact seed key.
-`ci/runner-images.json` and `scripts/runner-image-identity.py check` make the
+graph, the isolated `mesh-llm-cli` test graph used by the Rust-test matrix,
+and the isolated default-feature `xtask` Clippy graph with all targets. The
+workflow-level debug-information overrides apply to every seed profile and its
+consumers. Root and workspace package Cargo manifests and the
+warmer workflow, along with `Justfile` and `just/**`, are part of the exact
+seed key.
+`ci/runner-images.json` and `cargo xtool ci-ops runner-identity check` make the
 current image, native epoch, compiler-seed and SDK Rust identities auditable
-without changing execution. The existing Python test discovery verifies the
-catalog against workflow bindings and real planner rows. Historical tool
+without changing execution. The native `migration_ci_operations` contracts
+verify the catalog against workflow bindings and real planner rows. Historical tool
 receipts and source provenance remain unknown until qualified image receipts
 exist. Other consumer workload coverage remains unknown. The measured CPU
 runtime workload had zero seed hits in all three warm samples; the separate
@@ -840,6 +1740,20 @@ complete
 [manage-ci validation contract](../.agents/skills/manage-ci/SKILL.md#validation-contract)
 for scope-specific checks, and run the canonical `just test-all` target when
 full repository validation is required.
+The local gate runs the complete `xtask` test package separately with
+`--test-threads=1` because its fixtures own process-global signal handlers.
+Other packages retain their normal harness configuration, including child
+process output fixtures; do not serialize them with a global
+`RUST_TEST_THREADS=1` override.
+The portable gate runs the website build after SDK checks have finished, keeping
+their Cargo invocations serial while UI JavaScript checks run in parallel.
+Its plugin-author gate rebuilds the OpenAI exchange observer package and runs
+the installed lifecycle conformance tests with controlled inference backends.
+`just test-openai-exchange-conformance` runs that gate independently.
+The exemplar lives under
+`mesh/crates/mesh-llm-plugin/examples/openai-exchange-observer.rs` and remains
+a Cargo example of the plugin SDK. The package archive is written to the
+workspace-root `dist/openai-exchange-observer.tar.gz`.
 
 ### Offline runner identity qualification
 
@@ -848,17 +1762,19 @@ Runner-images PR #23 merged as `f73c2a9`. Trusted producer admission must run
 maintainer adopts its exact-byte cohort hash, origin and admission-validator
 revision. Offline structural validation alone cannot perform that admission.
 
-The consumer's `runner-image-identity.py bind` accepts a separate reviewed anchor
+The consumer's `ci-ops runner-identity bind` accepts a separate reviewed anchor
 and emits a fresh proposal directory containing `ci/runner-images.json` plus
 content-addressed `ci/runner-image-evidence/<sha256>.json` files. It does not
 modify the input catalog, workflows, image pins, compiler seed or cache policy.
-Qualified public UI and browser entries retain reviewed admission evidence; historical full-web and native entries remain null.
+The dedicated standalone API CPU entry and previously qualified image entries
+retain reviewed admission evidence. Each image keeps its own exact source and
+cohort binding; adding one consumer does not roll out other image pins.
 
 ```sh
-python3 scripts/runner-image-identity.py --root /trusted/mesh-llm bind \
+cargo xtool ci-ops runner-identity --root /trusted/mesh-llm bind \
   --image-id public-cpu --cohort /admitted/staged-cohort.json \
   --anchor /reviewed/anchor.json --output /new/proposal
-python3 scripts/runner-image-identity.py --root /new/proposal validate
+cargo xtool ci-ops runner-identity --root /new/proposal validate
 ```
 
 The anchor has exactly `receipt` and `provenance` objects. Receipt fields are
@@ -910,6 +1826,10 @@ Protected default-branch PR slices alone can still execute old image definitions
 their success is not candidate-image qualification. Release-tag selection must also
 retain its full-web image and release-only preparation guard.
 
+### Manual authority marker native tooling
+
+Manual-main `seed` and `verify-pr-write` modes share one GitHub-hosted same-commit automation producer using the existing `upload-automation` protected-clean/hosted-bare profile. Their Depot marker jobs retain empty permissions and no checkout. Pinned same-run artifact download and source/artifact/binary checks run before the existing native `authority-audit endpoint` commands and all marker cache phases. Same-run download with empty marker-job permissions still requires hosted qualification; local supplied-artifact fixtures do not prove GitHub delivery, provider cache isolation, or authenticated source authority. The immutable protected PR audit callers and runtime-seed qualification remain separate boundaries.
+
 ### CPU runtime seed canary
 
 `depot-canary.yml` adds an isolated default-branch-only manual `runtime-seed` mode.
@@ -949,6 +1869,17 @@ preserve the basis beyond remote artifact expiry.
 
 ## Console-print product scope
 
+The L11 optional-tooling cutover uses typed xtask replay matrix export and
+bounded family execution, canonical model/dataset pin projection, downloaded
+SHA-256 checks and hosted repair publication admission. The measured replay
+uses Rust whole-session execution and the separately built native `trajectory-reader` with its `parquet-input` feature.
+The caller supplies the verified local GGUF path; Rust progress events stay on
+stderr and request JSONL remains separate. Rust history consumes the retained
+artifact with complete-only regression and repair admission. Workload oracle evidence write/verify
+and HF converted-artifact preflight now use their existing Rust owners.
+Replay history is owned by the Rust replay-matrix command; card and other optional generic tooling remain transitional;
+no live replay, HF job or publication qualification is implied.
+
 `just no-console-print` forbids the print macros and direct `io::stdout()` /
 `io::stderr()` handles in product sources. There is no allowlist: every
 exemption is a category rule, so no individual call site can be approved. Its
@@ -962,7 +1893,7 @@ The handle rule exempts only the files that implement the console output
 facility, listed as `CONSOLE_OUTPUT_OWNERS` in the same module: the sink-aware
 writer and its pre-sink CLI fallback, the inline progress renderers, the TUI
 output manager / fd capture / terminal backend, the runtime tracing writer,
-skippy-server's stderr telemetry sink, and the CLI presentation surfaces.
+skippy-serving's stderr telemetry sink, and the CLI presentation surfaces.
 A capability probe such as `io::stdout().is_terminal()` reads nothing and is
 not a handle.
 
@@ -980,3 +1911,502 @@ The gate resolves bundle, model and evidence paths against the caller's working
 directory before invoking Cargo. Cargo starts the integration test in its crate
 directory; absolute paths keep its evidence writer and the wrapper's execution
 check on the same file.
+
+
+Full-session replay contract: [configuration and qualification](agentic-replay-nightly/README.md).
+
+## macOS deployment target
+
+Persistent canary preflight, build, family and retry jobs check provisioned tools
+before automation compilation or SDK dependency preparation. Their
+resolver-selected `preinstalled-macos` or `preinstalled-linux` bootstrap profile
+skips installers,
+disables Rustup automatic toolchain installation, and fails early with the name
+of a missing prerequisite. Tool provisioning is external to certification.
+The hosted profiles keep their existing installation behavior. Locked SDK
+dependency environments and offline NAS model admission retain their owners.
+
+The shared macOS accelerator action eagerly starts sccache in every cache mode
+on a unique short Unix socket before any compiler probe and exports it to
+subsequent steps. It exports and persists `SCCACHE_IDLE_TIMEOUT=0` before startup
+to retain the job-owned daemon across quiet test phases. Parallel compiler
+clients never initialize the new endpoint or restart it after idle expiration;
+the caller's remote-cache configuration remains unchanged.
+It never stops the default host server, so concurrent runner accounts cannot
+disrupt each other's compiler cache. Canary toolchain verification sets cache
+identity and leaves server startup to this action.
+The action initializes the disk directory before any
+compiler probe, including protected canary bootstrap calls that already set
+`SCCACHE_GHA_ENABLED=false`. It preserves an explicit `SCCACHE_DIR` and otherwise
+creates a job-local directory beneath `RUNNER_TEMP`. This does not grant remote
+cache authority or change the canary's later persistent compiler-cache identity.
+
+`scripts/lib/macos-deployment-target.txt` records the shared default (13.3),
+matching the pinned llama.cpp
+[Apple release](https://github.com/ggml-org/llama.cpp/blob/661643e43079a4ee6faab4c1895291767b67ea8d/.github/workflows/release.yml#L73)
+and [XCFramework](https://github.com/ggml-org/llama.cpp/blob/661643e43079a4ee6faab4c1895291767b67ea8d/build-xcframework.sh#L8)
+baseline. Just exports it unless the caller sets `MACOSX_DEPLOYMENT_TARGET`.
+Direct host/native builds and the canary harness load the same default; both
+canary jobs export it for every subsequent Cargo/CMake step and include it in
+compiler-cache identity. Native CMake receives the resolved target explicitly,
+so its build stamp changes and old target objects are rebuilt. This changes
+future builds, not running jobs or shared model caches.
+
+Explicit SDK/platform overrides remain supported. The full Swift SDK passes
+its selected macOS target to both Cargo and CMake while retaining its separate
+iOS targets. Setting a deployment target is not proof of oldest-OS runtime
+compatibility; validate on the minimum OS before making that claim.
+
+
+### Mesh and Skippy physical-layout catalog prerequisite
+
+The catalog registers future `mesh/crates/` and `skippy/crates/` paths alongside
+existing paths, including product scripts, docs, website, SDK, deployment and
+native sources. Future Mesh adapter, membership, control API and composition
+crates select `runtime-product`. Unknown product subtrees still fail closed.
+
+This additive prerequisite changes no source layout, slice, workflow, runner,
+permission or protected catalog comparison. Land it on the protected default
+branch before the dependent relocation; the latter must use identical catalogs.
+Path consumers and Cargo discovery still require updates with the physical move.
+
+Renamed frontend, serving, model and GPU benchmark crates retain their direct
+semantic aliases. The current `skippy-package-builder` name is reused by model
+acquisition after extraction: retain its existing split-serving rule on main,
+with model-download ownership on the relocated path. That conservatively runs
+both domains until the later catalog cleanup; existing main routing is unchanged.
+
+The frontend's current Cargo package and direct CI owner are
+`skippy-inference-api`. The package translator still recognizes the historical
+`openai-frontend` predecessor for protected pre-extraction plans.
+
+### Protected executor compatibility for the product extraction
+
+The protected executor workflows pin `resolve-source-layout` to commit
+`38d63b2f6e27998034fdf0452150c7cc081fe921` and `resolve-cargo-packages` to
+`5c8fb4d472bc57058c8153761c561daa77dd5b94` (which passes planned packages
+absent from the candidate through to the checked-out-workspace filter, so a PR
+that deletes a crate is not rejected), so older PR source checkouts do not need
+the new helper files. The package resolver loads its Python implementation
+from that same pinned action checkout and inspects the candidate only through
+Cargo metadata in the existing executor trust context.
+
+`resolve-source-layout` resolves the checked-out console, website and SDK
+source directories from the two supported layouts. Missing or ambiguous
+components fail before producer/consumer work. UI build, artifact upload,
+platform host restore, SDK restore and release checksum verification use the
+same resolved directory; native ABI cache recipes include both native source
+locations. Workspace CI script entrypoints remain at `scripts/`.
+
+The protected planner still uses its own Cargo metadata and byte-identical
+catalogs. `scripts/ci-cargo-packages.py` runs only in candidate executors and
+translates a pre-extraction batch to its fixed successor owners when the
+protected executor declares `--generation legacy` and the candidate contains
+the extracted package builder. Explicit generation disambiguates the reused
+package name even in a one-package plan. Matrix executors must switch to
+`--generation current` in the same commit that migrates the protected workspace
+package names; the fixed platform owner requests remain legacy selectors. It checks
+successors against candidate Cargo workspace metadata, rejects unknown/missing
+owners and preserves new-plan batches unchanged. The frozen old/new workspace
+censuses verify all 75 extracted members have exactly one predecessor batch,
+including the reused `skippy-model-package` name. This adds no matrix workers,
+runner authority, permissions, catalog exception or skipped checks. Remove the
+migration map only after protected main and all in-flight sources use the new
+package names.
+
+The SafeTensors smoke selects its exact ignored test from the host or extracted
+adapter, asserts its presence, compiles once and retains the complete immutable
+checkpoint/quantization sweep. Platform unit rows use the same source-owner
+translation. Candidate workflow tests and local checks validate compatibility;
+protected PR runs alone cannot certify a workflow definition that has not yet
+landed on main.
+
+Node addon release producers also resolve `sdk` or `mesh/sdk` before version
+checks, native builds, npm pack and immutable artifact staging on Linux, macOS
+and Windows. Executable fixtures cover all three producers in both layouts.
+The release publisher verifies the four supported addon archives and their
+checksum sidecars before publishing assets or dispatching downstream npm
+assembly. Intel macOS is excluded from the Node SDK release matrix.
+
+Legacy change-detection entrypoints and Windows cache triggers recognize both
+product layouts. Nightly and explicit-revision canary pin readers accept exactly
+one legacy or relocated pin, rejecting missing and ambiguous source trees.
+
+Release version propagation discovers both relocated crate trees, including
+versioned local dependencies. The compiler seed warmer uses the resolved UI
+placeholder directory. Neither change expands runner or cache authority.
+
+### Focused upgrade repair checks
+
+`just llama-upgrade <upstream-sha> metal <cache-root>` enters the CI repair/build owner locally without publication credentials (see `ci/llama-canary/REPAIR.md`). `just llama-upgrade-check fast metal` and the trusted canary call the same typed
+`automation canary-receipts repair-check` command. The environment phase restores
+the controller-owned native-test lock before coding. Fast checks compile static
+binaries, verify their native ABI symbols and compiled source/binary hashes, and exercise
+GPU Flash Attention split/chain and recurrent state execution. The full phase
+then checks generated equality/idempotence, runs the complete native suite and
+canonical Skippy, workload-oracle, System One and Laya gates. Focused results do
+not replace the complete candidate and independent family passes. Step logs stay
+on disk; live output contains progress and bounded failure excerpts. One isolated
+Metal fixture SIGBUS gets a diagnostic fixture retry and an unfiltered native
+rerun, without starting an agent for the transient failure.
+
+Every coding turn saves an explicitly unverified source checkpoint; the native
+outer supervisor also attempts recovery after termination and cancellation.
+When the native base commit is unavailable, recovery captures the complete
+tracked tree against an empty tree. Candidate processes cannot inherit GitHub
+workflow-control paths, and local repair uses a private home without Git credentials.
+Recovery uploads precede verbose logs and omit the restored Python environment.
+The original failure remains authoritative if diagnostic recovery fails.
+
+### Canary memory admission and Python SDK
+
+Persistent canary jobs require `self-hosted`, `ARM64`, `jy-managed` and
+`family-certify`. Preflight, family and infrastructure-retry jobs request only
+the controller's memory-tier label. The two native producers additionally
+request their OS, then a managed control job binds their binaries to one candidate
+package. JY selects eligible machines by memory and storage attributes; the
+workflow names no machine type or node.
+
+Roll out [the JY runner policies and Fleet provisioning](https://github.com/general-inference/monorepo/pull/244)
+before merging this placement change. The runner groups restrict access to
+`llama-upstream-canary.yml@refs/heads/main` and
+`llama-canary-family-pass.yml@refs/heads/main` in this repository. Verify MDM
+readiness, the runner account's Goose provider authentication and readable
+offline model cache, then register both profiles. No matching managed runner
+means queued jobs; there is no legacy-pool fallback. Repository validation does
+not establish live MDM convergence or hardware certification.
+
+The controller projects each immutable source plan onto `family-certify` plus
+`accelerator-memory-128plus` (115.2 GiB) or `accelerator-memory-256plus`
+(230.4 GiB), reserving 10% of physical RAM. The source plan and its digest are
+unchanged, including historical `mesh_ref` certification. Missing artifact sizes
+and peaks beyond the larger tier fail planning. No family is silently skipped.
+An optional source-owned `minimum_runner_memory_gib` value of 128 or 256 may
+promote an estimate-selected row but cannot demote it; plans without the field
+remain estimate-only. GLM-4.5-Air, Qwen4exp, Llama4 and MiniMax-M2 currently require the
+256-plus tier through this policy.
+
+The Rust canary source-plan placement owner uses the greater of pinned file sizes and
+the model estimate, including projector/draft artifacts. Causal parity releases
+the monolithic oracle before partitioned execution and releases state source
+before restore: one aggregate weight copy plus a 25% tensor/KV/state/scratch
+allowance and 2 GiB per each of three processes. Non-chat candidate/oracle
+execution budgets two complete weight copies plus 25% and 2 GiB per process.
+These are explicit admission estimates for the current short-context harness,
+not measured peak guarantees; changes to concurrency/context require review.
+
+Native `automation canary-receipts certify` workers recompute placement from the
+digest-verified plan, wait for one
+pre-provisioned cross-account physical-host lock in the root-owned
+`/Library/Application Support/MeshLLM/locks` directory, check actual physical capacity and
+available memory, and poll availability once per second while running the battery.
+Expected contention between runner services on one machine is serialized rather
+than reported as a family failure; the evidence records whether and how long the
+worker waited. Available memory is macOS free + inactive + speculative pages;
+purgeable pages are not counted twice. A reserve violation or monitoring failure
+stops only this family's process group and fails certification.
+`memory-admission.json` retains the estimate, host observations, admission
+status, and continuous guard status even when the battery exits nonzero.
+Sampling cannot guarantee that instantaneous allocations never cross
+the reserve. Unrelated workloads must leave enough headroom at admission;
+labels alone are insufficient.
+
+Runner provisioning owns the lock path: create
+`/Library/Application Support/MeshLLM/locks` as root with mode `0755`, and
+pre-create `mesh-canary-family-host.lock` as root with mode `0666`. Jobs verify
+both owner and permissions and never create the path themselves.
+
+The shared `setup-canary-python` action restores the fixed external Python SDK
+checkout through `prepare-python-sdk-source` and admits its commit, tracked
+roster and file hashes through native `smoke-observation sdk-source`. Its
+embedding profile restores the external `ci/canary-python/uv.lock` into a
+controller-owned virtual environment and exports `SKIPPY_WORKLOAD_SDK_PYTHON`.
+The producer build uses it for the early embedding battery, and historical
+source workers consume that exact SDK interpreter. This is managed
+project dependency restoration, not an installation into system Python or the
+read-only model cache. The runner still requires preinstalled `uv`.
+
+The canary build and generated-patch checks share the locked external native-test
+project in the trusted controller's `ci/llama-canary/jinja`, frozen before any
+selected-source switch so historical revisions need no new manifest. Its environment lives under the run-owned
+state directory and uses the prepared SDK interpreter when available, otherwise
+the installed `python3`. Interpreter downloads are disabled. Both upstream
+Jinja and FP8 conversion tests remain selected by the complete native suite.
+The locked environment requires Python 3.12 or newer and includes NumPy,
+PyTorch, Safetensors and Transformers. The optional developer
+llama-benchy wrapper defaults to a full upstream source commit; explicit caller
+overrides remain available. Neither dependency adds repository Python code.
+
+The native Python-tooling census runs through `just ci-crate-lists` in normal
+Quality validation. `ci/python-tooling-policy.json` records exact retained
+external dependency inputs, source pins and invocation exceptions. It rejects
+repository Python source and shebangs, undeclared package inputs and direct
+interpreter invocations in maintained automation. Historical receipts remain
+data. Mutation tests cover added hidden files, suffixless scripts and inline
+process execution; static checks do not replace review of semantic emulation.
+
+### Self-hosted job disk cleanup
+
+The persistent build and family jobs run `cargo xtool ci-ops runner-cleanup`
+after artifact upload attempts, on success, failure and cancellation. It removes
+known job-local Cargo debug outputs, prepared llama sources, native/workload
+builds, downloaded handoffs and the worker SDK environment. Evidence and the
+producer export are removed only when their respective uploads succeeded;
+failed uploads retain the local copy for recovery. The helper validates bounded
+run/pass/shard identities and refuses symlinked parent paths. Shared model,
+compiler and package-download caches, source checkouts and other jobs' run-scoped
+outputs are preserved. Force termination or runner loss can prevent cleanup;
+this is not a host-wide garbage collector.
+
+The same helper also owns bounded profiles for agentic replay, GPU smoke,
+CUDA release and the amd64/arm64 runner-contract matrix. Replay creates its
+build worktrees under the job's runner temporary directory and explicitly removes
+only their Git registrations before deleting the root; unrelated registrations
+are preserved. CUDA release explicitly saves its native
+Actions cache before deleting build outputs; failed runtime uploads retain
+`dist/native-runtimes`. Smoke removes its downloaded product and staged binary,
+retaining shared model caches and diagnostic logs. Runner-contract removes its
+Cargo target output. Hosted fallback rows retain their normal disposable-runner
+lifecycle. The workflow contract test requires final cleanup for every declared
+self-hosted job, including custom `mesh-llm-*` runner matrix labels.
+
+
+Each canary candidate's initial native build compiles without
+executing tests; the generated-patch checker verifies equality and idempotence,
+rebuilds the full native target set, and runs one unfiltered CTest pass. Its
+generator-tool unit suite remains separate. Standalone native builds retain
+their existing test execution by default.
+
+The native Skippy suite includes sparse synthetic graph-contract tests for every
+canary registry family. `tools/xtask/src/repo_consistency/synthetic_graph_contracts.rs` makes
+missing fixtures and registry dimension/MTP drift fail CI validation. The matrix
+checks admitted stage chains and explicit unsupported contracts without model
+weights; it does not confer real-model certification. See
+`ci/llama-canary/SYNTHETIC_GRAPH_CONTRACTS.md` for structural coverage and limits.
+
+Snapshot promotion is owned by the native `model-package` component. Required
+`ci-automation-contracts` runs `ci-snapshot-promotion-contracts` before its terminal
+xtask harness. This selects package library tests and the actual promoter CLI
+tests, including immutable source reads, parent-bound atomic publication and
+embedded prepare failure propagation. The embedded layer-package job builds the
+promoter through `just snapshot-promoter-release-build`; existing optional HF
+SDK operations remain transitional. Local fixtures do not certify live HF jobs
+or publication.
+
+Runtime-event wrapper and current model-resolution action contracts are owned by
+the required native migration_lifecycle::runtime_events_gate tests and typed
+workflow guards. The Python contract module is retired together with its core
+roster entry after native caller and original-intent qualification. Finite
+fixtures do not establish live native reporter or model execution.
+
+Native `cargo xtool automation stability nightly` and `tool-call` commands own
+OpenAI chat/streaming and forced-tool probes, bounded optional agent processes,
+release-attestation inspection, and evidence summaries. The required
+`migration_stability` target executes these commands against finite local HTTP,
+TLS, and process fixtures, including invocation from outside the checkout. HTTP
+uses the existing Hyper client. HTTPS uses an existing curl 8.4 or newer with
+certificate verification and platform trust; an explicit `CURL_CA_BUNDLE` may
+select a trust bundle. The [curl download limit](https://curl.se/docs/manpage.html#--max-filesize)
+covers unknown-length responses starting in 8.4. Rust owns response parsing,
+SSE completion, joined worker ownership, process cancellation, and private-file
+cleanup. TLS fixture dependencies are test-only and do not enter the automation
+bootstrap dependency closure. Plan mode performs no HTTP, TLS capability probe,
+or evidence writes. The nightly workflow prepares the native automation tool and calls its nightly
+and KV tool-loop commands. The optional OpenCode adapter uses the native agent
+configuration, fixture and recording-proxy owners. The native KV owner retains growing tool histories, concurrent cohorts,
+measured prefix reuse, bounded native-log checkpoints and fresh transcript runs.
+Its Python helper and 18 original test methods are retired after caller
+qualification; the required native target retains their behavioral coverage.
+Local fixtures do not certify live model, KV cache, or hosted endpoint behavior.
+
+The two general stability Python harnesses, their 22 test methods, the two KV
+workflow contract methods, and six product-crate Python bindings are retired
+together after original and native caller qualification. The required
+`migration_stability` target and native workflow guards retain this coverage.
+The current core gate selects native Rust contract targets and no Python unittest
+modules. Retained SDK clients and optional reader/research environments keep their
+separate ownership. Protected pinned Python actions still require published caller
+cutover.
+
+The normal automation contract gate bootstraps a native-library-free xtask,
+then builds the separate `trajectory-reader` utility with `parquet-input`.
+It runs compressed-Parquet library cases and frontend/reader command tests
+against the bootstrap-reported executable. These additions qualify local
+automation behavior; model-backed workloads and platform/hosted evidence retain
+their existing gates.
+
+
+The Rust `cargo xtool ci-ops pr-authority-audit` command validates the existing
+PR provider/cache flags, original event, forbidden credential variables,
+Actions endpoints, and Docker configuration sources. Successful admission is
+silent, and diagnostics name fields and reasons without retaining their values.
+Its local fixtures do not establish provider isolation. The published protected
+`audit-depot-pr-isolation` action remains transitional and still parses Docker
+JSON with Python. Because it runs before checkout, caller cutover requires a
+protected executable artifact and verified source/digest delivery before
+execution; a command compiled from PR source cannot replace that admission.
+
+The `audit-pr-authority-verified` composite is prepared for a future protected
+pre-checkout caller cutover. It downloads only the declared same-run artifact ID,
+requires protected producer source SHA and independent binary digest, checks
+producer runner OS/architecture against the consumer, and verifies inert bytes
+before invoking `ci-ops pr-authority-audit`. It has no artifact-name fallback,
+compiler, Python interpreter, or caller-provided executable path. Its local
+fixtures exercise admission, substitution failures, and the actual Rust policy
+command. The existing 27 pinned `audit-depot-pr-isolation` callers remain
+transitional until each has a native protected producer dependency and the
+replacement action is published at a reviewed protected commit. Local fixtures
+do not establish hosted artifact transport or provider isolation.
+
+The prepared `protected-automation-artifact.yml` reusable producer accepts
+closed native platform and topic inputs plus one immutable protected source SHA.
+Its fixed GitHub-hosted executor map admits only Linux X64/ARM64, macOS ARM64,
+and Windows X64. After checking out the protected default branch, it verifies
+the requested commit is an ancestor before selecting and compiling that source.
+Topic-scoped immutable artifacts retain for one day; unscoped release artifacts
+retain their existing name and 90-day policy. The upload action initializes the
+macOS automation environment for protected-clean producers. Native artifact IDs,
+source SHA, executable digest, and OS/architecture are independent outputs.
+Caller metadata and native producer dependencies are prepared across the five
+lanes, the optional Linux CI canary, release SDK builds, and nested SDK forwarding.
+Seven root workflows freeze one protected source commit per run, then provision
+11 topic/native producer instances across those workflows. All 28 reusable calls
+into the 17 audit workflows forward dependency-provided identities; lane summaries
+require the selected producer jobs to succeed. These metadata inputs are not yet
+consumed by the 27 existing audit steps, which retain their published immutable
+pin. Switching those steps requires a reviewed published replacement action.
+No hosted execution or cross-platform native qualification is recorded here.
+
+The existing Windows unit platform row additionally prepares the repository automation tool and selects twenty exact native xtask binary methods: three build/path, seven installer-helper, eight whole-installer-consumer and two private-state handle-lock tests. Each method requires independent `--exact` listing and one passing nonignored result, followed by a verified count of twenty. It prebuilds the inert migration_generator_fixture PE through Just. A separate native Windows wrapper regression checks success, native nonzero propagation and missing-sccache refusal. This does not add a runner or planner row, select Unix-only composition fixtures on Windows, or replace live product/hardware acceptance. Portable/static fixtures remain in the normal Quality Rust roster.
+
+Windows row selection is conditional. This owning workflow edit maps through ci-control to all platform rows, and main/manual-full profiles select all rows. Standalone future changes under tools/xtask, just, Justfile or install.ps1 are not guaranteed to select Windows unit under the protected ownership catalog. The gate qualifies only a planner-selected Windows unit row; an unselected row records no native evidence. This proposal changes no protected catalog and adds no routing bypass.
+
+## Same-run product-source automation
+
+Product-source jobs no longer compile `xtask` once per job. The Linux, macOS and
+Windows lanes and the optional Linux CI canary each declare one
+`product_automation_<platform>` producer: `product-automation-artifact.yml`
+checks out the lane's exact `source_sha` (the canary's merge SHA) on a fixed
+GitHub-hosted runner with a read-only token, no secrets and no checkout
+credentials, and publishes it through `upload-automation` with the
+`product-clean` source profile. The artifact is named
+`automation-product-<os>-<arch>-<source_sha>-<lane>` with one-day retention, so
+it cannot collide with the protected `automation-<os>-<arch>-<sha>-<lane>`
+authority artifact, and `product-clean` claims no protected authority. Its
+`identity_json` output (source SHA, artifact ID, executable digest, producer
+OS/architecture) is the only value consumers receive.
+
+The static ABI producer, Rust test batches, host, native-runtime and product
+composition jobs of each lane list the producer in `needs`, take its identity as
+the `product_automation` input and run `restore-automation`, which verifies
+source, artifact ID, digest and that the producer ran on the same OS and
+architecture. They never rebuild xtask and have no `prepare-automation`
+fallback. The one exception is `static-abi-artifact.yml`, whose
+`product_automation` input is optional because the release SDK build calls it
+without a lane producer; it prepares automation only when the input is empty. `package-native-runtime.sh`,
+`prepare-host-input`, `prepare-skippy-cli-input` and `prepare-windows-host-input`
+run the restored executable when `MESH_LLM_AUTOMATION_BIN` is set and otherwise
+keep `cargo xtool`. The lane planner (`ci validate-lane`) lists the producers as
+required exactly when a restoring job is planned, so a selected consumer cannot
+run without its producer and an unplanned producer must be skipped.
+
+The twelve entry planner jobs (`plan` in the five `pr_*` and five `main_*`
+workflows, `ci-control`, and `ci-pr-canary-lane`), the five lane `summary` jobs,
+and Quality `commit_convention` do not wait on a producer and use
+`prepare-ci-controller` instead. It builds only the `ci-controller` executable
+on GitHub-hosted Linux, runs `ci-controller automation bootstrap`, and exports
+`MESH_CI_CONTROLLER_BIN`. `compute-changes` calls `repository affected-crates
+--stdin` and `plan-ci` calls `ci plan` through that variable, and each prepares
+the controller only when it is unset, so a planner job builds it once. Lane
+summaries run `ci validate-lane`; the Quality summary also runs `repository
+llama-upstream-pin` on PRs. Its exact-key cache entry
+(`ci-controller-hosted-<os>-<arch>-<toolchain>-<hash>` over `Cargo.lock`,
+`Cargo.toml`, `.cargo/config.toml`, the action file,
+`.github/cache-version.txt`, `tools/ci-controller/**`, and the Linux linker
+drivers) is separate from the xtask entry. A miss runs `cargo build --locked
+--release -p ci-controller --bin ci-controller` without Just or sccache and
+saves the result.
+
+Other jobs that must not wait on a producer keep `prepare-automation`: the
+release UI stamp and the
+Windows unit platform-check jobs, Linux SDK and product smoke consumers (they restore through
+`restore-smoke-inputs`, which already prefers an exported
+`MESH_LLM_AUTOMATION_BIN`), release, canary, nightly, Docker and warm-cache
+workflows. The `hosted-bare` profile now restores a release executable from an
+exact-key `actions/cache` entry (`xtask-hosted-bare-<os>-<arch>-<hash>` over
+`Cargo.lock`, `Cargo.toml`, `.cargo/config.toml`, the action file,
+`.github/cache-version.txt`, `tools/xtask/**`, `tools/ci-controller/**`,
+`tools/process-supervision/**`, `tools/trajectory-reader/**`,
+`mesh/crates/mesh-llm-release-footer/**`, the compiled-in JSON/script inputs and
+the Linux linker drivers), compiles only on a miss and saves on a miss. It hashes
+`tools/ci-controller/**` and `tools/process-supervision/**` because xtask
+compiles both libraries. The image
+profile never restores or saves an executable. The protected authority producers
+pass `reuse-hosted-binary: false`, so their bytes are always compiled in the
+run from the frozen protected source. A first run after any hashed input changes
+is a cold miss. Pull requests execute main's reusable workflows, so none of this
+applies to a PR until it is merged. No hosted execution is recorded here.
+
+## External Python SDK source preparation
+
+The checkout action, admission descriptor and Python-tooling policy use SDK
+commit `85226c50a68a13b48f40fe25e70eb85814e67457`; update all three together.
+Laya product readiness and Decisions smoke discovery query
+`/mesh/v1/models?workload_class=decision&available=true`, since compatibility
+model lists contain only LLMs. The golden and response checks remain required.
+
+The current checkpoint includes typed Mesh model discovery, OCR uploads,
+membership/live-session controls, full node configuration and native-runtime
+management. Its generated bindings were produced from the coordinated Mesh
+implementation recorded in the SDK's `sdk-inputs.json`; keep that source
+checkpoint synchronized with native API changes.
+
+The Python SDK package, generated Python bindings and four genuine compatibility
+and embedding clients are owned by `Mesh-LLM/mesh-llm-python-sdk`. Mesh admits the
+fixed commit and manifest in `ci/required-sdk-python/sdk-source.json`; source
+admission rejects changed bytes, unexpected tracked or nonignored files, and
+path substitution. Dependency preparation restores the original locked profiles
+from that admitted source. Runtime calls remain offline and never compile a
+missing native bridge or install missing SDK dependencies.
+
+`prepare-python-sdk-source` restores the fixed source before the Quality contract
+job and Rust/Kotlin/Swift SDK source consumers. `setup-canary-python` reuses it
+before compatibility or embedding dependency preparation. The bare macOS Swift SDK
+smoke restores the lane's `product_automation_macos_arm64` executable through
+`restore-automation` before admission and never compiles xtask. Required SDK cadence
+is unchanged. For local `just ci-automation-contracts` or `just ci-validate`, set
+`MESH_PYTHON_SDK_SOURCE` to the exact admitted checkout first; the local recipe
+inherits that input and does not acquire external source. The source-dependent
+`migration_repository` and `migration_lifecycle` fixtures use that same input.
+The [SDK checkpoint](required-sdk-python/sdk-source.json) is published; fresh anonymous restore and native source admission passed.
+Hosted restore remains unqualified. A passing source contract or mock FFI test does not qualify the native
+bridge, model serving or real client requests.
+
+The retired Skippy benchmark harness no longer selects external research-source
+preparation in Rust test batches. Explicit research source admission remains
+available for the separate optional research tools.
+Its historical domain mappings remain in `ci/ownership.yml` to preserve exact
+equality with the protected planner catalog. Workspace membership and current
+crate selection remove the harness independently; catalog cleanup requires the
+separate protected-catalog rollout described above.
+
+The unused local `audit-depot-pr-isolation` implementation is removed. All 27
+protected callers still use their immutable published `ed07043` action, and the
+five published package resolvers retain their separate rollout boundary. Neither
+SDK extraction nor native trajectory input changes those authority checks.
+
+Standalone OpenAI, cache-reuse, and System One serving smokes launch `skippy serve`
+with `--model-path` and public resource settings. They do not synthesize stage
+configuration or prescribe attention/recurrent cache representations. Loaded
+native graphs and memory exporters own cache admission. Split correctness still
+uses genuine planner output and binary stage servers. Cache-hit assertions run
+on immediate repeated requests without publication sleeps or retries.
+
+## Rolling preview distribution
+
+`rolling-preview.yml` is a main-only manual dispatcher (schedule commented out) of `release.yml` with `preview=true`, the full GPU matrix and
+hosted runners. Unique run/attempt preview versions leave main unchanged. Release
+producers check out the metadata source SHA; publication stages a draft before
+exposing the complete immutable prerelease, never marking it latest. Stable
+package channels are untouched; retention is currently indefinite and unchanged
+source is not skipped. No runner settings or secrets are added.

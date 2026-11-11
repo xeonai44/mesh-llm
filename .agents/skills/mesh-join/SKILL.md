@@ -10,18 +10,20 @@ metadata:
 Use this when wiring two or more mesh-llm nodes together, or attaching a
 client-only node to an existing mesh. Per-platform install/serve steps live in
 `deploy-macos` and `deploy-linux-gpu`; this skill covers the mesh topology
-itself. Full reference: `docs/MESHES.md`.
+itself. Full reference: `mesh/docs/MESHES.md`.
 
 ## Mental model
 
 - A node can **serve** models (`serve`), be an **API-only client** (`client`),
   or both at once.
-- Starting `serve` with no `--join`/`--discover`/`--auto` **creates a private
-  mesh** and emits an invite token.
+- Starting `serve` without join sources or discovery **creates an unpublished
+  mesh** and emits a join token (unless `--publish` is requested).
 - `--auto` discovers published meshes (Nostr by default) and joins the best
   one — the public community mesh in practice.
-- `--publish` makes your mesh discoverable; without it the mesh is private and
-  joinable only via the invite token.
+- `--publish` makes your mesh discoverable; not publishing is not admission
+  control. The default join token supplies
+  connectivity information, not bearer authorization. Use explicit owner/trust
+  policy for controlled membership (see `docs/MESHES.md`).
 - Every node exposes the same OpenAI API on `:9337`; `/v1/models` returns the
   union of local + peer models and requests route by the `model` field.
 
@@ -36,7 +38,7 @@ mesh-llm client --auto                 # API-only client, no GPU needed
 Confirm joining via `discovery_joined` in the log (use `--log-format json` for
 machine-readable events) or `peers` in `/api/status`.
 
-## Private mesh: create + join
+## Unpublished mesh: create + join
 
 ```bash
 # Node A — creates the mesh, prints an invite token
@@ -55,8 +57,25 @@ mesh-llm client --join <token>
 ```
 
 `--join` is repeatable. Requirement-aware meshes (version/attestation policy)
-use signed bootstrap tokens; legacy/private meshes use the older unsigned
-token. Either way, the flow above is the same.
+use signed bootstrap tokens; unrestricted meshes can use the default unsigned
+endpoint token. Neither token delivery nor publication defines owner admission.
+`--join-file` and the join environment variables are alternative token sources
+for both published and unpublished meshes. Either way, the flow above is the same.
+
+## Service joins
+
+`setup --service` installs a service whose command is a bare `serve`; do not
+hand-edit the generated unit. Put the invite token in an operator-owned file
+with mode `0600`. The default is `~/.mesh-llm/invite.token`, or set
+`MESH_LLM_JOIN_FILE` in `~/.config/mesh-llm/service.env` to name another path.
+For a foreground process, the equivalent is `serve --join-file <PATH>`.
+
+The token file is re-read for every rejoin attempt, so replace its contents to
+rotate the token without editing or restarting the service. An empty or
+unreadable token file is a startup error, never a silent standalone run. Do not
+put an invite token in argv or a unit file; both are visible in process or
+service inspection. Requirement-aware meshes use expiring signed tokens, so
+their operating procedure must include rotation.
 
 ## Published / named meshes
 
@@ -65,8 +84,8 @@ token. Either way, the flow above is the same.
 mesh-llm serve --model Qwen3-8B-Q4_K_M --publish --mesh-name "lab-a"
 
 # Join by name from anywhere
-mesh-llm serve --discover "lab-a"
-mesh-llm client --discover "lab-a"
+mesh-llm serve --discover=lab-a
+mesh-llm client --discover=lab-a
 
 # Browse what's out there
 mesh-llm discover
@@ -75,8 +94,8 @@ mesh-llm discover --model qwen --min-vram 24
 mesh-llm discover --auto        # prints the best invite token (script-friendly)
 ```
 
-`--mesh-name` without `--publish` is only a local label — the mesh stays
-private.
+`--mesh-name` without `--publish` is only a local label — the name does not
+publish the mesh.
 
 ## LAN-only discovery
 
@@ -101,10 +120,10 @@ supplied matching invite token (mDNS advertisements only carry fingerprints).
 
 ```bash
 # Peers on each node (expect N-1)
-curl -s http://localhost:3131/api/status | python3 -m json.tool
+curl -s http://localhost:3131/api/status
 
 # Union of models across the mesh
-curl -s http://localhost:9337/v1/models | python3 -m json.tool
+curl -s http://localhost:9337/v1/models
 
 # Route to a specific peer's model — the response "model" field
 # confirms which node answered
@@ -120,13 +139,13 @@ curl -s http://localhost:9337/v1/chat/completions \
 
 When one node cannot fit the model, use Skippy layer splits — same mesh
 mechanics plus `--split` and a layer-package model on every serving node. See
-`docs/SKIPPY_SPLITS.md`; diagnose readiness with `mesh-llm doctor split`.
+`skippy/docs/SKIPPY_SPLITS.md`; diagnose readiness with `mesh-llm doctor split`.
 
 ## Ownership / trust (private deployments)
 
 For owner-attested meshes: `mesh-llm auth init`, then start nodes with
 `--owner-key`, `--node-label`, `--trust-policy`, `--trust-owner`. Details in
-`docs/MESHES.md` ("Private ownership and trust").
+`mesh/docs/MESHES.md` ("Ownership and admission control").
 
 ## Gotchas
 

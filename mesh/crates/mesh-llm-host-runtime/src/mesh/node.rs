@@ -1,0 +1,1735 @@
+use super::*;
+use mesh_llm_membership::adopted_membership::RequirementAwareMeshState;
+use mesh_llm_types::mesh::{DEMAND_TTL_SECS, merge_demand};
+use serde_json::json;
+use std::net::SocketAddr;
+
+mod construction;
+mod demand;
+mod membership;
+mod ownership;
+mod routing_telemetry;
+mod startup;
+
+pub(crate) use construction::{NodeStartupSpec, ScopedNodeIdentity};
+pub(crate) use membership::{
+    LocalEndpoints, MembershipEntry, MembershipNodeConfig, MeshMemberships,
+    membership_token_endpoint,
+};
+
+pub use startup::detect_local_fit_bytes;
+#[cfg(test)]
+pub(crate) use startup::hardware_snapshot_for_start;
+pub(crate) use startup::{StartupResolution, stamp_plugin_event_source, startup_transport_config};
+
+/// Upper bound on how long shutdown waits for one iroh endpoint to close.
+///
+/// `Endpoint::close` queues connection-close frames and then waits for peers to
+/// acknowledge them, which iroh documents as up to roughly 3s when connectivity
+/// is bad or a peer has already gone away; it then waits for the endpoint and
+/// connection drivers to stop. Shutdown must stay bounded, so an unresponsive
+/// peer costs this budget and nothing more.
+const ENDPOINT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Await `Endpoint::close` under [`ENDPOINT_CLOSE_TIMEOUT`].
+///
+/// Returning early on an already-closed endpoint keeps this idempotent, so a
+/// shutdown path may call it without tracking whether an earlier one did.
+///
+/// On timeout iroh has still *started* closing, which downgrades the drop-time
+/// `abort()` to a no-op, but the endpoint is not marked closed and the
+/// ungraceful-drop ERROR can still be logged. The warning is what tells those
+/// two cases apart in a log.
+async fn close_endpoint_gracefully(endpoint: &Endpoint, label: &str) {
+    if endpoint.is_closed() {
+        return;
+    }
+    if tokio::time::timeout(ENDPOINT_CLOSE_TIMEOUT, endpoint.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            endpoint = label,
+            timeout_secs = ENDPOINT_CLOSE_TIMEOUT.as_secs(),
+            "iroh endpoint did not finish closing within the shutdown budget; peers may time its connections out instead of seeing them close"
+        );
+    }
+}
+
+/// Lightweight routing table for passive nodes (clients + standby GPU).
+/// Contains just enough info to route requests to the right host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingTable {
+    pub hosts: Vec<RouteEntry>,
+    /// Stable mesh identity — shared by all nodes in the same mesh.
+    #[serde(default)]
+    pub mesh_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteEntry {
+    pub model: String,
+    pub node_id: String,
+    pub endpoint_id: EndpointId,
+    pub vram_gb: f64,
+}
+
+#[derive(Clone)]
+pub struct Node {
+    pub(crate) native_inference: Arc<super::native_inference::NativeInferenceState>,
+    pub(crate) endpoint: Endpoint,
+    pub(crate) endpoint_secret_key: SecretKey,
+    pub(crate) public_addr: Option<stun::PublicAddr>,
+    pub(crate) quic_bind: QuicBindSelection,
+    pub(crate) relay_policy: RelayPolicy,
+    pub(crate) owner_keypair: Option<crate::crypto::OwnerKeypair>,
+    pub(crate) local_mesh_requirements: crate::MeshRequirements,
+    pub(crate) state: Arc<Mutex<MembershipState>>,
+    pub(crate) gossip_verification: Arc<super::signed_records::VerificationGate>,
+    pub(crate) gossip_encoder: Arc<crate::protocol::GossipFrameEncoder>,
+    pub(crate) plugin_message_history: Arc<Mutex<super::plugin_mesh::PluginMessageHistory>>,
+    /// Relay-disabled same-identity endpoints that own recovered direct connections.
+    /// See [`super::direct_rescue`] for the ownership and shutdown rules.
+    pub(crate) direct_rescue_endpoints: super::direct_rescue::DirectRescueEndpoints,
+    pub(crate) role: Arc<Mutex<NodeRole>>,
+    pub(crate) host_role_claims: Arc<Mutex<HostRoleClaims>>,
+    pub(crate) models: Arc<Mutex<Vec<String>>>,
+    pub(crate) model_source: Arc<Mutex<Option<String>>>,
+    pub(crate) serving_models: Arc<Mutex<Vec<String>>>,
+    pub(crate) served_model_descriptors: Arc<Mutex<Vec<ServedModelDescriptor>>>,
+    pub(crate) served_model_generations: Arc<Mutex<HashMap<String, u64>>>,
+    /// The local runtime port each model's current generation (and so its
+    /// `weights_digest`) belongs to. A digest read for any other port is not
+    /// that instance's: the descriptor is node-wide and keeps only the newest.
+    pub(crate) served_model_weights_ports: Arc<Mutex<HashMap<String, (u64, u16)>>>,
+    pub(crate) model_runtime_descriptors: Arc<Mutex<Vec<ModelRuntimeDescriptor>>>,
+    pub(crate) hosted_models: Arc<Mutex<Vec<String>>>,
+    pub(crate) llama_ready: Arc<Mutex<bool>>,
+    pub(crate) available_models: Arc<Mutex<Vec<String>>>,
+    pub(crate) requested_models: Arc<Mutex<Vec<String>>>,
+    /// See `Node::startup_model_may_be`.
+    pub(crate) startup_models_resolving: Arc<Mutex<StartupResolution>>,
+    pub(crate) explicit_model_interests: Arc<Mutex<Vec<String>>>,
+    /// Mesh-wide demand map — merged from gossip + local API requests.
+    /// This is the single source of truth for "what does the mesh want?"
+    pub(crate) model_demand: Arc<std::sync::Mutex<HashMap<String, ModelDemand>>>,
+    pub(crate) requirement_mesh_state: Arc<Mutex<Option<RequirementAwareMeshState>>>,
+    /// Tests opt into membership persistence with an explicit temporary file.
+    pub(crate) adopted_membership_file: Option<std::path::PathBuf>,
+    pub(crate) identity_state_dir: Option<std::path::PathBuf>,
+    /// An attachment to a host-owned full-model backend, never a GPU participant.
+    pub(crate) full_model_only: bool,
+    pub(crate) mesh_id: Arc<Mutex<Option<String>>>,
+    pub(crate) mesh_policy_hash: Arc<Mutex<Option<String>>>,
+    pub(crate) signed_genesis_policy: Arc<Mutex<Option<crate::SignedMeshGenesisPolicy>>>,
+    pub(crate) bootstrap_token: Arc<Mutex<Option<crate::SignedBootstrapToken>>>,
+    /// Addresses we have been asked to join (from invite tokens), retained so
+    /// the LAN beacon can unicast a dial-back hint to them even before a direct
+    /// connection forms (relay-less multi-homed-initiator case).
+    pub(crate) join_targets: Arc<Mutex<Vec<EndpointAddr>>>,
+    pub(crate) first_joined_mesh_ts: Arc<Mutex<Option<u64>>>,
+    pub(crate) accepting: Arc<(tokio::sync::Notify, std::sync::atomic::AtomicBool)>,
+    /// Accelerator-resident capacity advertised to peers and split placement.
+    pub(crate) vram_bytes: u64,
+    /// Local fit budget, which may additionally include CPU offload memory.
+    pub(crate) local_runtime_capacity_bytes: u64,
+    /// Independent safe system-RAM budget for CPU-default models when global
+    /// host-RAM offload is disabled.
+    pub(crate) host_ram_capacity_bytes: u64,
+    /// What `gpu.host_ram_offload = true` would add to the local fit budget.
+    pub(crate) host_ram_offload_gain_bytes: u64,
+    pub(crate) peer_change_tx: watch::Sender<usize>,
+    pub peer_change_rx: watch::Receiver<usize>,
+    pub(crate) inflight_requests: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) inflight_change_tx: watch::Sender<u64>,
+    pub(crate) routing_metrics: crate::network::metrics::RoutingMetrics,
+    pub(crate) routing_telemetry:
+        Arc<std::sync::Mutex<Option<Arc<dyn crate::network::metrics::RoutingTelemetrySink>>>>,
+    pub(crate) cache_affinity_inventory:
+        Arc<std::sync::Mutex<mesh_llm_routing::cache_inventory::CacheInventory>>,
+    pub(crate) swarm_capture: Arc<std::sync::Mutex<Option<crate::capture::SwarmCaptureRecorder>>>,
+    pub(crate) local_request_metrics: Arc<LocalRequestMetricsSampler>,
+    /// Local-only plugin-frame telemetry: the source-mismatch counter and the
+    /// per-peer warning throttle. It shares no lock with `state`, so a
+    /// plugin-frame decision never contends with the mesh-wide state mutex.
+    pub(crate) plugin_frame_telemetry: Arc<PluginFrameTelemetry>,
+    pub(crate) runtime_data_producer: crate::runtime_data::RuntimeDataProducer,
+    pub(crate) tunnel_tx:
+        tokio::sync::mpsc::Sender<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)>,
+    pub(crate) tunnel_http_tx: tokio::sync::mpsc::Sender<(
+        EndpointId,
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+    )>,
+    pub(crate) stage_transport_tx: tokio::sync::mpsc::Sender<(
+        EndpointId,
+        iroh::endpoint::SendStream,
+        iroh::endpoint::RecvStream,
+    )>,
+    pub(crate) stage_control_tx: Arc<
+        Mutex<
+            Option<
+                tokio::sync::mpsc::UnboundedSender<crate::inference::skippy::StageControlCommand>,
+            >,
+        >,
+    >,
+    pub(crate) stage_control_lifecycle:
+        Arc<Mutex<Option<crate::inference::skippy::StageControlHandle>>>,
+    pub(crate) stage_transport_bridges: Arc<Mutex<HashMap<String, StageTransportBridge>>>,
+    pub(crate) stage_transport_aliases: Arc<Mutex<HashMap<String, String>>>,
+    pub(crate) stage_topologies: Arc<Mutex<StageTopologyState>>,
+    pub(crate) plugin_manager: Arc<Mutex<Option<crate::plugin::PluginManager>>>,
+    pub(crate) display_name: Arc<Mutex<Option<String>>>,
+    pub(crate) owner_attestation: Arc<Mutex<Option<SignedNodeOwnership>>>,
+    /// Where a renewed ownership certificate is saved for `mesh-llm auth`.
+    /// `None` for a node whose certificate is not kept on disk: a mesh
+    /// membership's, since the file is the main node's, and a test node's.
+    pub(crate) owner_attestation_path: Option<std::path::PathBuf>,
+    /// A renewed certificate whose write to `owner_attestation_path` failed,
+    /// retried on every heartbeat until a write succeeds.
+    pub(crate) unsaved_owner_attestation: Arc<Mutex<Option<SignedNodeOwnership>>>,
+    pub(crate) release_attestation: Arc<Mutex<Option<crate::ReleaseBuildAttestation>>>,
+    pub(crate) release_attestation_summary: Arc<Mutex<crate::ReleaseAttestationSummary>>,
+    pub(crate) owner_summary: Arc<Mutex<OwnershipSummary>>,
+    pub(crate) control_listener: Arc<Mutex<Option<ControlListenerLifecycle>>>,
+    pub(crate) trust_store: Arc<Mutex<TrustStore>>,
+    pub(crate) trust_policy: TrustPolicy,
+    pub enumerate_host: bool,
+    pub gpu_name: Option<String>,
+    pub hostname: Option<String>,
+    pub is_soc: Option<bool>,
+    pub gpu_vram: Option<String>,
+    pub gpu_reserved_bytes: Option<String>,
+    /// Itemized view of the advertised capacity, sent with the GPU inventory.
+    pub advertised_memory: AdvertisedMemory,
+    pub gpu_mem_bandwidth_gbps: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_compute_tflops_fp32: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub gpu_compute_tflops_fp16: Arc<tokio::sync::Mutex<Option<Vec<f64>>>>,
+    pub(crate) config_state: Arc<tokio::sync::Mutex<crate::runtime::config_state::ConfigState>>,
+    /// This node's request-defaults tracker; the same one `config_state` swaps
+    /// through, so a config apply reaches only this node's models.
+    pub(crate) live_request_defaults:
+        Arc<crate::runtime::live_request_defaults::LiveRequestDefaults>,
+    /// Peers this node's operator chose to stop routing to (local only).
+    pub(crate) peer_blocks: crate::network::peer_blocks::PeerBlocks,
+    /// The route-health table the serving surface routes with, registered by
+    /// [`crate::network::affinity::AffinityRouter::for_node`], so a plugin
+    /// vouching for a peer (an UNBLOCK) can lift that peer's cooldowns.
+    pub(crate) route_target_health:
+        Arc<std::sync::OnceLock<crate::network::target_health::TargetHealth>>,
+    /// Plugin public keys this node announces, and the verified ones its
+    /// directly-connected peers announce (`mesh::plugin_keys`).
+    pub(crate) plugin_keys: crate::mesh::plugin_keys::PluginKeys,
+    pub(crate) model_requirements: super::model_requirements::ModelRequirements,
+    pub(crate) unmatched_model_requirements:
+        Arc<tokio::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    pub(crate) config_revision_tx: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Shared activity policy guard for ingress admission checks.
+    pub(crate) activity_policy_guard: crate::runtime::activity_policy::ActivityPolicyGuard,
+    /// Whether activity admission details are being advertised onto a public mesh.
+    pub(crate) public_mesh: bool,
+    /// Default private owner-requested graceful drain timeout.
+    pub(crate) drain_timeout_secs: u64,
+    /// Upper bound for private owner-requested graceful drain timeouts.
+    pub(crate) drain_timeout_max_secs: u64,
+    pub(crate) runtime_intents: Arc<std::sync::Mutex<Vec<crate::runtime::DesiredRuntimeIntent>>>,
+    pub(crate) runtime_instance_lifecycles: Arc<
+        std::sync::Mutex<
+            HashMap<u16, Arc<tokio::sync::Mutex<crate::runtime::InstanceLifecycleRecord>>>,
+        >,
+    >,
+    pub(crate) owner_lifecycle_response_cache: OwnerLifecycleResponseCache,
+    /// Shared request leases and residency policy across host memberships.
+    pub(crate) native_model_lifecycle:
+        Arc<std::sync::OnceLock<Arc<crate::runtime::native_model_lifecycle::NativeModelLifecycle>>>,
+    /// Channel to send model lifecycle intents to the reconciler.
+    /// Set during runtime initialization; None outside the control loop.
+    pub(crate) model_intent_tx:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::runtime::ModelIntent>>>>,
+    /// Further meshes this node serves its models into (`node::membership`).
+    pub(crate) memberships: MeshMemberships,
+    /// This node's endpoint and its memberships', shared among them: none may
+    /// peer with another.
+    pub(crate) local_endpoints: LocalEndpoints,
+    /// A membership node: it keeps to the one mesh it was started for.
+    pub(crate) is_membership: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LocalRequestMetricsSnapshot {
+    pub accepted_request_counts: Vec<u64>,
+    pub latency_samples_ms: Vec<u64>,
+}
+
+#[derive(Default)]
+pub(crate) struct LocalRequestMetricsSampler {
+    pub(crate) inner: std::sync::Mutex<LocalRequestMetricsWindow>,
+}
+
+#[derive(Default)]
+pub(crate) struct LocalRequestMetricsWindow {
+    pub(crate) accepted_by_second: VecDeque<(u64, u64)>,
+    pub(crate) completed_latencies_ms: VecDeque<(u64, u64)>,
+}
+
+pub(crate) struct PeerDownReport {
+    pub(crate) conn_opt: Option<Connection>,
+    pub(crate) peer_addr: Option<EndpointAddr>,
+    pub(crate) recently_seen: bool,
+    pub(crate) reporter_cooled: bool,
+}
+
+pub(crate) fn peer_down_endpoint_id(frame: &crate::proto::node::PeerDown) -> Option<EndpointId> {
+    let peer_id_arr: [u8; 32] = match frame.peer_id.as_slice().try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            tracing::warn!("PeerDown: peer_id is not 32 bytes — rejecting");
+            return None;
+        }
+    };
+    match iroh::PublicKey::from_bytes(&peer_id_arr) {
+        Ok(key) => Some(EndpointId::from(key)),
+        Err(_) => {
+            tracing::warn!("PeerDown: peer_id is not a valid public key — rejecting");
+            None
+        }
+    }
+}
+
+impl LocalRequestMetricsSampler {
+    pub(crate) fn record_request_accepted(&self) {
+        let now_sec = now_secs();
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("pretty request metrics mutex poisoned");
+        guard.prune(now_sec);
+        if let Some((second, count)) = guard.accepted_by_second.back_mut()
+            && *second == now_sec
+        {
+            *count += 1;
+            return;
+        }
+        guard.accepted_by_second.push_back((now_sec, 1));
+    }
+
+    pub(crate) fn record_request_completed(&self, started_at: std::time::Instant) {
+        let now_sec = now_secs();
+        let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("pretty request metrics mutex poisoned");
+        guard.prune(now_sec);
+        guard
+            .completed_latencies_ms
+            .push_back((now_sec, latency_ms));
+    }
+
+    pub(crate) fn snapshot(&self) -> LocalRequestMetricsSnapshot {
+        let now_sec = now_secs();
+        let window_start = now_sec.saturating_sub(PRETTY_LOCAL_REQUEST_WINDOW_SECS - 1);
+        let mut guard = self
+            .inner
+            .lock()
+            .expect("pretty request metrics mutex poisoned");
+        guard.prune(now_sec);
+
+        let accepted_by_second = guard
+            .accepted_by_second
+            .iter()
+            .copied()
+            .collect::<HashMap<_, _>>();
+        let accepted_request_counts = (window_start..=now_sec)
+            .map(|second| accepted_by_second.get(&second).copied().unwrap_or(0))
+            .collect();
+        let latency_samples_ms = guard
+            .completed_latencies_ms
+            .iter()
+            .filter_map(|(second, latency_ms)| (*second >= window_start).then_some(*latency_ms))
+            .collect();
+
+        LocalRequestMetricsSnapshot {
+            accepted_request_counts,
+            latency_samples_ms,
+        }
+    }
+}
+
+impl LocalRequestMetricsWindow {
+    pub(crate) fn prune(&mut self, now_sec: u64) {
+        let oldest_kept_second = now_sec.saturating_sub(PRETTY_LOCAL_REQUEST_WINDOW_SECS - 1);
+        while let Some((second, _)) = self.accepted_by_second.front() {
+            if *second < oldest_kept_second {
+                self.accepted_by_second.pop_front();
+            } else {
+                break;
+            }
+        }
+        while let Some((second, _)) = self.completed_latencies_ms.front() {
+            if *second < oldest_kept_second {
+                self.completed_latencies_ms.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+impl Node {
+    pub(crate) fn set_swarm_capture_recorder(
+        &self,
+        recorder: Option<crate::capture::SwarmCaptureRecorder>,
+    ) {
+        *self
+            .swarm_capture
+            .lock()
+            .expect("swarm capture recorder lock poisoned") = recorder;
+    }
+
+    pub(crate) fn swarm_capture_recorder(&self) -> Option<crate::capture::SwarmCaptureRecorder> {
+        self.swarm_capture
+            .lock()
+            .expect("swarm capture recorder lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn swarm_capture_enabled(&self) -> bool {
+        self.swarm_capture
+            .lock()
+            .expect("swarm capture recorder lock poisoned")
+            .is_some()
+    }
+
+    pub(crate) fn capture_event(&self, event: &str, fields: impl FnOnce() -> serde_json::Value) {
+        if let Some(recorder) = self.swarm_capture_recorder() {
+            recorder.record_event(event, fields());
+        }
+    }
+
+    pub(crate) fn capture_peer_observation(
+        &self,
+        event: &str,
+        peer: &PeerInfo,
+        source: &str,
+        bridge_id: Option<EndpointId>,
+    ) {
+        self.capture_event(event, || peer_capture_fields(peer, source, bridge_id));
+    }
+
+    pub(crate) fn capture_peer_rejected(
+        &self,
+        id: EndpointId,
+        _addr: &EndpointAddr,
+        ann: &PeerAnnouncement,
+        owner_summary: &OwnershipSummary,
+        source: &str,
+        bridge_id: Option<EndpointId>,
+    ) {
+        self.capture_event("peer_rejected", || {
+            json!({
+                "peer": endpoint_id_capture_fields(id),
+                "source": source,
+                "bridge": bridge_id.map(endpoint_id_capture_fields),
+                "role": &ann.role,
+                "version": &ann.version,
+                "hostname": &ann.hostname,
+                "mesh_id": &ann.mesh_id,
+                "models": &ann.models,
+                "serving_models": &ann.serving_models,
+                "hosted_models": &ann.hosted_models,
+                "available_models": &ann.available_models,
+                "requested_models": &ann.requested_models,
+                "gpu_name": &ann.gpu_name,
+                "is_soc": ann.is_soc,
+                "vram_bytes": ann.vram_bytes,
+                "latency_ms": ann.latency_ms,
+                "latency_source": ann.latency_source.map(|value| value.as_str_name()),
+                "owner": owner_summary,
+            })
+        });
+    }
+
+    pub(crate) fn capture_gossip_inbound(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        announcement_count: usize,
+    ) {
+        self.capture_event("gossip_inbound", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "protocol": format!("{protocol:?}"),
+                "announcement_count": announcement_count,
+            })
+        });
+    }
+
+    pub(crate) fn capture_path_observation(
+        &self,
+        remote: EndpointId,
+        path_type: &str,
+        rtt_ms: Option<u32>,
+        observed_direct_remote_addr: Option<SocketAddr>,
+        source: &str,
+    ) {
+        let observed_via_relay = path_type == "relay";
+        self.capture_event("peer_path_observed", || json!({
+            "remote": endpoint_id_capture_fields(remote),
+            "path_type": path_type,
+            "rtt_ms": rtt_ms,
+            "observed_direct_remote_addr": observed_direct_remote_addr.map(|addr| addr.to_string()),
+            "observed_via_relay": observed_via_relay,
+            "direct_addr_available": observed_direct_remote_addr.is_some(),
+            "source": source,
+        }));
+    }
+
+    pub(crate) fn capture_selected_connection_path(
+        &self,
+        remote: EndpointId,
+        conn: &Connection,
+        source: &str,
+    ) -> Option<SelectedPathObservation> {
+        let observation = selected_path_observation(conn)?;
+        self.capture_path_observation(
+            remote,
+            observation.path_type,
+            observation.rtt_ms,
+            observation.observed_direct_remote_addr,
+            source,
+        );
+        Some(observation)
+    }
+
+    pub(crate) fn capture_connection_event(&self, event: ConnectionCaptureEvent<'_>) {
+        self.capture_event(event.event, || {
+            json!({
+                "remote": endpoint_id_capture_fields(event.remote),
+                "direction": event.direction,
+                "phase": event.phase,
+                "protocol": event.protocol.map(|value| format!("{value:?}")),
+                "path_type": event.path_type,
+                "rtt_ms": event.rtt_ms,
+                "admitted_peer": event.admitted_peer,
+                "reason": event.reason,
+            })
+        });
+    }
+
+    pub(crate) fn capture_direct_proof_of_life(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        announcement_count: usize,
+        recovered_from_dead: bool,
+        prior_state: &str,
+    ) {
+        self.capture_event("peer_direct_proof_of_life", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "protocol": format!("{protocol:?}"),
+                "announcement_count": announcement_count,
+                "recovered_from_dead": recovered_from_dead,
+                "prior_state": prior_state,
+            })
+        });
+    }
+
+    pub(crate) fn capture_peer_lifecycle_event(&self, event: PeerLifecycleCaptureEvent<'_>) {
+        self.capture_event(event.event, || {
+            json!({
+                "peer": endpoint_id_capture_fields(event.peer),
+                "reason": event.reason,
+                "reporter": event.reporter.map(endpoint_id_capture_fields),
+                "last_seen_age_ms": event.last_seen_age_ms,
+                "last_mentioned_age_ms": event.last_mentioned_age_ms,
+                "had_connection": event.had_connection,
+                "bridge": event.bridge_id.map(endpoint_id_capture_fields),
+            })
+        });
+    }
+
+    pub(crate) async fn capture_peer_lifecycle_snapshot(
+        &self,
+        event: &str,
+        peer: EndpointId,
+        reason: &str,
+        reporter: Option<EndpointId>,
+    ) {
+        if !self.swarm_capture_enabled() {
+            return;
+        }
+
+        let (last_seen_age_ms, last_mentioned_age_ms, had_connection, bridge_id) = {
+            let state = self.state.lock().await;
+            let peer_info = state.peers.get(&peer);
+            (
+                peer_info.map(|info| elapsed_ms_u64(info.last_seen.elapsed())),
+                peer_info.map(|info| elapsed_ms_u64(info.last_mentioned.elapsed())),
+                Some(state.connections.contains_key(&peer)),
+                peer_info
+                    .and_then(|info| info.propagated_latency.as_ref())
+                    .and_then(|latency| latency.observer_id),
+            )
+        };
+        self.capture_peer_lifecycle_event(PeerLifecycleCaptureEvent {
+            event,
+            peer,
+            reason,
+            reporter,
+            last_seen_age_ms,
+            last_mentioned_age_ms,
+            had_connection,
+            bridge_id,
+        });
+    }
+
+    pub(crate) fn capture_stream_observation(
+        &self,
+        remote: EndpointId,
+        stream_type: u8,
+        protocol: ControlProtocol,
+        admitted: bool,
+    ) {
+        self.capture_event("mesh_stream_observed", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "stream_type": stream_type,
+                "protocol": format!("{protocol:?}"),
+                "admitted": admitted,
+            })
+        });
+    }
+
+    pub(crate) fn capture_stream_rejected(
+        &self,
+        remote: EndpointId,
+        stream_type: u8,
+        protocol: ControlProtocol,
+        reason: &str,
+    ) {
+        self.capture_event("mesh_stream_rejected", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "stream_type": stream_type,
+                "protocol": format!("{protocol:?}"),
+                "reason": reason,
+            })
+        });
+    }
+
+    pub(crate) fn capture_route_request(
+        &self,
+        remote: EndpointId,
+        protocol: ControlProtocol,
+        outcome: &str,
+    ) {
+        self.capture_event("route_request", || {
+            json!({
+                "remote": endpoint_id_capture_fields(remote),
+                "protocol": format!("{protocol:?}"),
+                "outcome": outcome,
+            })
+        });
+    }
+
+    pub(crate) fn capture_http_request(&self, event: HttpCaptureEvent<'_>) {
+        self.capture_event(event.event, || {
+            json!({
+                "source_addr": event.source_addr.map(|addr| addr.to_string()),
+                "method": event.method,
+                "path": crate::capture::http_path_without_query(event.path),
+                "query_present": event.path.contains('?'),
+                "body_len_bytes": event.body_len_bytes,
+                "model": event.model_name,
+                "completion_tokens": event.completion_tokens,
+                "stream": event.stream,
+            })
+        });
+    }
+}
+impl Node {
+    pub(crate) async fn stop_stage_transport_bridge(
+        &self,
+        topology_id: &str,
+        run_id: &str,
+        stage_id: &str,
+    ) {
+        let key = stage_runtime_status_key(topology_id, run_id, stage_id);
+        if let Some(bridge) = self.stage_transport_bridges.lock().await.remove(&key) {
+            bridge.abort();
+        }
+    }
+
+    pub fn local_request_metrics_snapshot(&self) -> LocalRequestMetricsSnapshot {
+        self.local_request_metrics.snapshot()
+    }
+
+    pub(crate) fn runtime_data_collector(&self) -> crate::runtime_data::RuntimeDataCollector {
+        self.runtime_data_producer.collector()
+    }
+
+    pub async fn owner_summary(&self) -> OwnershipSummary {
+        self.owner_summary.lock().await.clone()
+    }
+
+    pub async fn release_attestation_summary(&self) -> crate::ReleaseAttestationSummary {
+        self.release_attestation_summary.lock().await.clone()
+    }
+
+    pub async fn control_endpoint(&self) -> Option<String> {
+        let guard = self.control_listener.lock().await;
+        guard.as_ref().map(|listener| listener.token.clone())
+    }
+
+    pub async fn shutdown_control_listener(&self) {
+        let lifecycle = self.control_listener.lock().await.take();
+        if let Some(lifecycle) = lifecycle {
+            lifecycle
+                .shutdown_requested
+                .store(true, std::sync::atomic::Ordering::Release);
+            lifecycle.shutdown.notify_waiters();
+            let _ = lifecycle.task.await;
+            close_endpoint_gracefully(&lifecycle.endpoint, "owner-control").await;
+        }
+        self.shutdown_stage_control().await;
+    }
+
+    async fn shutdown_stage_control(&self) {
+        *self.stage_control_tx.lock().await = None;
+        let lifecycle = self.stage_control_lifecycle.lock().await.take();
+        if let Some(lifecycle) = lifecycle
+            && let Err(error) = lifecycle.shutdown().await
+        {
+            tracing::warn!("stage control shutdown failed: {error:#}");
+        }
+    }
+
+    /// Close the main mesh QUIC endpoint as the last step of runtime shutdown.
+    ///
+    /// iroh only releases an endpoint gracefully when `Endpoint::close` is
+    /// awaited. Dropping it instead makes `EndpointInner::drop` log
+    ///
+    /// ```text
+    /// ERROR iroh::socket: Endpoint dropped without calling `Endpoint::close`. Aborting ungracefully.
+    /// ```
+    ///
+    /// and abort the socket, which also denies peers the connection-close
+    /// frames — they are left to time the connections out and report this node
+    /// as failed rather than as cleanly departed.
+    ///
+    /// Call this only after every subsystem that speaks over the mesh endpoint
+    /// (control listener, plugins, loaded models and their stage connections,
+    /// the final gossip updates) has finished. `accept_loop` observes the close
+    /// as `Endpoint::accept` returning `None` and exits on its own.
+    pub async fn close_endpoint(&self) {
+        // Closing the registry to new installs is what makes this drain
+        // complete: the relay-health monitor is an untracked task holding a
+        // `Node` clone, so without the flag it could park a fresh rescue
+        // endpoint after the drain had already passed, leaving it open and
+        // unowned for the process lifetime.
+        let rescue_endpoints = self.direct_rescue_endpoints.drain_for_shutdown().await;
+
+        // One shared budget for all rescue endpoints, not one each. These are
+        // per-peer, so a mesh with several rescued peers would otherwise add
+        // ENDPOINT_CLOSE_TIMEOUT per endpoint to shutdown before the main
+        // endpoint even starts closing.
+        if !rescue_endpoints.is_empty() {
+            let closes = rescue_endpoints
+                .iter()
+                .map(|endpoint| endpoint.close())
+                .collect::<Vec<_>>();
+            if tokio::time::timeout(
+                ENDPOINT_CLOSE_TIMEOUT,
+                futures_util::future::join_all(closes),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!(
+                    endpoint = "direct-rescue",
+                    count = rescue_endpoints.len(),
+                    timeout_secs = ENDPOINT_CLOSE_TIMEOUT.as_secs(),
+                    "direct-rescue endpoints did not finish closing within the shutdown budget; peers may time those connections out instead of seeing them close"
+                );
+            }
+        }
+
+        close_endpoint_gracefully(&self.endpoint, "mesh").await;
+    }
+
+    fn spawn_accept_loop(&self) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            node.accept_loop().await;
+        });
+    }
+
+    #[cfg(test)]
+    pub async fn new_for_tests(role: NodeRole) -> Result<Self> {
+        let (node, _) = Self::new_for_tests_with_secret(role).await?;
+        Ok(node)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn new_for_tests_with_secret(role: NodeRole) -> Result<(Self, SecretKey)> {
+        let (node, secret_key) = {
+            let secret_key = SecretKey::generate();
+            let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+                .max_concurrent_bidi_streams(1024u32.into())
+                .build();
+            let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .secret_key(secret_key.clone())
+                .alpns(vec![ALPN.to_vec(), skippy_protocol::STAGE_ALPN_V2.to_vec()])
+                .relay_mode(iroh::endpoint::RelayMode::Disabled)
+                .transport_config(transport_config)
+                .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?
+                .bind()
+                .await?;
+            (
+                Self::new_test_node_from_endpoint(role, endpoint, secret_key.clone()),
+                secret_key,
+            )
+        };
+        Ok((node, secret_key))
+    }
+
+    #[cfg(test)]
+    /// Construct a test node around an already bound endpoint and isolated state.
+    pub(crate) fn new_test_node_from_endpoint(
+        role: NodeRole,
+        endpoint: Endpoint,
+        secret_key: SecretKey,
+    ) -> Self {
+        let test_config_state = crate::runtime::config_state::ConfigState::default();
+        let test_live_request_defaults = test_config_state.live_request_defaults();
+        let (peer_change_tx, peer_change_rx) = watch::channel(0usize);
+        let (inflight_change_tx, _inflight_change_rx) = watch::channel(0u64);
+        let (tunnel_tx, _tunnel_rx) = tokio::sync::mpsc::channel(256);
+        let (tunnel_http_tx, _tunnel_http_rx) = tokio::sync::mpsc::channel(256);
+        let (stage_transport_tx, _stage_transport_rx) = tokio::sync::mpsc::channel(256);
+        let runtime_data_collector = crate::runtime_data::RuntimeDataCollector::new();
+        let runtime_data_producer =
+            runtime_data_collector.producer(crate::runtime_data::RuntimeDataSource {
+                scope: "routing",
+                plugin_data_key: None,
+                plugin_endpoint_key: None,
+            });
+
+        Node {
+            endpoint,
+            endpoint_secret_key: secret_key,
+            public_addr: None,
+            quic_bind: QuicBindSelection::default(),
+            relay_policy: RelayPolicy::Disabled,
+            owner_keypair: None,
+            local_mesh_requirements: crate::MeshRequirements::unrestricted(),
+            state: Arc::new(Mutex::new(MembershipState::default())),
+            plugin_message_history: Default::default(),
+            direct_rescue_endpoints: super::direct_rescue::DirectRescueEndpoints::default(),
+            role: Arc::new(Mutex::new(role)),
+            host_role_claims: Arc::new(Mutex::new(HostRoleClaims::default())),
+            models: Arc::new(Mutex::new(Vec::new())),
+            model_source: Arc::new(Mutex::new(None)),
+            serving_models: Arc::new(Mutex::new(Vec::new())),
+            served_model_descriptors: Arc::new(Mutex::new(Vec::new())),
+            served_model_generations: Arc::new(Mutex::new(HashMap::new())),
+            served_model_weights_ports: Arc::new(Mutex::new(HashMap::new())),
+            model_runtime_descriptors: Arc::new(Mutex::new(Vec::new())),
+            hosted_models: Arc::new(Mutex::new(Vec::new())),
+            llama_ready: Arc::new(Mutex::new(false)),
+            available_models: Arc::new(Mutex::new(Vec::new())),
+            requested_models: Arc::new(Mutex::new(Vec::new())),
+            startup_models_resolving: Arc::default(),
+            explicit_model_interests: Arc::new(Mutex::new(Vec::new())),
+            model_demand: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            requirement_mesh_state: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            adopted_membership_file: None,
+            identity_state_dir: None,
+            full_model_only: false,
+            mesh_id: Arc::new(Mutex::new(None)),
+            mesh_policy_hash: Arc::new(Mutex::new(None)),
+            signed_genesis_policy: Arc::new(Mutex::new(None)),
+            gossip_verification: Arc::default(),
+            gossip_encoder: Arc::default(),
+            bootstrap_token: Arc::new(Mutex::new(None)),
+            join_targets: Arc::new(Mutex::new(Vec::new())),
+            first_joined_mesh_ts: Arc::new(Mutex::new(None)),
+            accepting: Arc::new((
+                tokio::sync::Notify::new(),
+                std::sync::atomic::AtomicBool::new(false),
+            )),
+            vram_bytes: 0,
+            local_runtime_capacity_bytes: 0,
+            host_ram_capacity_bytes: 0,
+            host_ram_offload_gain_bytes: 0,
+            advertised_memory: AdvertisedMemory::default(),
+            peer_change_tx,
+            peer_change_rx,
+            inflight_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            inflight_change_tx,
+            routing_metrics: crate::network::metrics::RoutingMetrics::default(),
+            routing_telemetry: Arc::new(std::sync::Mutex::new(None)),
+            cache_affinity_inventory: Arc::new(std::sync::Mutex::new(
+                mesh_llm_routing::cache_inventory::CacheInventory::default(),
+            )),
+            swarm_capture: Arc::new(std::sync::Mutex::new(None)),
+            local_request_metrics: Arc::new(LocalRequestMetricsSampler::default()),
+            plugin_frame_telemetry: Arc::new(PluginFrameTelemetry::default()),
+            runtime_data_producer,
+            tunnel_tx,
+            tunnel_http_tx,
+            stage_transport_tx,
+            native_inference: Default::default(),
+            stage_control_tx: Arc::new(Mutex::new(None)),
+            stage_control_lifecycle: Arc::new(Mutex::new(None)),
+            stage_transport_bridges: Arc::new(Mutex::new(HashMap::new())),
+            stage_transport_aliases: Arc::new(Mutex::new(HashMap::new())),
+            stage_topologies: Arc::new(Mutex::new(StageTopologyState::default())),
+            plugin_manager: Arc::new(Mutex::new(None)),
+            display_name: Arc::new(Mutex::new(None)),
+            owner_attestation: Arc::new(Mutex::new(None)),
+            plugin_keys: crate::mesh::plugin_keys::PluginKeys::default(),
+            model_requirements: Default::default(),
+            unmatched_model_requirements: Default::default(),
+            release_attestation: Arc::new(Mutex::new(None)),
+            release_attestation_summary: Arc::new(Mutex::new(
+                crate::ReleaseAttestationSummary::default(),
+            )),
+            owner_summary: Arc::new(Mutex::new(OwnershipSummary::default())),
+            control_listener: Arc::new(Mutex::new(None)),
+            trust_store: Arc::new(Mutex::new(TrustStore::default())),
+            trust_policy: TrustPolicy::Off,
+            enumerate_host: false,
+            gpu_name: None,
+            hostname: None,
+            is_soc: None,
+            gpu_vram: None,
+            gpu_reserved_bytes: None,
+            gpu_mem_bandwidth_gbps: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp32: Arc::new(tokio::sync::Mutex::new(None)),
+            gpu_compute_tflops_fp16: Arc::new(tokio::sync::Mutex::new(None)),
+            config_state: Arc::new(tokio::sync::Mutex::new(test_config_state)),
+            live_request_defaults: test_live_request_defaults,
+            peer_blocks: crate::network::peer_blocks::PeerBlocks::in_memory(),
+            route_target_health: Arc::new(std::sync::OnceLock::new()),
+            config_revision_tx: {
+                let (tx, _rx) = tokio::sync::watch::channel(0);
+                Arc::new(tx)
+            },
+            activity_policy_guard: crate::runtime::activity_policy::ActivityPolicyGuard::new(
+                &mesh_llm_config::RuntimeActivityConfig::default(),
+            ),
+            public_mesh: false,
+            drain_timeout_secs: mesh_llm_config::DEFAULT_DRAIN_TIMEOUT_SECS,
+            drain_timeout_max_secs: mesh_llm_config::DEFAULT_DRAIN_TIMEOUT_MAX_SECS,
+            runtime_intents: Arc::new(std::sync::Mutex::new(Vec::new())),
+            runtime_instance_lifecycles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            owner_lifecycle_response_cache: OwnerLifecycleResponseCache::default(),
+            native_model_lifecycle: Arc::default(),
+            model_intent_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            memberships: MeshMemberships::default(),
+            owner_attestation_path: None,
+            unsaved_owner_attestation: Arc::default(),
+            local_endpoints: LocalEndpoints::default(),
+            is_membership: false,
+        }
+    }
+
+    /// Start direct owner control only for a verified owner on an ordinary node.
+    /// Full-model attachments have no mesh control authority; the separate control
+    /// endpoint never registers a duplicate identity with the relay.
+    pub(crate) async fn maybe_start_control_listener(
+        &self,
+        secret_key: SecretKey,
+        bind_addr: Option<std::net::SocketAddr>,
+        advertise_addr: Option<std::net::SocketAddr>,
+    ) -> Result<()> {
+        // An attachment has no model/control authority, even when its identity
+        // is attested by an owner trusted by this mesh. Only the shared host's
+        // separately authenticated local operator can change its lifecycle.
+        if self.full_model_only || self.local_verified_owner_id().await.is_none() {
+            return Ok(());
+        }
+
+        // The owner-control listener deliberately shares the node's secret key
+        // (and therefore its iroh endpoint id) with the main mesh endpoint: the
+        // control protocol validates the dialed `target_node_id` against the
+        // main endpoint id (`verify_control_plane_target_node`), so the control
+        // endpoint MUST present that same id.
+        //
+        // Because the id is shared, this endpoint must NOT register with the
+        // relay. An iroh relay keeps only one active connection per endpoint id:
+        // a second same-id registration evicts the first ("Another endpoint
+        // connected with the same endpoint id. No more messages will be
+        // received."). The control listener binds *after* the main mesh
+        // endpoint, so if it also joined the relay it would steal the main
+        // endpoint's relay slot and silently cut off all relay-delivered mesh
+        // traffic (gossip, joins, inference routing) — breaking relay fallback
+        // for any peer that cannot reach this node directly. Keeping the control
+        // endpoint relay-disabled leaves the main mesh endpoint as the sole
+        // relay registrant for this id. Owner-control is therefore reachable
+        // over its direct / advertised address only; relay-assisted remote
+        // owner-control is intentionally unsupported while the control and mesh
+        // endpoints share one id.
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(secret_key)
+            .alpns(vec![ALPN_CONTROL_V2.to_vec()])
+            .clear_ip_transports()
+            .bind_addr(bind_addr.unwrap_or_else(default_control_bind_addr))?
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .bind()
+            .await?;
+        let token = encode_endpoint_addr_token(&control_endpoint_addr(&endpoint, advertise_addr));
+        let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let task_endpoint = endpoint.clone();
+        let task_shutdown_requested = shutdown_requested.clone();
+        let task_shutdown = shutdown.clone();
+        let node = self.clone();
+        let task = tokio::spawn(Box::pin(async move {
+            node.control_accept_loop(task_endpoint, task_shutdown_requested, task_shutdown)
+                .await;
+        }));
+        *self.control_listener.lock().await = Some(ControlListenerLifecycle {
+            endpoint,
+            token,
+            shutdown_requested,
+            shutdown,
+            task,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn plugin_manager_local_kind(&self) -> crate::plugin::proto::mesh_event::Kind {
+        if self.accepting.1.load(std::sync::atomic::Ordering::Acquire) {
+            crate::plugin::proto::mesh_event::Kind::LocalAccepting
+        } else {
+            crate::plugin::proto::mesh_event::Kind::LocalStandby
+        }
+    }
+
+    /// Insert a peer that models a *healthy* admitted peer: it is marked as
+    /// showing signs of life so the issue #1756 routing gate admits it. Use
+    /// [`Node::insert_test_peer_without_liveness`] to model a departed or
+    /// unreachable peer instead.
+    #[cfg(test)]
+    pub async fn insert_test_peer(&self, peer: PeerInfo) {
+        let id = peer.id;
+        let mut state = self.state.lock().await;
+        state.test_peer_liveness.insert(id);
+        state.peers.insert(id, peer);
+    }
+
+    /// Insert a peer with no connection and no observed RTT — the shape of a
+    /// departed peer still carried by a stale bridge announcement. It stays
+    /// `admitted` so the test isolates the issue #1756 liveness gate rather
+    /// than the admission gate.
+    #[cfg(test)]
+    pub async fn insert_test_peer_without_liveness(&self, peer: PeerInfo) {
+        let id = peer.id;
+        let mut state = self.state.lock().await;
+        state.test_peer_liveness.remove(&id);
+        state.peers.insert(id, peer);
+    }
+
+    /// Drop a peer from the local mesh view, simulating churn.
+    #[cfg(test)]
+    pub async fn remove_test_peer(&self, id: EndpointId) {
+        let mut state = self.state.lock().await;
+        state.test_peer_liveness.remove(&id);
+        state.peers.remove(&id);
+    }
+}
+
+impl Node {
+    pub fn id(&self) -> EndpointId {
+        self.endpoint.id()
+    }
+
+    pub async fn role(&self) -> NodeRole {
+        self.role.lock().await.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn set_role(&self, role: NodeRole) {
+        *self.role.lock().await = role;
+    }
+
+    pub async fn set_release_attestation_report(
+        &self,
+        summary: crate::ReleaseAttestationSummary,
+        attestation: Option<crate::ReleaseBuildAttestation>,
+    ) {
+        *self.release_attestation.lock().await = attestation;
+        *self.release_attestation_summary.lock().await = summary;
+    }
+
+    pub async fn set_models(&self, models: Vec<String>) {
+        *self.models.lock().await = models;
+    }
+
+    pub async fn models(&self) -> Vec<String> {
+        self.models.lock().await.clone()
+    }
+
+    pub async fn set_model_source(&self, source: String) {
+        *self.model_source.lock().await = Some(source);
+        self.refresh_served_model_descriptors().await;
+    }
+
+    pub async fn set_serving_models(&self, models: Vec<String>) {
+        *self.serving_models.lock().await = models;
+        self.refresh_served_model_descriptors().await;
+    }
+
+    pub async fn set_served_model_descriptors(&self, mut descriptors: Vec<ServedModelDescriptor>) {
+        let model_names: std::collections::HashSet<_> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.identity.model_name.clone())
+            .collect();
+        let mut generations = self.served_model_generations.lock().await;
+        let mut current = self.served_model_descriptors.lock().await;
+        for descriptor in &mut descriptors {
+            if descriptor.identity.weights_digest.is_none() {
+                descriptor.identity.weights_digest = current
+                    .iter()
+                    .find(|existing| existing.identity.model_name == descriptor.identity.model_name)
+                    .and_then(|existing| existing.identity.weights_digest.clone());
+            }
+        }
+        for removed in current
+            .iter()
+            .filter(|descriptor| !model_names.contains(&descriptor.identity.model_name))
+        {
+            let generation = generations
+                .entry(removed.identity.model_name.clone())
+                .or_default();
+            *generation = generation.wrapping_add(1);
+        }
+        *current = descriptors;
+        drop(current);
+        drop(generations);
+        self.model_runtime_descriptors
+            .lock()
+            .await
+            .retain(|runtime| model_names.contains(&runtime.model_name));
+    }
+
+    pub(crate) async fn update_served_model_descriptor(
+        &self,
+        model_name: &str,
+        update: impl FnOnce(Option<ServedModelDescriptor>) -> ServedModelDescriptor,
+    ) {
+        let mut descriptors = self.served_model_descriptors.lock().await;
+        if let Some(existing) = descriptors
+            .iter_mut()
+            .find(|descriptor| descriptor.identity.model_name == model_name)
+        {
+            *existing = update(Some(existing.clone()));
+        } else {
+            descriptors.push(update(None));
+        }
+    }
+
+    pub(crate) async fn begin_served_model_generation(&self, model_name: &str) -> u64 {
+        let mut generations = self.served_model_generations.lock().await;
+        let generation = generations.entry(model_name.to_string()).or_default();
+        *generation = generation.wrapping_add(1);
+        let generation = *generation;
+
+        let mut descriptors = self.served_model_descriptors.lock().await;
+        if let Some(descriptor) = descriptors
+            .iter_mut()
+            .find(|descriptor| descriptor.identity.model_name == model_name)
+        {
+            descriptor.identity.weights_digest = None;
+        } else {
+            descriptors.push(ServedModelDescriptor {
+                identity: ServedModelIdentity {
+                    model_name: model_name.to_string(),
+                    source_kind: ModelSourceKind::LocalGguf,
+                    local_file_name: Some(format!("{model_name}.gguf")),
+                    ..Default::default()
+                },
+                requires: Vec::new(),
+                capabilities_known: false,
+                capabilities: crate::models::ModelCapabilities::default(),
+                topology: None,
+                metadata: crate::models::served_model_metadata_for_model(model_name),
+            });
+        }
+        generation
+    }
+
+    /// Record the local runtime `port` the generation `begin_served_model_generation`
+    /// returned will serve on. Ignored when a newer generation has begun.
+    pub(crate) async fn bind_served_model_generation_to_port(
+        &self,
+        model_name: &str,
+        generation: u64,
+        port: u16,
+    ) {
+        let generations = self.served_model_generations.lock().await;
+        if generations.get(model_name).copied() == Some(generation) {
+            self.served_model_weights_ports
+                .lock()
+                .await
+                .insert(model_name.to_string(), (generation, port));
+        }
+    }
+
+    /// Load a model on `port` the way the runtime does: a new generation
+    /// bound to that port, carrying `digest`.
+    #[cfg(test)]
+    pub(crate) async fn load_model_for_tests(&self, model_name: &str, port: u16, digest: &str) {
+        let generation = self.begin_served_model_generation(model_name).await;
+        self.bind_served_model_generation_to_port(model_name, generation, port)
+            .await;
+        assert!(
+            self.set_served_model_weights_digest_for_generation(
+                model_name,
+                generation,
+                Some(digest.to_owned()),
+            )
+            .await
+        );
+    }
+
+    /// Drop `identity.weights_digest` unless it was computed for the runtime
+    /// instance on `port`. The node-wide descriptor keeps only the newest
+    /// generation's digest, so a request that reached an older instance of the
+    /// same model name (its file replaced between loads) must not report the
+    /// newer file's bytes as the ones it ran.
+    pub(crate) async fn scope_weights_digest_to_port(
+        &self,
+        identity: &mut ServedModelIdentity,
+        port: u16,
+    ) {
+        if identity.weights_digest.is_none() {
+            return;
+        }
+        let name = &identity.model_name;
+        let current = self
+            .served_model_generations
+            .lock()
+            .await
+            .get(name)
+            .copied();
+        let bound = self
+            .served_model_weights_ports
+            .lock()
+            .await
+            .get(name)
+            .copied();
+        if bound.is_none() || bound != current.map(|generation| (generation, port)) {
+            identity.weights_digest = None;
+        }
+    }
+
+    pub(crate) async fn set_served_model_weights_digest_for_generation(
+        &self,
+        model_name: &str,
+        generation: u64,
+        weights_digest: Option<String>,
+    ) -> bool {
+        let generations = self.served_model_generations.lock().await;
+        if generations.get(model_name).copied() != Some(generation) {
+            return false;
+        }
+        let mut descriptors = self.served_model_descriptors.lock().await;
+        let Some(descriptor) = descriptors
+            .iter_mut()
+            .find(|descriptor| descriptor.identity.model_name == model_name)
+        else {
+            return false;
+        };
+        descriptor.identity.weights_digest = weights_digest;
+        true
+    }
+
+    pub async fn upsert_served_model_descriptor(&self, descriptor: ServedModelDescriptor) {
+        let mut descriptors = self.served_model_descriptors.lock().await;
+        if let Some(existing) = descriptors
+            .iter_mut()
+            .find(|existing| existing.identity.model_name == descriptor.identity.model_name)
+        {
+            *existing = descriptor;
+        } else {
+            descriptors.push(descriptor);
+        }
+    }
+
+    pub async fn remove_served_model_descriptor(&self, model_name: &str) {
+        let mut generations = self.served_model_generations.lock().await;
+        let generation = generations.entry(model_name.to_string()).or_default();
+        *generation = generation.wrapping_add(1);
+        self.served_model_descriptors
+            .lock()
+            .await
+            .retain(|descriptor| descriptor.identity.model_name != model_name);
+        drop(generations);
+        self.model_runtime_descriptors
+            .lock()
+            .await
+            .retain(|runtime| runtime.model_name != model_name);
+    }
+
+    pub async fn set_model_runtime_context_length(
+        &self,
+        model_name: &str,
+        context_length: Option<u32>,
+    ) {
+        let identity_hash = self
+            .served_model_descriptors
+            .lock()
+            .await
+            .iter()
+            .find(|descriptor| descriptor.identity.model_name == model_name)
+            .and_then(|descriptor| descriptor.identity.identity_hash.clone());
+        let mut runtimes = self.model_runtime_descriptors.lock().await;
+        if let Some(context_length) = context_length {
+            if let Some(runtime) = runtimes
+                .iter_mut()
+                .find(|runtime| runtime.model_name == model_name)
+            {
+                runtime.identity_hash = identity_hash.or_else(|| runtime.identity_hash.clone());
+                runtime.context_length = Some(context_length);
+                runtime.ready = true;
+            } else {
+                runtimes.push(ModelRuntimeDescriptor {
+                    model_name: model_name.to_string(),
+                    identity_hash,
+                    context_length: Some(context_length),
+                    ready: true,
+                });
+            }
+        } else {
+            runtimes.retain(|runtime| runtime.model_name != model_name);
+        }
+    }
+
+    pub async fn local_model_context_length(&self, model_name: &str) -> Option<u32> {
+        self.model_runtime_descriptors
+            .lock()
+            .await
+            .iter()
+            .find(|runtime| runtime.model_name == model_name)
+            .and_then(ModelRuntimeDescriptor::advertised_context_length)
+    }
+
+    pub async fn peer_model_context_length(
+        &self,
+        peer_id: EndpointId,
+        model_name: &str,
+    ) -> Option<u32> {
+        self.state
+            .lock()
+            .await
+            .peers
+            .get(&peer_id)
+            .and_then(|peer| advertised_context_length(peer, model_name))
+    }
+
+    pub(crate) async fn peer_model_throughput_hint(
+        &self,
+        peer_id: EndpointId,
+        model_name: &str,
+    ) -> Option<crate::network::metrics::ModelThroughputHint> {
+        // Only a hint whose measuring node says when it measured, recently
+        // enough, is evidence; an older peer's hint ranks as unmeasured.
+        let now_unix_ms = current_time_unix_ms();
+        let state = self.state.lock().await;
+        state.peers.get(&peer_id).and_then(|peer| {
+            peer.advertised_model_throughput
+                .iter()
+                .find(|hint| hint.model_name == model_name)
+                .filter(|hint| hint.is_fresh_at(now_unix_ms))
+                .cloned()
+        })
+    }
+
+    /// Locally served descriptors only -- unlike [`Self::all_served_model_descriptors`],
+    /// never includes a peer's gossiped copy, so a caller matching on
+    /// `model_name` cannot be handed a peer's descriptor for a same-named
+    /// model. `network/openai/ingress.rs`'s serving-provenance lookup relies
+    /// on that: gossip strips `weights_digest` before it crosses the wire
+    /// (see `protocol/convert.rs`), so a peer descriptor would silently read
+    /// back `None` even when this host's own load-time digest is known.
+    /// Endpoint-local workload admission also snapshots only this node's
+    /// models, never a peer's copy.
+    pub async fn served_model_descriptors(&self) -> Vec<ServedModelDescriptor> {
+        self.served_model_descriptors.lock().await.clone()
+    }
+
+    pub async fn all_served_model_descriptors(&self) -> Vec<ServedModelDescriptor> {
+        // Local descriptors carry the channel requirements plugins attached,
+        // exactly as peers see them in announcements.
+        let hosted_models = self.hosted_models.lock().await.clone();
+        let mut descriptors = self.descriptors_with_requirements(&hosted_models).await;
+        let peer_descriptors = {
+            let state = self.state.lock().await;
+            state
+                .peers
+                .values()
+                .flat_map(|peer| peer.served_model_descriptors.clone())
+                .collect::<Vec<_>>()
+        };
+        descriptors.extend(peer_descriptors);
+        descriptors
+    }
+
+    pub async fn serving_models(&self) -> Vec<String> {
+        self.serving_models.lock().await.clone()
+    }
+
+    pub async fn set_hosted_models(&self, models: Vec<String>) {
+        *self.hosted_models.lock().await = models;
+    }
+
+    pub async fn hosted_models(&self) -> Vec<String> {
+        self.hosted_models.lock().await.clone()
+    }
+
+    pub(crate) fn register_runtime_instance_lifecycle(
+        &self,
+        port: u16,
+        lifecycle: Arc<tokio::sync::Mutex<crate::runtime::InstanceLifecycleRecord>>,
+    ) {
+        self.runtime_instance_lifecycles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(port, lifecycle);
+    }
+
+    pub(crate) fn unregister_runtime_instance_lifecycle(&self, port: u16) {
+        self.runtime_instance_lifecycles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&port);
+    }
+
+    pub(crate) async fn begin_runtime_instance_request(
+        &self,
+        port: u16,
+    ) -> Result<Option<crate::runtime::InstanceRequestGuard>, crate::runtime::InstanceAdmissionError>
+    {
+        let lifecycle = self
+            .runtime_instance_lifecycles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&port)
+            .cloned();
+        let Some(lifecycle) = lifecycle else {
+            return Ok(None);
+        };
+        let residency = match self.native_model_lifecycle.get() {
+            Some(service) => service.lease_port(port).await,
+            None => None,
+        };
+        let record = lifecycle.lock().await;
+        if !record.is_accepting_work() {
+            return Err(crate::runtime::InstanceAdmissionError::NotAccepting {
+                state: record.state(),
+            });
+        }
+        Ok(Some(
+            crate::runtime::InstanceRequestGuard::new(record.in_flight_tracker())
+                .with_residency(residency),
+        ))
+    }
+
+    pub(crate) async fn refresh_served_model_descriptors(&self) {
+        let serving_models = self.serving_models.lock().await.clone();
+        let existing_by_name: HashMap<_, _> = self
+            .served_model_descriptors
+            .lock()
+            .await
+            .iter()
+            .map(|descriptor| (descriptor.identity.model_name.clone(), descriptor.clone()))
+            .collect();
+        let mut descriptors = if let Some(primary_model_name) = serving_models.first() {
+            let model_source = self.model_source.lock().await.clone();
+            let primary_model_path = crate::models::find_model_path(primary_model_name);
+            infer_served_model_descriptors(
+                primary_model_name,
+                &serving_models,
+                model_source.as_deref(),
+                Some(primary_model_path.as_path()),
+            )
+        } else {
+            Vec::new()
+        };
+        for descriptor in &mut descriptors {
+            if descriptor.metadata.is_none() {
+                descriptor.metadata =
+                    crate::models::served_model_metadata_for_model(&descriptor.identity.model_name);
+            }
+            if let Some(existing) = existing_by_name.get(&descriptor.identity.model_name) {
+                if existing.identity.source_kind == ModelSourceKind::LocalGguf
+                    || (descriptor.identity.model_name.starts_with("local-gguf/")
+                        && existing.identity.source_kind != ModelSourceKind::Unknown)
+                {
+                    descriptor.identity = existing.identity.clone();
+                }
+                descriptor.capabilities = existing.capabilities;
+                descriptor.capabilities_known = existing.capabilities_known;
+                if existing.topology.is_some() {
+                    descriptor.topology = existing.topology.clone();
+                }
+                if existing.metadata.is_some() {
+                    descriptor.metadata = existing.metadata.clone();
+                }
+            }
+        }
+        self.set_served_model_descriptors(descriptors).await;
+    }
+
+    /// Set the operator-facing display name for this node.
+    pub async fn set_display_name(&self, name: String) {
+        *self.display_name.lock().await = Some(name);
+    }
+
+    /// Removes the plugin manager, releasing any runner references to this node.
+    pub async fn take_plugin_manager(&self) -> Option<crate::plugin::PluginManager> {
+        self.plugin_manager.lock().await.take()
+    }
+
+    pub async fn set_plugin_manager(&self, plugin_manager: crate::plugin::PluginManager) {
+        let peers = {
+            let state = self.state.lock().await;
+            state.peers.values().cloned().collect::<Vec<_>>()
+        };
+        plugin_manager.expect_mesh_snapshots();
+        *self.plugin_manager.lock().await = Some(plugin_manager.clone());
+        self.broadcast_existing_mesh_snapshot(&plugin_manager, peers)
+            .await;
+    }
+
+    pub async fn plugin_manager(&self) -> Option<crate::plugin::PluginManager> {
+        self.plugin_manager.lock().await.clone()
+    }
+
+    pub fn start_plugin_channel_forwarder(
+        &self,
+        mut rx: tokio::sync::mpsc::Receiver<crate::plugin::PluginMeshEvent>,
+    ) {
+        let node = self.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let Err(err) = node.forward_plugin_event(event).await {
+                    tracing::debug!("Plugin mesh forward failed: {err}");
+                }
+            }
+        });
+    }
+
+    pub(crate) async fn emit_plugin_mesh_event(
+        &self,
+        kind: crate::plugin::proto::mesh_event::Kind,
+        peer: Option<&PeerInfo>,
+        detail_json: String,
+    ) {
+        let plugin_manager = self.plugin_manager.lock().await.clone();
+        if let Some(plugin_manager) = plugin_manager
+            && let Err(err) = plugin_manager
+                .broadcast_mesh_event(
+                    self.build_mesh_event(kind, peer.map(peer_info_to_mesh_peer), detail_json)
+                        .await,
+                )
+                .await
+        {
+            tracing::debug!(
+                "Failed to deliver plugin mesh event {:?} for {}: {err}",
+                kind,
+                peer.map(|p| p.id.fmt_short().to_string())
+                    .unwrap_or_else(|| self.endpoint.id().fmt_short().to_string())
+            );
+        }
+    }
+
+    pub(crate) async fn update_peer_rtt(&self, id: EndpointId, rtt_ms: u32) {
+        // 0ms is not a valid network RTT — it indicates a measurement artifact
+        // (e.g. local buffer time before the actual network round-trip).
+        if rtt_ms == 0 {
+            return;
+        }
+        let updated_peer = {
+            let mut state = self.state.lock().await;
+            if let Some(peer) = state.peers.get_mut(&id) {
+                let prev = peer.rtt_ms;
+                // Only accept equal-or-lower RTT for planner preference and display.
+                // Gossip round-trip timing can inflate the value when routed via
+                // relay, overwriting a better path measurement. Liveness remains
+                // responsible for detecting an unreachable peer.
+                if prev.is_some_and(|p| rtt_ms > p) {
+                    // Store display_rtt regardless (for UI refresh), but don't update best RTT.
+                    peer.display_rtt = Some(DirectLatencyObservation {
+                        rtt_ms,
+                        observed_at: std::time::Instant::now(),
+                    });
+                    return;
+                }
+                peer.rtt_ms = Some(rtt_ms);
+                peer.display_rtt = Some(DirectLatencyObservation {
+                    rtt_ms,
+                    observed_at: std::time::Instant::now(),
+                });
+                Some(peer.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(peer) = updated_peer {
+            tracing::info!("Peer {} RTT: {}ms", id.fmt_short(), rtt_ms);
+            self.emit_plugin_mesh_event(
+                crate::plugin::proto::mesh_event::Kind::PeerUpdated,
+                Some(&peer),
+                String::new(),
+            )
+            .await;
+        }
+    }
+
+    pub(crate) async fn update_peer_selected_path(
+        &self,
+        id: EndpointId,
+        observation: SelectedPathObservation,
+    ) {
+        let direct_rtt_ms = if observation.path_type == "direct" {
+            observation.rtt_ms
+        } else {
+            None
+        };
+        {
+            let mut state = self.state.lock().await;
+            if let Some(peer) = state.peers.get_mut(&id) {
+                peer.selected_path = Some(observation);
+            }
+        }
+        if let Some(rtt_ms) = direct_rtt_ms {
+            self.update_peer_rtt(id, rtt_ms).await;
+        }
+    }
+
+    /// Re-gossip our state to all connected peers, in this mesh and in every
+    /// mesh this node is a member of.
+    /// Call after changing assigned/hosted state, role, or configured models.
+    pub async fn regossip(&self) {
+        self.regossip_with_memberships().await;
+    }
+
+    async fn regossip_connections(&self) {
+        let conns: Vec<(EndpointId, Connection)> = {
+            let state = self.state.lock().await;
+            state
+                .connections
+                .iter()
+                .map(|(id, c)| (*id, c.clone()))
+                .collect()
+        };
+        for (peer_id, conn) in conns {
+            let node = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = node.initiate_gossip(conn, peer_id).await {
+                    tracing::debug!("Regossip to {} failed: {e}", peer_id.fmt_short());
+                }
+            });
+        }
+    }
+
+    /// Gossip with one connected peer to update routing table.
+    /// Used by: (1) passive nodes' periodic 60s heartbeat, (2) background
+    /// refresh on tunnel failure so future requests have fresh routing.
+    pub async fn gossip_one_peer(&self) {
+        let conn = {
+            let state = self.state.lock().await;
+            state
+                .connections
+                .iter()
+                .next()
+                .map(|(id, c)| (*id, c.clone()))
+        };
+        if let Some((peer_id, conn)) = conn {
+            let _ = self.initiate_gossip_inner(conn, peer_id, false).await;
+        }
+    }
+
+    pub async fn is_llama_ready(&self) -> bool {
+        *self.llama_ready.lock().await
+    }
+
+    pub async fn mesh_id(&self) -> Option<String> {
+        if let Some(state) = self.requirement_mesh_state.lock().await.clone() {
+            return Some(state.mesh_id);
+        }
+        self.mesh_id.lock().await.clone()
+    }
+
+    pub async fn first_joined_mesh_ts(&self) -> Option<u64> {
+        *self.first_joined_mesh_ts.lock().await
+    }
+
+    pub async fn set_first_joined_mesh_ts_if_absent(&self, ts: u64) -> bool {
+        let mut current = self.first_joined_mesh_ts.lock().await;
+        if current.is_none() {
+            *current = Some(ts);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the mesh identity. If None was set, adopts the given ID (from gossip).
+    /// If already set, ignores (originator's ID wins).
+    pub async fn set_mesh_id(&self, id: String) {
+        if let Some(state) = self.requirement_mesh_state.lock().await.clone()
+            && state.mesh_id != id
+        {
+            tracing::warn!(
+                "ignoring conflicting mesh ID '{}' for requirement-aware mesh {}",
+                id,
+                state.mesh_id
+            );
+            return;
+        }
+        let mut current = self.mesh_id.lock().await;
+        if current.is_none() {
+            *current = Some(id);
+            drop(current);
+            self.emit_plugin_mesh_event(
+                crate::plugin::proto::mesh_event::Kind::MeshIdUpdated,
+                None,
+                String::new(),
+            )
+            .await;
+        }
+    }
+
+    /// Set mesh ID unconditionally (for originator).
+    pub async fn set_mesh_id_force(&self, id: String) {
+        if let Some(state) = self.requirement_mesh_state.lock().await.clone() {
+            assert_eq!(
+                state.mesh_id, id,
+                "requirement-aware mesh state must keep mesh ID aligned with policy hash"
+            );
+        }
+        *self.mesh_id.lock().await = Some(id);
+        self.emit_plugin_mesh_event(
+            crate::plugin::proto::mesh_event::Kind::MeshIdUpdated,
+            None,
+            String::new(),
+        )
+        .await;
+    }
+
+    pub async fn set_available_models(&self, models: Vec<String>) {
+        *self.available_models.lock().await = models;
+    }
+
+    pub async fn available_models(&self) -> Vec<String> {
+        self.available_models.lock().await.clone()
+    }
+}

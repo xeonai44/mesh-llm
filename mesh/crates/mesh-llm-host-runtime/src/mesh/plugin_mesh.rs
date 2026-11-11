@@ -1,0 +1,1205 @@
+mod message_history;
+#[cfg(test)]
+mod relay_tests;
+pub(super) use message_history::PluginMessageHistory;
+
+use super::*;
+use crate::mesh::node::stamp_plugin_event_source;
+use crate::plugin::ChannelRoute;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const PLUGIN_FRAME_PREFIX_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const PLUGIN_FRAME_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PLUGIN_CHANNEL_FRAME_MAX_BYTES: usize = 10_000_000;
+const PLUGIN_BULK_FRAME_MAX_BYTES: usize = 64_000_000;
+const PLUGIN_FRAME_SIGNATURE_TTL_MS: u64 = 120_000;
+/// The accepted remaining lifetime includes 30 seconds of clock skew. The
+/// time-based deduplication window matches this bound; signature expiry still
+/// rejects an old frame if its ID is evicted earlier by the history cap.
+const PLUGIN_FRAME_MAX_REMAINING_TTL_MS: u64 = 150_000;
+const PLUGIN_MESSAGE_DEDUP_TTL: std::time::Duration =
+    std::time::Duration::from_millis(PLUGIN_FRAME_MAX_REMAINING_TTL_MS);
+
+fn plugin_frame_recipient(
+    peer_id: EndpointId,
+    skip_peer: Option<EndpointId>,
+    target: &str,
+    signed: bool,
+    relay_supported: bool,
+) -> bool {
+    Some(peer_id) != skip_peer
+        && (!signed
+            || (skip_peer.is_none() && target.is_empty())
+            || relay_supported
+            || target == endpoint_id_hex(peer_id))
+}
+
+trait OriginSignedPluginFrame: prost::Message + Clone {
+    const SIGNATURE_DOMAIN: &'static [u8];
+
+    fn source_peer_id(&self) -> Option<&str>;
+    fn expires_at_unix_ms(&self) -> u64;
+    fn set_expires_at_unix_ms(&mut self, value: u64);
+    fn origin_signature(&self) -> &[u8];
+    fn set_origin_signature(&mut self, value: Vec<u8>);
+}
+
+impl OriginSignedPluginFrame for crate::plugin::proto::MeshChannelFrame {
+    const SIGNATURE_DOMAIN: &'static [u8] = b"mesh-llm/plugin-channel-frame/v1\0";
+
+    fn source_peer_id(&self) -> Option<&str> {
+        self.message
+            .as_ref()
+            .map(|message| message.source_peer_id.as_str())
+    }
+
+    fn expires_at_unix_ms(&self) -> u64 {
+        self.expires_at_unix_ms
+    }
+
+    fn set_expires_at_unix_ms(&mut self, value: u64) {
+        self.expires_at_unix_ms = value;
+    }
+
+    fn origin_signature(&self) -> &[u8] {
+        &self.origin_signature
+    }
+
+    fn set_origin_signature(&mut self, value: Vec<u8>) {
+        self.origin_signature = value;
+    }
+}
+
+impl OriginSignedPluginFrame for crate::plugin::proto::MeshBulkFrame {
+    const SIGNATURE_DOMAIN: &'static [u8] = b"mesh-llm/plugin-bulk-frame/v1\0";
+
+    fn source_peer_id(&self) -> Option<&str> {
+        self.message
+            .as_ref()
+            .map(|message| message.source_peer_id.as_str())
+    }
+
+    fn expires_at_unix_ms(&self) -> u64 {
+        self.expires_at_unix_ms
+    }
+
+    fn set_expires_at_unix_ms(&mut self, value: u64) {
+        self.expires_at_unix_ms = value;
+    }
+
+    fn origin_signature(&self) -> &[u8] {
+        &self.origin_signature
+    }
+
+    fn set_origin_signature(&mut self, value: Vec<u8>) {
+        self.origin_signature = value;
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PluginFrameAuthentication {
+    ImmediatePeer,
+    OriginSignature,
+}
+
+/// Signs a prost re-encoding of the decoded frame, with its signature cleared.
+/// Signed frames use only feature-advertising relays. Legacy relays are skipped
+/// because their decode/re-encode cycle would discard the signature fields.
+fn plugin_frame_signing_bytes<F: OriginSignedPluginFrame>(frame: &F) -> Vec<u8> {
+    let mut unsigned = frame.clone();
+    unsigned.set_origin_signature(Vec::new());
+    let encoded = unsigned.encode_to_vec();
+    let mut bytes = Vec::with_capacity(F::SIGNATURE_DOMAIN.len() + encoded.len());
+    bytes.extend_from_slice(F::SIGNATURE_DOMAIN);
+    bytes.extend_from_slice(&encoded);
+    bytes
+}
+
+fn sign_origin_frame_with_expiry<F: OriginSignedPluginFrame>(
+    secret: &SecretKey,
+    frame: &mut F,
+    expires_at_unix_ms: u64,
+) {
+    frame.set_expires_at_unix_ms(expires_at_unix_ms);
+    frame.set_origin_signature(Vec::new());
+    let signature = secret
+        .sign(&plugin_frame_signing_bytes(frame))
+        .to_bytes()
+        .to_vec();
+    frame.set_origin_signature(signature);
+}
+
+fn sign_origin_frame<F: OriginSignedPluginFrame>(secret: &SecretKey, frame: &mut F) {
+    let expires_at_unix_ms =
+        crate::mesh::current_time_unix_ms().saturating_add(PLUGIN_FRAME_SIGNATURE_TTL_MS);
+    sign_origin_frame_with_expiry(secret, frame, expires_at_unix_ms);
+}
+
+#[cfg(test)]
+pub(super) fn sign_channel_frame_with_expiry(
+    secret: &SecretKey,
+    frame: &mut crate::plugin::proto::MeshChannelFrame,
+    expires_at_unix_ms: u64,
+) {
+    sign_origin_frame_with_expiry(secret, frame, expires_at_unix_ms);
+}
+
+fn sign_channel_frame(secret: &SecretKey, frame: &mut crate::plugin::proto::MeshChannelFrame) {
+    sign_origin_frame(secret, frame);
+}
+
+#[cfg(test)]
+pub(super) fn sign_bulk_frame_with_expiry(
+    secret: &SecretKey,
+    frame: &mut crate::plugin::proto::MeshBulkFrame,
+    expires_at_unix_ms: u64,
+) {
+    sign_origin_frame_with_expiry(secret, frame, expires_at_unix_ms);
+}
+
+fn sign_bulk_frame(secret: &SecretKey, frame: &mut crate::plugin::proto::MeshBulkFrame) {
+    sign_origin_frame(secret, frame);
+}
+
+fn verify_origin_signature<F: OriginSignedPluginFrame>(frame: &F, now_unix_ms: u64) -> bool {
+    let Some(source_peer_id) = frame.source_peer_id() else {
+        return false;
+    };
+    if source_peer_id.is_empty()
+        || frame.expires_at_unix_ms() <= now_unix_ms
+        || frame.expires_at_unix_ms()
+            > now_unix_ms.saturating_add(PLUGIN_FRAME_MAX_REMAINING_TTL_MS)
+    {
+        return false;
+    }
+    let Ok(source_bytes) = hex::decode(source_peer_id) else {
+        return false;
+    };
+    let Ok(source_bytes) = <[u8; 32]>::try_from(source_bytes.as_slice()) else {
+        return false;
+    };
+    let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&source_bytes) else {
+        return false;
+    };
+    let Ok(signature_bytes) = <[u8; 64]>::try_from(frame.origin_signature()) else {
+        return false;
+    };
+    verifying_key
+        .verify_strict(
+            &plugin_frame_signing_bytes(frame),
+            &ed25519_dalek::Signature::from_bytes(&signature_bytes),
+        )
+        .is_ok()
+}
+
+fn authenticate_plugin_frame<F: OriginSignedPluginFrame>(
+    frame: &F,
+    remote: EndpointId,
+) -> Option<PluginFrameAuthentication> {
+    let source_peer_id = frame.source_peer_id()?;
+    let has_signature_fields =
+        !frame.origin_signature().is_empty() || frame.expires_at_unix_ms() != 0;
+    if !has_signature_fields {
+        return (source_peer_id.is_empty() || source_peer_id == endpoint_id_hex(remote))
+            .then_some(PluginFrameAuthentication::ImmediatePeer);
+    }
+    verify_origin_signature(frame, crate::mesh::current_time_unix_ms())
+        .then_some(PluginFrameAuthentication::OriginSignature)
+}
+
+/// Shortest interval between plugin-frame warnings for one sending peer.
+///
+/// A remote can open a fresh stream per frame and distinct `message_id` values
+/// bypass the dedup window, so warning once per frame is log I/O that peer
+/// controls. The runtime writes each event to stderr and flushes it, so an
+/// unthrottled warning is both unbounded output and a backpressure stall.
+const PLUGIN_FRAME_WARN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Upper bound on peers the plugin-frame warning throttle tracks. Reaching it
+/// evicts the least recently warned peer, which costs that peer one extra
+/// warning and never grows the map past this size.
+const PLUGIN_FRAME_WARN_MAX_PEERS: usize = 1024;
+
+/// `frame_kind` value for warnings raised on the channel-frame path.
+const PLUGIN_FRAME_KIND_CHANNEL: &str = "channel";
+
+/// `frame_kind` value for warnings raised on the bulk-transfer path.
+const PLUGIN_FRAME_KIND_BULK: &str = "bulk";
+
+/// Throttle state for plugin-frame warnings from one sending peer.
+///
+/// A remote can open a fresh stream for every frame, so one warning per frame
+/// is log I/O that peer can drive without bound; the cooldown bounds it and
+/// `suppressed` keeps the volume visible in the warning that is eventually
+/// emitted.
+pub(crate) struct PluginFrameWarnState {
+    /// When this peer's last warning was emitted.
+    pub(crate) last_warn_at: std::time::Instant,
+    /// Warnings folded into this peer's next emitted warning.
+    pub(crate) suppressed: u32,
+}
+
+/// Local-only plugin-frame telemetry: the mismatch counter and the per-peer
+/// warning throttle that keeps its output bounded.
+///
+/// The throttle holds its own mutex rather than living in the mesh-wide
+/// `MeshState`, so a plugin-frame decision never contends with — or holds — the
+/// lock every other mesh path serializes behind, and the counter is a lock-free
+/// atomic read for the status path.
+#[derive(Default)]
+pub(crate) struct PluginFrameTelemetry {
+    /// Rejected plugin-mesh frames with an unauthenticated non-empty source
+    /// claim different from the sending peer. Advanced before throttling, so it
+    /// records the true volume even while a peer's warning is folded.
+    source_mismatch_total: AtomicU64,
+    /// Per-peer warning throttle; deliberately its own mutex, not `MeshState`.
+    warn: std::sync::Mutex<HashMap<EndpointId, PluginFrameWarnState>>,
+}
+
+impl PluginFrameTelemetry {
+    /// Record one rejected frame whose claimed source is unauthenticated and
+    /// differs from the sending peer.
+    ///
+    /// The counter advances on every call; `now` decides the warning for
+    /// `remote`: `Some` with the number of warnings folded in when the caller
+    /// should emit one, or `None` while the peer is inside its cooldown.
+    pub(crate) fn record_source_mismatch(
+        &self,
+        remote: EndpointId,
+        now: std::time::Instant,
+    ) -> Option<u32> {
+        self.source_mismatch_total.fetch_add(1, Ordering::Relaxed);
+        let mut warn = self
+            .warn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        plugin_frame_warn_slot(&mut warn, remote, now)
+    }
+
+    /// Total plugin-frame source mismatches observed on this node.
+    pub(crate) fn source_mismatch_total(&self) -> u64 {
+        self.source_mismatch_total.load(Ordering::Relaxed)
+    }
+}
+
+/// Throttle decision behind [`PluginFrameTelemetry::record_source_mismatch`],
+/// over `now` so the cooldown is deterministic under test.
+///
+/// Returns the number of warnings folded into the one the caller should emit
+/// now, or `None` while `remote` is still inside its cooldown.
+pub(crate) fn plugin_frame_warn_slot(
+    warn: &mut HashMap<EndpointId, PluginFrameWarnState>,
+    remote: EndpointId,
+    now: std::time::Instant,
+) -> Option<u32> {
+    if let Some(entry) = warn.get_mut(&remote) {
+        if now.duration_since(entry.last_warn_at) < PLUGIN_FRAME_WARN_COOLDOWN {
+            entry.suppressed = entry.suppressed.saturating_add(1);
+            return None;
+        }
+        entry.last_warn_at = now;
+        return Some(std::mem::take(&mut entry.suppressed));
+    }
+
+    // The least recently warned peer is the one to evict. Resolved through a
+    // helper so the scrutinee holds no borrow of `warn`.
+    if warn.len() >= PLUGIN_FRAME_WARN_MAX_PEERS
+        && let Some(oldest) = least_recently_warned(warn)
+    {
+        warn.remove(&oldest);
+    }
+    warn.insert(
+        remote,
+        PluginFrameWarnState {
+            last_warn_at: now,
+            suppressed: 0,
+        },
+    );
+    Some(0)
+}
+
+pub(crate) async fn read_plugin_frame_bytes<R>(reader: &mut R, max_len: usize) -> Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(
+        PLUGIN_FRAME_PREFIX_READ_TIMEOUT,
+        tokio::io::AsyncReadExt::read_exact(reader, &mut len_buf),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "timeout reading plugin frame prefix after {PLUGIN_FRAME_PREFIX_READ_TIMEOUT:?}"
+        )
+    })?
+    .context("read plugin frame prefix")?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    anyhow::ensure!(len <= max_len, "Plugin frame too large");
+    let mut buf = vec![0u8; len];
+    tokio::time::timeout(
+        PLUGIN_FRAME_BODY_READ_TIMEOUT,
+        tokio::io::AsyncReadExt::read_exact(reader, &mut buf),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "timeout reading plugin frame body after {PLUGIN_FRAME_BODY_READ_TIMEOUT:?}"
+        )
+    })?
+    .context("read plugin frame body")?;
+    Ok(buf)
+}
+
+impl Node {
+    pub(crate) async fn forward_plugin_event(
+        &self,
+        event: crate::plugin::PluginMeshEvent,
+    ) -> Result<()> {
+        match event {
+            crate::plugin::PluginMeshEvent::BoundOperation {
+                plugin_id,
+                generation,
+                request,
+                response_tx,
+            } => {
+                if let Some(manager) = self.plugin_manager().await {
+                    tokio::spawn(async move {
+                        let result = manager
+                            .bound_operation(&plugin_id, generation, request)
+                            .await;
+                        let _ = response_tx.send(result);
+                    });
+                }
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::IdentityService {
+                plugin_id,
+                request,
+                response_tx,
+            } => {
+                let node = self.clone();
+                tokio::spawn(async move {
+                    let response = crate::plugin::identity_services::handle_request(
+                        &node, &plugin_id, request,
+                    )
+                    .await;
+                    let _ = response_tx.send(response);
+                });
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::Channel { plugin_id, message } => {
+                self.forward_plugin_channel_message(plugin_id, message)
+                    .await
+            }
+            crate::plugin::PluginMeshEvent::BulkTransfer { plugin_id, message } => {
+                self.forward_plugin_bulk_transfer(plugin_id, message).await
+            }
+            crate::plugin::PluginMeshEvent::OpenStream {
+                plugin_id,
+                request,
+                response_tx,
+            } => {
+                let response = self
+                    .open_outbound_plugin_mesh_stream(plugin_id, request)
+                    .await;
+                let _ = response_tx.send(response);
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::PeerBlock {
+                plugin_id,
+                request,
+                response_tx,
+            } => {
+                let response =
+                    crate::network::peer_blocks::apply_plugin_request(self, plugin_id, request)
+                        .await;
+                let _ = response_tx.send(response);
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::ModelRequirementsWithdraw { plugin_id } => {
+                self.model_requirements.lock().await.remove(&plugin_id);
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::ModelRequirement {
+                plugin_id,
+                request,
+                response_tx,
+            } => {
+                let _ = response_tx.send(self.apply_model_requirement(&plugin_id, request).await);
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::PluginKey {
+                plugin_id,
+                request,
+                response_tx,
+            } => {
+                let _ = response_tx.send(self.apply_plugin_key_request(&plugin_id, request));
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::PluginStatus {
+                plugin_id,
+                generation,
+                schema_version,
+                request,
+                response_tx,
+            } => {
+                let response = self
+                    .runtime_data_collector()
+                    .publish_plugin_status(&plugin_id, generation, schema_version, &request)
+                    .map_err(|rejection| crate::plugin::proto::ErrorResponse {
+                        code: rmcp::model::ErrorCode::INVALID_PARAMS.0,
+                        message: rejection.message(&plugin_id),
+                        data_json: String::new(),
+                    });
+                let _ = response_tx.send(response);
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::PluginDisconnected {
+                plugin_id,
+                generation,
+            } => {
+                self.runtime_data_collector()
+                    .mark_plugin_status_unavailable(&plugin_id, generation);
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::InferenceObservationGrant {
+                plugin_id,
+                response_tx,
+            } => {
+                let granted =
+                    self.config_state
+                        .lock()
+                        .await
+                        .config()
+                        .plugins
+                        .iter()
+                        .any(|plugin| {
+                            plugin.name == plugin_id && plugin.inference_observation_allowed()
+                        });
+                let _ = response_tx.send(granted);
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::PluginStopped { plugin_id } => {
+                // A disabled or removed plugin no longer runs here, so this
+                // node stops vouching for its key and showing its status.
+                self.plugin_keys.remove_own(&plugin_id);
+                self.model_requirements.lock().await.remove(&plugin_id);
+                self.runtime_data_collector()
+                    .remove_plugin_status(&plugin_id);
+                Ok(())
+            }
+            crate::plugin::PluginMeshEvent::PluginStarted {
+                plugin_id,
+                generation,
+                delivered,
+            } => {
+                // Before the manager is installed, installing it sends the
+                // snapshot to every plugin.
+                let sent = match self.plugin_manager().await {
+                    Some(plugin_manager) => self
+                        .send_mesh_snapshot_to(&plugin_manager, &plugin_id, generation)
+                        .await
+                        .is_ok(),
+                    None => true,
+                };
+                let _ = delivered.send(sent);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) async fn broadcast_existing_mesh_snapshot(
+        &self,
+        plugin_manager: &crate::plugin::PluginManager,
+        peers: Vec<PeerInfo>,
+    ) {
+        // A plugin that misses part of the broadcast gets it again when it
+        // next starts, or with the next mesh change.
+        let _ = self.send_mesh_snapshot(plugin_manager, None, peers).await;
+    }
+
+    /// The mesh snapshot [`Self::broadcast_existing_mesh_snapshot`] sends,
+    /// with the peers known now, to the process of `generation` of
+    /// `plugin_id` alone, without starting it. Fails when that process did
+    /// not take every event of it.
+    pub(crate) async fn send_mesh_snapshot_to(
+        &self,
+        plugin_manager: &crate::plugin::PluginManager,
+        plugin_id: &str,
+        generation: u64,
+    ) -> anyhow::Result<()> {
+        let peers = {
+            let state = self.state.lock().await;
+            state.peers.values().cloned().collect::<Vec<_>>()
+        };
+        self.send_mesh_snapshot(plugin_manager, Some((plugin_id, generation)), peers)
+            .await
+    }
+
+    async fn send_mesh_snapshot(
+        &self,
+        plugin_manager: &crate::plugin::PluginManager,
+        target: Option<(&str, u64)>,
+        peers: Vec<PeerInfo>,
+    ) -> anyhow::Result<()> {
+        let send = |event| async move {
+            match target {
+                Some((plugin_id, generation)) => {
+                    plugin_manager
+                        .send_mesh_event_to(plugin_id, generation, event)
+                        .await
+                }
+                None => plugin_manager.broadcast_mesh_event(event).await,
+            }
+        };
+        let mut result = send(
+            self.build_mesh_event(self.plugin_manager_local_kind(), None, String::new())
+                .await,
+        )
+        .await;
+        if self.mesh_id().await.is_some() {
+            result = result.and(
+                send(
+                    self.build_mesh_event(
+                        crate::plugin::proto::mesh_event::Kind::MeshIdUpdated,
+                        None,
+                        String::new(),
+                    )
+                    .await,
+                )
+                .await,
+            );
+        }
+        for peer in peers {
+            if let Err(err) = send(
+                self.build_mesh_event(
+                    crate::plugin::proto::mesh_event::Kind::PeerUp,
+                    Some(peer_info_to_mesh_peer(&peer)),
+                    String::new(),
+                )
+                .await,
+            )
+            .await
+            {
+                tracing::debug!(
+                    "Failed to send existing peer snapshot to plugins for {}: {err}",
+                    peer.id.fmt_short()
+                );
+                result = result.and(Err(err));
+            }
+        }
+        result
+    }
+
+    /// Announce (or withdraw) `plugin_id`'s public key, bound to this node.
+    pub(crate) fn apply_plugin_key_request(
+        &self,
+        plugin_id: &str,
+        request: crate::plugin::proto::PluginKeyRequest,
+    ) -> Result<crate::plugin::proto::PluginKeyResponse, crate::plugin::proto::ErrorResponse> {
+        use crate::mesh::plugin_keys;
+        let invalid = |message: String| crate::plugin::proto::ErrorResponse {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS.0,
+            message,
+            data_json: String::new(),
+        };
+        let node_id = hex::encode(self.endpoint.id().as_bytes());
+        if !plugin_keys::valid_plugin_name(plugin_id) {
+            return Err(invalid(format!(
+                "plugin `{plugin_id}` cannot announce a key: its name is not 1 to {} letters, digits, '-', '_' or '.'",
+                plugin_keys::MAX_PLUGIN_NAME_BYTES
+            )));
+        }
+        if request.public_key.is_empty() {
+            // Sign the withdrawal so peers, and their plugins, drop the key at
+            // once, whether or not this node stays up to be asked again.
+            self.plugin_keys.withdraw_own(plugin_id, |key| {
+                plugin_keys::withdraw(&self.endpoint_secret_key, plugin_id, key.public_key)
+            });
+            return Ok(crate::plugin::proto::PluginKeyResponse {
+                node_id,
+                binding_signature: Vec::new(),
+            });
+        }
+        let Ok(public_key) = <[u8; 32]>::try_from(request.public_key.as_slice()) else {
+            return Err(invalid(
+                "public_key must be 32 bytes (Ed25519), or empty to withdraw".into(),
+            ));
+        };
+        if !plugin_keys::valid_public_key(&public_key) {
+            return Err(invalid(
+                "public_key is not a valid Ed25519 public key".into(),
+            ));
+        }
+        let bound = plugin_keys::bind(&self.endpoint_secret_key, plugin_id, public_key);
+        self.plugin_keys.set_own(bound.clone()).map_err(invalid)?;
+        Ok(crate::plugin::proto::PluginKeyResponse {
+            node_id,
+            binding_signature: bound.binding_signature.to_vec(),
+        })
+    }
+
+    /// A plugin's own channel message: to the other local plugins on a
+    /// channel it declares local, else signed and sent to the mesh.
+    async fn forward_plugin_channel_message(
+        &self,
+        plugin_id: String,
+        mut message: crate::plugin::proto::ChannelMessage,
+    ) -> Result<()> {
+        // One classification decides the route, so a manifest that changes
+        // mid-call cannot turn a local message into a mesh one.
+        match self
+            .plugin_channel_route(&plugin_id, &message.channel, "message")
+            .await
+        {
+            (ChannelRoute::Local, Some(plugin_manager)) => {
+                // A local channel never reaches the mesh: its messages go to
+                // the other plugins on this node.
+                return plugin_manager
+                    .relay_local_channel_message(&plugin_id, message)
+                    .await;
+            }
+            (ChannelRoute::Mesh, _) => {}
+            _ => return Ok(()),
+        }
+        stamp_plugin_event_source(self.endpoint.id(), &mut message.source_peer_id);
+        let mut frame = crate::plugin::proto::MeshChannelFrame {
+            plugin_id,
+            message_id: new_plugin_message_id(&message.source_peer_id),
+            message: Some(message),
+            ..Default::default()
+        };
+        sign_channel_frame(&self.endpoint_secret_key, &mut frame);
+        if !self.remember_plugin_message(frame.message_id.clone()).await {
+            return Ok(());
+        }
+        self.broadcast_plugin_channel_frame(&frame, None).await
+    }
+
+    /// A plugin's own bulk transfer, sent to the mesh; dropped on a local
+    /// channel.
+    async fn forward_plugin_bulk_transfer(
+        &self,
+        plugin_id: String,
+        mut message: crate::plugin::proto::BulkTransferMessage,
+    ) -> Result<()> {
+        // Bulk transfers are peer-to-peer only; a local channel has no
+        // peer to send one to.
+        match self
+            .plugin_channel_route(&plugin_id, &message.channel, "bulk transfer")
+            .await
+        {
+            (ChannelRoute::Mesh, _) => {}
+            (ChannelRoute::Local, _) => {
+                tracing::warn!(
+                    plugin = %plugin_id,
+                    channel = %message.channel,
+                    "dropping bulk transfer on a local channel: local channels never reach the mesh"
+                );
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+        stamp_plugin_event_source(self.endpoint.id(), &mut message.source_peer_id);
+        let mut frame = crate::plugin::proto::MeshBulkFrame {
+            plugin_id,
+            message_id: new_plugin_message_id(&message.source_peer_id),
+            message: Some(message),
+            ..Default::default()
+        };
+        sign_bulk_frame(&self.endpoint_secret_key, &mut frame);
+        if !self.remember_plugin_message(frame.message_id.clone()).await {
+            return Ok(());
+        }
+        self.broadcast_plugin_bulk_frame(&frame, None).await
+    }
+
+    /// How `plugin_id`'s traffic on `channel` may travel, with the plugin
+    /// manager that answered. Without a manager (shutdown) or a cached
+    /// manifest (restart) nothing is declared, so the route fails closed.
+    pub(crate) async fn plugin_channel_route(
+        &self,
+        plugin_id: &str,
+        channel: &str,
+        noun: &str,
+    ) -> (ChannelRoute, Option<crate::plugin::PluginManager>) {
+        let Some(plugin_manager) = self.plugin_manager().await else {
+            tracing::debug!(
+                plugin = %plugin_id,
+                channel = %channel,
+                "Dropping outbound {noun}: no plugin manager"
+            );
+            return (ChannelRoute::Undeclared, None);
+        };
+        let route = plugin_manager.channel_route(plugin_id, channel).await;
+        if route == ChannelRoute::Undeclared {
+            tracing::debug!(
+                plugin = %plugin_id,
+                channel = %channel,
+                "Dropping outbound {noun} for undeclared mesh channel"
+            );
+        }
+        (route, Some(plugin_manager))
+    }
+
+    /// Record a plugin-frame source mismatch from `remote` and decide the warning.
+    ///
+    /// Both plugin-frame receive paths record the same class of event — a frame
+    /// whose source mismatch lacks a valid origin signature — and neither
+    /// may warn per frame: a remote can open a stream per frame, and the runtime
+    /// writes every warning to stderr and flushes it synchronously. Every call
+    /// advances the local mismatch counter; the warning itself is throttled to at
+    /// most one per [`PLUGIN_FRAME_WARN_COOLDOWN`] per sending peer, tracking at
+    /// most [`PLUGIN_FRAME_WARN_MAX_PEERS`] peers. Neither the counter nor the
+    /// throttle takes the mesh-wide [`MeshState`] lock.
+    ///
+    /// Returns the number of warnings folded into the one the caller should emit
+    /// now, or `None` while the peer is still inside its cooldown (the caller
+    /// stays silent and the occurrence is counted instead).
+    pub(crate) fn plugin_frame_source_mismatch(&self, remote: EndpointId) -> Option<u32> {
+        self.plugin_frame_telemetry
+            .record_source_mismatch(remote, std::time::Instant::now())
+    }
+
+    /// Total plugin-frame source mismatches this node has observed.
+    ///
+    /// The per-peer warning is throttled, so this counter — not the log line —
+    /// is the record of how often a peer makes a rejected source claim.
+    /// Surfaced on the local status payload.
+    pub(crate) fn plugin_frame_source_mismatch_total(&self) -> u64 {
+        self.plugin_frame_telemetry.source_mismatch_total()
+    }
+
+    /// Whether this node already accepted `message_id` for plugin delivery.
+    #[cfg(test)]
+    pub(crate) async fn has_plugin_message(&self, message_id: &str) -> bool {
+        self.plugin_message_history
+            .lock()
+            .await
+            .contains(message_id)
+    }
+
+    pub(crate) async fn remember_plugin_message(&self, message_id: String) -> bool {
+        let now = std::time::Instant::now();
+        self.plugin_message_history
+            .lock()
+            .await
+            .remember(message_id, now)
+    }
+
+    pub(crate) async fn broadcast_plugin_channel_frame(
+        &self,
+        frame: &crate::plugin::proto::MeshChannelFrame,
+        skip_peer: Option<EndpointId>,
+    ) -> Result<()> {
+        let data = frame.encode_to_vec();
+        let conns = self
+            .plugin_frame_connections(
+                frame
+                    .message
+                    .as_ref()
+                    .map_or("", |message| message.target_peer_id.as_str()),
+                !frame.origin_signature.is_empty(),
+                skip_peer,
+            )
+            .await;
+        for (peer_id, conn) in conns {
+            let bytes = data.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let (mut send, _recv) = conn.open_bi().await?;
+                    send.write_all(&[STREAM_PLUGIN_CHANNEL]).await?;
+                    send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+                    send.write_all(&bytes).await?;
+                    send.finish()?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(e) = result {
+                    tracing::debug!(
+                        "Failed to broadcast plugin frame to {}: {e}",
+                        peer_id.fmt_short()
+                    );
+                }
+            });
+        }
+        Ok(())
+    }
+
+    async fn plugin_frame_connections(
+        &self,
+        target: &str,
+        signed: bool,
+        skip_peer: Option<EndpointId>,
+    ) -> Vec<(EndpointId, Connection)> {
+        {
+            let state = self.state.lock().await;
+            state
+                .connections
+                .iter()
+                .filter(|(peer_id, _)| {
+                    plugin_frame_recipient(
+                        **peer_id,
+                        skip_peer,
+                        target,
+                        signed,
+                        state
+                            .peers
+                            .get(*peer_id)
+                            .is_some_and(|peer| peer.plugin_origin_signature_supported),
+                    )
+                })
+                .map(|(peer_id, conn)| (*peer_id, conn.clone()))
+                .collect()
+        }
+    }
+
+    pub(crate) async fn broadcast_plugin_bulk_frame(
+        &self,
+        frame: &crate::plugin::proto::MeshBulkFrame,
+        skip_peer: Option<EndpointId>,
+    ) -> Result<()> {
+        let data = frame.encode_to_vec();
+        let conns = self
+            .plugin_frame_connections(
+                frame
+                    .message
+                    .as_ref()
+                    .map_or("", |message| message.target_peer_id.as_str()),
+                !frame.origin_signature.is_empty(),
+                skip_peer,
+            )
+            .await;
+        for (peer_id, conn) in conns {
+            let bytes = data.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let (mut send, _recv) = conn.open_bi().await?;
+                    send.write_all(&[STREAM_PLUGIN_BULK_TRANSFER]).await?;
+                    send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+                    send.write_all(&bytes).await?;
+                    send.finish()?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                if let Err(e) = result {
+                    tracing::debug!(
+                        "Failed to broadcast plugin bulk frame to {}: {e}",
+                        peer_id.fmt_short()
+                    );
+                }
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn forward_targeted_plugin_frame(
+        &self,
+        target_peer_id: &str,
+        stream_type: u8,
+        data: Vec<u8>,
+    ) {
+        let target = target_peer_id.to_string();
+        let node = self.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let conn = node
+                    .connection_for_peer_hex(&target)
+                    .await
+                    .with_context(|| format!("target peer {target} is not routable"))?;
+                let (mut send, _recv) = conn.open_bi().await?;
+                send.write_all(&[stream_type]).await?;
+                send.write_all(&(data.len() as u32).to_le_bytes()).await?;
+                send.write_all(&data).await?;
+                send.finish()?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::debug!("Failed to forward targeted plugin frame: {error}");
+            }
+        });
+    }
+
+    /// Handle an inbound plugin-mesh frame carrying channel frames.
+    ///
+    /// Unsigned legacy frames are bound to `remote` and accepted only when they
+    /// claim that peer (or omit a source). Relayed claims require an end-to-end
+    /// origin signature over the frame and its expiry.
+    pub(crate) async fn handle_plugin_channel_stream(
+        &self,
+        remote: EndpointId,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) -> Result<()> {
+        let buf = read_plugin_frame_bytes(&mut recv, PLUGIN_CHANNEL_FRAME_MAX_BYTES).await?;
+        send.finish()?;
+
+        let frame = crate::plugin::proto::MeshChannelFrame::decode(buf.as_slice())?;
+        if frame.plugin_id.is_empty() || frame.message_id.is_empty() {
+            return Ok(());
+        }
+        let Some(mut message) = frame.message.clone() else {
+            return Ok(());
+        };
+        let source_peer_id_was_empty = message.source_peer_id.is_empty();
+        let Some(authentication) = authenticate_plugin_frame(&frame, remote) else {
+            if message.source_peer_id != endpoint_id_hex(remote)
+                && let Some(suppressed) = self.plugin_frame_source_mismatch(remote)
+            {
+                tracing::warn!(
+                    claimed_source = %message.source_peer_id,
+                    sending_peer = %remote.fmt_short(),
+                    channel = %message.channel,
+                    frame_kind = %PLUGIN_FRAME_KIND_CHANNEL,
+                    suppressed,
+                    "Rejecting plugin frame with an unauthenticated source_peer_id"
+                );
+            }
+            return Ok(());
+        };
+        if message.source_peer_id.is_empty() {
+            message.source_peer_id = endpoint_id_hex(remote);
+        }
+        // A rejected frame never enters deduplication, so a relay cannot spend
+        // the origin's message ID with an unauthenticated claim.
+        if !self.remember_plugin_message(frame.message_id.clone()).await {
+            return Ok(());
+        }
+        let local_peer_id = endpoint_id_hex(self.endpoint.id());
+        let deliver_local =
+            message.target_peer_id.is_empty() || message.target_peer_id == local_peer_id;
+
+        if deliver_local {
+            let plugin_manager = self.plugin_manager.lock().await.clone();
+            if let Some(plugin_manager) = plugin_manager {
+                plugin_manager
+                    .dispatch_channel_message(crate::plugin::PluginMeshEvent::Channel {
+                        plugin_id: frame.plugin_id.clone(),
+                        message: message.clone(),
+                    })
+                    .await?;
+            }
+        }
+
+        // A signed origin may be forwarded unchanged. Legacy empty-source frames
+        // may also continue: each hop binds the empty claim to its authenticated
+        // immediate peer. Non-empty unsigned claims never cross another hop.
+        if (authentication == PluginFrameAuthentication::OriginSignature
+            || source_peer_id_was_empty)
+            && !message.target_peer_id.is_empty()
+            && message.target_peer_id != local_peer_id
+        {
+            self.forward_targeted_plugin_frame(
+                &message.target_peer_id,
+                STREAM_PLUGIN_CHANNEL,
+                frame.encode_to_vec(),
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Handle an inbound plugin-mesh frame carrying bulk-transfer frames.
+    ///
+    /// Unsigned legacy frames are bound to the authenticated immediate peer;
+    /// relayed claims require a valid origin signature and expiry.
+    pub(crate) async fn handle_plugin_bulk_stream(
+        &self,
+        remote: EndpointId,
+        mut send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+    ) -> Result<()> {
+        let buf = read_plugin_frame_bytes(&mut recv, PLUGIN_BULK_FRAME_MAX_BYTES).await?;
+        send.finish()?;
+
+        let frame = crate::plugin::proto::MeshBulkFrame::decode(buf.as_slice())?;
+        if frame.plugin_id.is_empty() || frame.message_id.is_empty() {
+            return Ok(());
+        }
+        let Some(mut message) = frame.message.clone() else {
+            return Ok(());
+        };
+        let source_peer_id_was_empty = message.source_peer_id.is_empty();
+        let Some(authentication) = authenticate_plugin_frame(&frame, remote) else {
+            if message.source_peer_id != endpoint_id_hex(remote)
+                && let Some(suppressed) = self.plugin_frame_source_mismatch(remote)
+            {
+                tracing::warn!(
+                    claimed_source = %message.source_peer_id,
+                    sending_peer = %remote.fmt_short(),
+                    channel = %message.channel,
+                    frame_kind = %PLUGIN_FRAME_KIND_BULK,
+                    suppressed,
+                    "Rejecting plugin bulk frame with an unauthenticated source_peer_id"
+                );
+            }
+            return Ok(());
+        };
+        if message.source_peer_id.is_empty() {
+            message.source_peer_id = endpoint_id_hex(remote);
+        }
+        if !self.remember_plugin_message(frame.message_id.clone()).await {
+            return Ok(());
+        }
+        let local_peer_id = endpoint_id_hex(self.endpoint.id());
+        let deliver_local =
+            message.target_peer_id.is_empty() || message.target_peer_id == local_peer_id;
+
+        if deliver_local {
+            let plugin_manager = self.plugin_manager.lock().await.clone();
+            if let Some(plugin_manager) = plugin_manager {
+                plugin_manager
+                    .dispatch_bulk_transfer_message(crate::plugin::PluginMeshEvent::BulkTransfer {
+                        plugin_id: frame.plugin_id.clone(),
+                        message: message.clone(),
+                    })
+                    .await?;
+            }
+        }
+
+        if (authentication == PluginFrameAuthentication::OriginSignature
+            || source_peer_id_was_empty)
+            && !message.target_peer_id.is_empty()
+            && message.target_peer_id != local_peer_id
+        {
+            self.forward_targeted_plugin_frame(
+                &message.target_peer_id,
+                STREAM_PLUGIN_BULK_TRANSFER,
+                frame.encode_to_vec(),
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+}
+
+/// The peer this throttle would evict first: the one warned longest ago.
+fn least_recently_warned(warn: &HashMap<EndpointId, PluginFrameWarnState>) -> Option<EndpointId> {
+    warn.iter()
+        .min_by_key(|(_, entry)| entry.last_warn_at)
+        .map(|(peer, _)| *peer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(seed: u32) -> EndpointId {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&seed.to_be_bytes());
+        EndpointId::from(SecretKey::from_bytes(&bytes).public())
+    }
+
+    #[test]
+    fn signed_plugin_frames_skip_legacy_relays_but_keep_direct_targets() {
+        let capable = peer(1);
+        let legacy = peer(2);
+        assert!(plugin_frame_recipient(capable, None, "", true, true));
+        assert!(plugin_frame_recipient(legacy, None, "", true, false));
+        let target = endpoint_id_hex(peer(3));
+        assert!(!plugin_frame_recipient(legacy, None, &target, true, false));
+        assert!(plugin_frame_recipient(capable, None, &target, true, true));
+        assert!(plugin_frame_recipient(
+            legacy,
+            None,
+            &endpoint_id_hex(legacy),
+            true,
+            false
+        ));
+        assert!(!plugin_frame_recipient(
+            legacy,
+            Some(capable),
+            "",
+            true,
+            false
+        ));
+        assert!(!plugin_frame_recipient(
+            legacy,
+            Some(capable),
+            &endpoint_id_hex(peer(3)),
+            true,
+            false
+        ));
+        assert!(plugin_frame_recipient(
+            legacy,
+            Some(capable),
+            &endpoint_id_hex(legacy),
+            true,
+            false
+        ));
+        assert!(!plugin_frame_recipient(
+            capable,
+            Some(capable),
+            "",
+            true,
+            true
+        ));
+        assert!(plugin_frame_recipient(legacy, None, "", false, false));
+    }
+
+    #[test]
+    fn plugin_frame_warnings_are_throttled_per_peer() {
+        let mut warn = HashMap::new();
+        let remote = peer(1);
+        let now = std::time::Instant::now();
+
+        // The first claim warns; every claim inside the cooldown is folded into
+        // the next warning instead of producing its own.
+        assert_eq!(plugin_frame_warn_slot(&mut warn, remote, now), Some(0));
+        assert_eq!(plugin_frame_warn_slot(&mut warn, remote, now), None);
+        assert_eq!(plugin_frame_warn_slot(&mut warn, remote, now), None);
+        assert_eq!(warn.get(&remote).expect("tracked peer").suppressed, 2);
+
+        // Once the cooldown lapses the folded count is reported, not repeated.
+        let later = now + PLUGIN_FRAME_WARN_COOLDOWN;
+        assert_eq!(plugin_frame_warn_slot(&mut warn, remote, later), Some(2));
+        assert_eq!(warn.get(&remote).expect("tracked peer").suppressed, 0);
+
+        // Each peer has its own budget.
+        assert_eq!(plugin_frame_warn_slot(&mut warn, peer(2), now), Some(0));
+    }
+
+    #[test]
+    fn plugin_frame_warning_state_stays_bounded() {
+        let mut warn = HashMap::new();
+        let start = std::time::Instant::now();
+        for seed in 0..PLUGIN_FRAME_WARN_MAX_PEERS as u32 {
+            // Later peers age, so eviction has an unambiguous oldest entry.
+            let at = start + std::time::Duration::from_millis(u64::from(seed));
+            assert_eq!(plugin_frame_warn_slot(&mut warn, peer(seed), at), Some(0));
+        }
+        assert_eq!(warn.len(), PLUGIN_FRAME_WARN_MAX_PEERS);
+
+        let newest = peer(PLUGIN_FRAME_WARN_MAX_PEERS as u32);
+        let at = start + PLUGIN_FRAME_WARN_COOLDOWN;
+        assert_eq!(plugin_frame_warn_slot(&mut warn, newest, at), Some(0));
+        assert_eq!(warn.len(), PLUGIN_FRAME_WARN_MAX_PEERS);
+        assert!(warn.contains_key(&newest));
+        assert!(!warn.contains_key(&peer(0)));
+    }
+
+    #[test]
+    fn plugin_frame_telemetry_counts_every_mismatch() {
+        let telemetry = PluginFrameTelemetry::default();
+        let remote = peer(7);
+        let now = std::time::Instant::now();
+
+        // The first mismatch warns and is counted.
+        assert_eq!(telemetry.record_source_mismatch(remote, now), Some(0));
+        assert_eq!(telemetry.source_mismatch_total(), 1);
+
+        // Mismatches folded into the cooldown still advance the counter, so the
+        // volume is visible even though the warning is not emitted.
+        assert_eq!(telemetry.record_source_mismatch(remote, now), None);
+        assert_eq!(telemetry.record_source_mismatch(remote, now), None);
+        assert_eq!(telemetry.source_mismatch_total(), 3);
+
+        // The counter is node-wide, not per peer.
+        assert_eq!(telemetry.record_source_mismatch(peer(8), now), Some(0));
+        assert_eq!(telemetry.source_mismatch_total(), 4);
+    }
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ci-hf-download-smoke.sh — exercise the Rust HuggingFace download pipeline.
 #
-# Runs the model-hf integration tests that hit real HuggingFace API and
+# Runs the skippy-model-hf integration tests that hit real HuggingFace API and
 # download endpoints. These tests verify the code path a user exercises
 # when running `mesh-llm serve --model org/repo:Q4_K_M`.
 #
@@ -14,12 +14,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+automation=(cargo run --quiet --manifest-path "$ROOT/tools/xtask/Cargo.toml" --)
+if [[ -n "${MESH_LLM_AUTOMATION_BIN:-}" ]]; then
+  automation=("$MESH_LLM_AUTOMATION_BIN")
+fi
 MODEL_MANIFEST="${MESH_HF_DOWNLOAD_TEST_MANIFEST:-$ROOT/ci/model-artifacts/manifests/hf-download-smoke.json}"
 MODEL_CADENCE="${MESH_HF_DOWNLOAD_TEST_CADENCE:-manual}"
 export MESH_HF_DOWNLOAD_TEST_MANIFEST="$MODEL_MANIFEST"
 
 for artifact_id in smollm2-q4-download gemma3-bf16-metadata; do
-  python3 "$ROOT/scripts/resolve-test-model-manifest.py" \
+  "${automation[@]}" models resolve \
     "$MODEL_MANIFEST" \
     --artifact-id "$artifact_id" \
     --cadence "$MODEL_CADENCE" >/dev/null
@@ -63,9 +67,9 @@ run_hf_test_group() {
   return 1
 }
 
-echo "Running model-hf integration tests (API-only: resolve, list, artifact resolution)..."
+echo "Running skippy-model-hf integration tests (API-only: resolve, list, artifact resolution)..."
 run_hf_test_group "API-only model resolution" \
-  cargo test -p model-hf --test hf_download -- \
+  cargo test -p skippy-model-hf --test hf_download -- \
     --ignored \
     --test-threads=1 \
     resolve_revision_returns_commit_sha \
@@ -76,9 +80,9 @@ run_hf_test_group "API-only model resolution" \
     resolve_nonexistent_repo_returns_error
 
 echo ""
-echo "Running model-hf download tests (downloads ~100 MB GGUF via Rust HF client)..."
+echo "Running skippy-model-hf download tests (downloads ~100 MB GGUF via Rust HF client)..."
 run_hf_test_group "model download" \
-  cargo test -p model-hf --test hf_download -- \
+  cargo test -p skippy-model-hf --test hf_download -- \
     --ignored \
     --test-threads=1 \
     download_single_gguf_file \

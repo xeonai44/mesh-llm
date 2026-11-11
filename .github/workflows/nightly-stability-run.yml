@@ -64,6 +64,12 @@ permissions:
   contents: read
   packages: read
 
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_BENCH_DEBUG: "0"
+
 jobs:
   stability:
     name: Run stability harness
@@ -72,7 +78,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     container:
-      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:ff53048ee7a87b3244ccbfa1b2888fde5db31a73d0dfa42f283d25dde0115307
+      image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:f499b79bc52dc7492d57397fdbec9f890c6f6bb1d8c1fcde9c1c97d45c0541a7
     env:
       MESH_STABILITY_BASE_URL: ${{ inputs.base_url }}
       MESH_STABILITY_MODELS: ${{ inputs.models }}
@@ -117,6 +123,11 @@ jobs:
           fi
 
           echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare native stability automation
+        id: automation
+        if: ${{ steps.preflight.outputs.run == 'true' }}
+        uses: ./.github/actions/prepare-automation
 
       - name: Install requested agent CLIs
         # node/pnpm come from the prebuilt image; corepack is unneeded since
@@ -164,7 +175,7 @@ jobs:
           if [[ "$MESH_STABILITY_SKIP_STREAMING" == "true" ]]; then
             args+=(--skip-streaming)
           fi
-          scripts/qa-nightly-stability.py "${args[@]}"
+          "${MESH_LLM_AUTOMATION_BIN:?automation preparation required}" automation stability nightly "${args[@]}"
 
       - name: Run KV tool-loop stability harness
         id: kv_tool_loop
@@ -173,7 +184,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          scripts/qa-kv-tool-loop-stability.py \
+          "${MESH_LLM_AUTOMATION_BIN:?automation preparation required}" automation stability kv-tool-loop \
             --base-url "$MESH_STABILITY_BASE_URL" \
             --models "$MESH_KV_MODELS" \
             --attempts "$MESH_KV_ATTEMPTS" \

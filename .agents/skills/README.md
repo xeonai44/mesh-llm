@@ -1,5 +1,12 @@
 # Repo Agent Skills
 
+New skill-local tooling follows the Rust automation rule in
+`manage-ci/SKILL.md`: no new Python helpers, including temporary or inline
+scripts. Extend typed `tools/xtask` commands instead; run an existing check
+from the repository root with `cargo xtool repo-consistency ci-crate-lists`.
+Existing Python-backed instructions remain transitional until their owners
+port and verify them.
+
 Skills under `.agents/skills/` are the canonical repo-local skills and are
 auto-picked-up by agents working in this repo. Each is a focused, current
 how-to; deeper reference lives in `docs/`.
@@ -22,9 +29,9 @@ Ground rules baked into all of these:
 - `--headless` only hides the web UI; it is not a backgrounding mechanism.
 - Prefer `mesh-llm stop` over `pkill`.
 
-Related docs: `docs/USAGE.md` (install/service/storage), `docs/CLI.md`
-(commands and model refs), `docs/MESHES.md` (mesh workflows),
-`docs/AGENTS.md` (agent clients), `docs/SKIPPY_SPLITS.md` (big-model splits).
+Related docs: `mesh/docs/USAGE.md` (install/service/storage), `mesh/docs/CLI.md`
+(commands and model refs), `mesh/docs/MESHES.md` (mesh workflows),
+`mesh/docs/AGENTS.md` (agent clients), `skippy/docs/SKIPPY_SPLITS.md` (big-model splits).
 
 The other directories beside these operator workflows are maintainer-facing
 skills for release validation, release notes, Skippy internals, patch queues,

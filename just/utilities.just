@@ -3,7 +3,7 @@
 # Measure repository-local Cargo build-cache usage (80 GiB / 14 day defaults).
 [unix]
 cache-status max_size="80GiB" max_age="14":
-    python3 scripts/manage-build-cache.py status --max-size "{{ max_size }}" --max-age "{{ max_age }}"
+    just automation-run ci-ops build-cache status --max-size "{{ trim_start_match(max_size, "max_size=") }}" --max-age "{{ trim_start_match(max_age, "max_age=") }}"
 
 # Emit Cargo's effective workspace and artifact-directory metadata as JSON.
 [unix]
@@ -13,23 +13,32 @@ cache-cargo-metadata:
 # Remove one package from an explicitly validated Cargo target directory.
 [unix]
 cache-cargo-clean:
-    @test -n "${MESH_LLM_CACHE_TARGET_DIR:-}" || { echo "cache-cargo-clean: MESH_LLM_CACHE_TARGET_DIR is unset; this recipe is driven by scripts/manage-build-cache.py" >&2; exit 1; }
-    @test -n "${MESH_LLM_CACHE_PACKAGE:-}" || { echo "cache-cargo-clean: MESH_LLM_CACHE_PACKAGE is unset; this recipe is driven by scripts/manage-build-cache.py" >&2; exit 1; }
+    @test -n "${MESH_LLM_CACHE_TARGET_DIR:-}" || { echo "cache-cargo-clean: MESH_LLM_CACHE_TARGET_DIR is unset; this recipe is driven by ci-ops build-cache" >&2; exit 1; }
+    @test -n "${MESH_LLM_CACHE_PACKAGE:-}" || { echo "cache-cargo-clean: MESH_LLM_CACHE_PACKAGE is unset; this recipe is driven by ci-ops build-cache" >&2; exit 1; }
     @cargo clean --target-dir "$MESH_LLM_CACHE_TARGET_DIR" -p "$MESH_LLM_CACHE_PACKAGE"
 
 # Preview bounded, oldest-first incremental and package-aware Cargo cleanup.
 [unix]
 cache-prune-dry-run max_size="80GiB" max_age="14":
-    python3 scripts/manage-build-cache.py prune --max-size "{{ max_size }}" --max-age "{{ max_age }}"
+    just automation-run ci-ops build-cache prune --max-size "{{ trim_start_match(max_size, "max_size=") }}" --max-age "{{ trim_start_match(max_age, "max_age=") }}"
 
 # Prune only repository-local Cargo artifacts; refuses during compilation.
 [unix]
 cache-prune max_size="80GiB" max_age="14":
-    python3 scripts/manage-build-cache.py prune --execute --max-size "{{ max_size }}" --max-age "{{ max_age }}"
+    just automation-run ci-ops build-cache prune --execute --max-size "{{ trim_start_match(max_size, "max_size=") }}" --max-age "{{ trim_start_match(max_age, "max_age=") }}"
 
 # Update both tracked llama.cpp pin files from the prepared checkout.
 llama-update-pin:
     scripts/update-llama-pin.sh
+
+# Run the same focused/full native upgrade checks as the canary controller.
+[unix]
+llama-upgrade upstream backend="metal" cache=env("HF_CACHE", ""):
+    just automation-run automation canary-receipts local-upgrade --root "{{justfile_directory()}}" --upstream "{{upstream}}" --backend "{{backend}}" --cache-root "{{cache}}"
+
+[unix]
+llama-upgrade-check phase="fast" backend="metal":
+    just automation-run automation canary-receipts repair-check --root "{{justfile_directory()}}" --controller-root "{{justfile_directory()}}" --state-dir "{{justfile_directory()}}/.deps/llama-upgrade-local" --build-dir "{{justfile_directory()}}/.deps/llama-upgrade-local-native" --backend "{{backend}}" --phase "{{phase}}"
 
 # Render a Markdown summary for a llama.cpp upstream pin change.
 llama-summary old new:
@@ -73,20 +82,22 @@ test port="9337":
     curl -s http://localhost:{{ port }}/v1/chat/completions \
         -H 'Content-Type: application/json' \
         -d '{"model":"test","messages":[{"role":"user","content":"Hello! Write a haiku about distributed computing."}],"max_tokens":50}' \
-        | python3 -c "import sys,json; d=json.load(sys.stdin); t=d['timings']; print(d['choices'][0]['message'].get('content','')[:200]); print(f\"  prompt: {t['prompt_per_second']:.1f} tok/s  gen: {t['predicted_per_second']:.1f} tok/s ({t['predicted_n']} tok)\")"
+        | just with-lld cargo xtool ci-ops chat-display
 
 # Show the local llama.cpp ABI patch queue
 diff:
-    ls -1 third_party/llama.cpp/patches
+    @find skippy/llama_cpp/patches -maxdepth 1 -type f -name '*.patch' -print | sort
+    @sed 's#^#skippy/llama_cpp/patches/model_support/#' skippy/llama_cpp/patches/model_support/series
+    @sed 's#^#skippy/llama_cpp/patches/generated/#' skippy/llama_cpp/patches/generated/series
 
 # Build the client-only Docker image
 [unix]
 docker-build-client tag="mesh-llm:client":
-    DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.client -t {{ tag }} .
+    DOCKER_BUILDKIT=1 docker build -f mesh/deploy/docker/Dockerfile.client -t {{ tag }} .
 
 [windows]
 docker-build-client tag="mesh-llm:client":
-    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:DOCKER_BUILDKIT='1'; docker build -f docker/Dockerfile.client -t '{{ tag }}' ."
+    @powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:DOCKER_BUILDKIT='1'; docker build -f mesh/deploy/docker/Dockerfile.client -t '{{ tag }}' ."
 
 # Run the client console image locally
 docker-run-client tag="mesh-llm:client":
@@ -101,4 +112,4 @@ hooks-install:
 # Validate commit subjects in a range against Conventional Commits v1.0.0.
 [unix]
 check-commits range="origin/main..HEAD":
-    python3 scripts/check-conventional-commit.py --range "{{ range }}"
+    just with-lld cargo xtool repository conventional-commits --range "{{ range }}"

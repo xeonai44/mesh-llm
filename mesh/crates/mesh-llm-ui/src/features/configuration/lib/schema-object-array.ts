@@ -1,0 +1,152 @@
+import type {
+  ConfigurationSettingObjectProperty,
+  ConfigurationSettingObjectSchema,
+  ConfigurationSettingValueSchema
+} from '@/features/app-tabs/types'
+
+// Renderer id a plugin sets to get explicit-Set rows (see SchemaSetValueArrayControl).
+export const SET_VALUE_RENDERER_ID = 'set-value'
+
+export function singularItemLabel(label: string): string {
+  const noun = label.trim().split(/\s+/).at(-1) ?? 'item'
+  const singular = noun.endsWith('ies')
+    ? `${noun.slice(0, -3)}y`
+    : noun.endsWith('sses')
+      ? noun.slice(0, -2)
+      : noun.endsWith('s') && !noun.endsWith('ss')
+        ? noun.slice(0, -1)
+        : noun
+  return `${singular.charAt(0).toUpperCase()}${singular.slice(1)}`
+}
+
+export function updateObjectPath(
+  value: Record<string, unknown>,
+  path: readonly string[],
+  nextValue: unknown
+): Record<string, unknown> {
+  const [name, ...remainingPath] = path
+  if (!name) return value
+
+  if (remainingPath.length === 0) {
+    const next = { ...value }
+    if (nextValue === undefined) delete next[name]
+    else next[name] = nextValue
+    return next
+  }
+
+  const child = value[name]
+  return {
+    ...value,
+    [name]: updateObjectPath(isSchemaRecord(child) ? child : {}, remainingPath, nextValue)
+  }
+}
+
+export function isSchemaRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+// The property a set-value row commits: the first required one, and only when its schema is a plain
+// string. Anything else is not a value a text box can set, so the setting keeps its object-array rows.
+export function setValuePrimaryProperty(
+  schema: ConfigurationSettingObjectSchema
+): ConfigurationSettingObjectProperty | undefined {
+  const first = (schema.properties ?? []).find((property) => property.required)
+  if (!first) return undefined
+  const kind = first.value_schema.kind
+  return kind === 'string' || kind === 'url' || kind === 'path' || kind === 'socket_addr' ? first : undefined
+}
+
+export function objectArrayItemSchema(
+  schema: ConfigurationSettingValueSchema | undefined
+): ConfigurationSettingObjectSchema | undefined {
+  if (schema?.kind !== 'array' || schema.items.kind !== 'object') return undefined
+  return schema.items
+}
+
+export function parseSchemaObjectArrayValue(value: string): readonly Record<string, unknown>[] | undefined {
+  if (value.trim().length === 0) return []
+
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (!Array.isArray(parsed) || !parsed.every(isSchemaRecord)) return undefined
+    return parsed
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined
+    throw error
+  }
+}
+
+function requiredSchemaDefault(schema: ConfigurationSettingValueSchema): unknown {
+  switch (schema.kind) {
+    case 'boolean':
+      return false
+    case 'integer':
+    case 'float':
+      return 0
+    case 'array':
+      return []
+    case 'object':
+      return createSchemaObjectDefault(schema)
+    case 'enum':
+      return schema.values[0] ?? ''
+    case 'one_of': {
+      const firstVariant = schema.variants[0]
+      return firstVariant ? requiredSchemaDefault(firstVariant) : ''
+    }
+    case 'path':
+    case 'socket_addr':
+    case 'string':
+    case 'url':
+      return ''
+  }
+}
+
+export function createSchemaObjectDefault(schema: ConfigurationSettingObjectSchema): Record<string, unknown> {
+  const value: Record<string, unknown> = {}
+  for (const property of schema.properties ?? []) {
+    if (property.required) value[property.name] = requiredSchemaDefault(property.value_schema)
+  }
+  return value
+}
+
+export function schemaValueFromInput(schema: ConfigurationSettingValueSchema, value: string): unknown {
+  switch (schema.kind) {
+    case 'boolean':
+      return value === 'true' || value === 'on'
+    case 'integer': {
+      const parsed = Number(value)
+      return value.trim().length > 0 && Number.isInteger(parsed) ? parsed : value
+    }
+    case 'float': {
+      const parsed = Number(value)
+      return value.trim().length > 0 && Number.isFinite(parsed) ? parsed : value
+    }
+    case 'one_of': {
+      const numericVariant = schema.variants.find((variant) => variant.kind === 'integer' || variant.kind === 'float')
+      if (numericVariant && value.trim().length > 0 && Number.isFinite(Number(value))) {
+        return schemaValueFromInput(numericVariant, value)
+      }
+      const booleanVariant = schema.variants.find((variant) => variant.kind === 'boolean')
+      if (booleanVariant && ['true', 'false', 'on', 'off'].includes(value)) {
+        return schemaValueFromInput(booleanVariant, value)
+      }
+      return value
+    }
+    case 'array':
+    case 'object':
+      return value
+    case 'enum':
+    case 'path':
+    case 'socket_addr':
+    case 'string':
+    case 'url':
+      return value
+  }
+}
+
+export function schemaInputValue(value: unknown): string {
+  if (value === undefined || value === null) return ''
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return JSON.stringify(value)
+}

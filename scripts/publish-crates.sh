@@ -2,6 +2,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/lib/automation.sh"
+
 usage() {
     cat >&2 <<'USAGE'
 usage: scripts/publish-crates.sh [--dry-run] [--allow-dirty] [--resume] [--sleep-seconds N]
@@ -322,40 +326,19 @@ publish_crate_with_retry() {
 # map silently breaks the dry-run whenever a new crate joins the workspace, and
 # the failure only surfaces at release time, at the end of a long release build.
 registry_dep_pairs=""
+publication_metadata=""
 
 load_registry_dep_pairs() {
-    local metadata=""
-    if ! metadata="$(cargo metadata --format-version 1 --no-deps 2>/dev/null)"; then
+    if ! publication_metadata="$(cargo metadata --format-version 1 --no-deps --locked 2>/dev/null)"; then
         echo "failed to read cargo metadata for workspace dependency derivation" >&2
         exit 1
     fi
-    if [[ -z "$metadata" ]]; then
+    if [[ -z "$publication_metadata" ]]; then
         echo "cargo metadata returned no workspace data" >&2
         exit 1
     fi
     registry_dep_pairs="$(
-        printf '%s' "$metadata" | python3 -c '
-import json
-import sys
-
-metadata = json.load(sys.stdin)
-
-publishable = [p for p in metadata["packages"] if p.get("publish") != []]
-by_manifest_dir = {
-    p["manifest_path"].rsplit("/", 1)[0]: p["name"] for p in publishable
-}
-
-for package in publishable:
-    for dependency in package["dependencies"]:
-        if dependency.get("kind") == "dev":
-            continue
-        path = dependency.get("path")
-        if not path:
-            continue
-        name = by_manifest_dir.get(path.rstrip("/"))
-        if name and name != package["name"]:
-            print(package["name"], name)
-'
+        printf '%s' "$publication_metadata" | mesh_automation repository publish-order --dependency-pairs
     )"
 }
 
@@ -379,61 +362,80 @@ should_skip_initial_dry_run() {
 
 publish_crates=(
     mesh-llm-identity
+    skippy-events
     skippy-tokenizer
     mesh-llm-protocol
+    mesh-llm-transport
     mesh-llm-routing
+    skippy-model-ref
+    skippy-model-artifact
     mesh-llm-types
-    mesh-llm-guardrails
-    mesh-llm-plugin
+    skippy-guardrails
     mesh-native-serving-plugin-api
     mesh-llm-skills
-    mesh-llm-gpu-bench
+    skippy-gpu-bench
     skippy-ffi
     skippy-package-format
     skippy-model
     skippy-protocol
+    skippy-native-runtime
+    mesh-llm-config
+    mesh-llm-plugin
+    mesh-llm-membership
     skippy-coordinator
     skippy-topology
     skippy-metrics
     skippy-cache
-    model-ref
-    model-artifact
-    model-resolver
+    skippy-model-resolver
     mesh-llm-client
     mesh-llm-api-client
     mesh-llm-events
+    mesh-llm-control-api
     mesh-llm-runtime-event-contracts
     mesh-llm-log-store
     mesh-llm-build-info
+    mesh-llm-analytics
     mesh-llm-release-footer
-    mesh-llm-native-runtime
-    mesh-llm-config
     mesh-llm-ui
     mesh-llm-console-server
     mesh-llm-tui
-    mesh-llm-cli
-    model-hf
-    model-package
+    skippy-hf-hub
+    skippy-model-hf
+    skippy-model-package
     mesh-llm-node
     mesh-llm-api-server
-    mesh-llm-hardware-profile
+    skippy-hardware-profile
     skippy-runtime
     skippy-scheduler
-    openai-frontend
-    skippy-server
+    skippy-inference-api
+    skippy-runtime-install
+    skippy-config
+    skippy-serving
+    skippy-api
+    mesh-llm-skippy-adapter
+    skippy-commands
+    mesh-llm-cli
+    skippy-cli
     mesh-native-serving-plugin-host
     mesh-llm-plugin-manager
     mesh-mixture-of-agents
-    mesh-llm-runtime-install
+    mesh-llm-moa-plugin
     mesh-llm-system
     mesh-llm-host-runtime
     mesh-llm-embedded-runtime
     mesh-llm-sdk
 )
 
-if [[ "$dry_run" -eq 1 ]]; then
-    load_registry_dep_pairs
-fi
+load_registry_dep_pairs
+selected_roster="$(
+    printf '%s' "$publication_metadata" \
+        | mesh_automation repository publish-order --selected-script "$PWD/scripts/publish-crates.sh" --source-root "$PWD"
+)"
+publish_crates=()
+while IFS= read -r crate; do
+    [[ -n "$crate" ]] || continue
+    publish_crates+=("$crate")
+done <<< "$selected_roster"
 
 for index in "${!publish_crates[@]}"; do
     crate="${publish_crates[$index]}"

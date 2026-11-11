@@ -10,6 +10,12 @@ release, deployment, or CI script:
 4. For PR/main composition, routing, fan-out, or provider changes, follow
    `.omo/specs/pr-ci-optimization.md`.
 
+For new CI automation, follow the Rust ownership rule in the manage-ci skill:
+use typed `tools/xtask` commands through thin Just recipes. From the repository
+root, `cargo xtool repo-consistency ci-crate-lists` runs an existing check.
+Keep current Python validation and the five PR/main entrypoints in place until
+their Rust replacements pass parity checks; do not add new Python helpers.
+
 Strict extension pattern:
 
 - keep event entrypoints thin;
@@ -37,12 +43,27 @@ Permanent Depot PR execution still requires the cache and runner-group
 isolation gates in `ci/DEPOT_MIGRATION.md`. Do not change Depot settings or
 runner groups as part of an ordinary CI refactor.
 
-Preserve the five-entry PR shape exactly. Do not create an all-platform PR
-workflow, an all-lanes reusable composer, or a PR controller whose visible job
-only dispatches detached runs. Quality, Website, Linux, macOS, and Windows must
-remain separate PR-associated workflows with directly drillable nested jobs
-and one stable `PR / <lane>` result each. Do not add path filters; planning owns
-skips so every stable result exists.
+Preserve the five-entry required PR shape exactly. Do not create an all-platform
+PR workflow, an all-lanes reusable composer, or a PR controller whose visible
+job only dispatches detached runs. Quality, Website, Linux, macOS, and Windows
+must remain separate PR-associated workflows with directly drillable nested
+jobs and one stable `PR / <lane>` result each. Do not add path filters; planning
+owns skips so every stable result exists.
+
+The optional `pr_ci_canary.yml` diagnostic is the narrow exception to the
+five-entry census. It is label-gated by `ci:canary`, non-required, and must stay
+separate from the five required workflows and the sibling-canceller target
+list. It calls the protected `main`-owned canary lane, which builds the
+pull-request merge source through a fixed Linux amd64 CPU UI/host/runtime/product
+chain while keeping runner-policy checkouts on `main`. It uses read-only
+contents/packages permissions, no secrets or environments, and a plain
+step-summary result. It must not request `checks: write`, use `secrets: inherit`,
+select Depot or a persistent self-hosted runner, or execute macOS, Windows, GPU,
+SDK, smoke, or release graphs. Unrelated label events must not cancel an active
+canary; removing the `ci:canary` label may use an active-group no-op to cancel
+it. The protected workflow reference and policy checkout are the security
+boundary for runner-owning jobs; no canary rollout authorizes an unrestricted
+shared persistent runner group.
 
 The protected `workflow_run` sibling-failure monitor is control infrastructure,
 not a sixth PR validation entrypoint. It may cancel only queued or in-progress

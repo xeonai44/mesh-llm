@@ -1,5 +1,8 @@
+#[path = "repo_consistency/product_documentation.rs"]
+mod product_documentation;
+
 use crate::command::{DynResult, ensure_eq, ensure_set_eq, run_command, trimmed_stderr_or_stdout};
-use crate::{publish_consistency, release_targets, workflow_checks};
+use crate::{ci_validation, publish_consistency, release_targets};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -16,13 +19,13 @@ pub(crate) fn check_attestation_default_version(repo_root: &Path) -> DynResult<(
     )
 }
 
-pub(crate) fn default_node_version() -> DynResult<String> {
-    host_runtime_package_version(&repo_root()?)
+pub(crate) fn default_node_version(repo_root: &Path) -> DynResult<String> {
+    host_runtime_package_version(repo_root)
 }
 
 fn resolve_runtime_version(repo_root: &Path) -> DynResult<String> {
     let runtime_lib = repo_root
-        .join("crates")
+        .join("mesh/crates")
         .join("mesh-llm-host-runtime")
         .join("src")
         .join("lib.rs");
@@ -53,7 +56,7 @@ fn extract_runtime_version(repo_root: &Path, contents: &str) -> DynResult<String
 
 pub(crate) fn host_runtime_package_version(repo_root: &Path) -> DynResult<String> {
     let runtime_manifest = repo_root
-        .join("crates")
+        .join("mesh/crates")
         .join("mesh-llm-host-runtime")
         .join("Cargo.toml");
     let runtime_contents = fs::read_to_string(runtime_manifest)?;
@@ -97,12 +100,9 @@ pub(crate) fn host_supports_shell_parity_checks() -> bool {
 }
 
 pub(crate) fn repo_root() -> DynResult<PathBuf> {
-    // CARGO_MANIFEST_DIR is <repo>/tools/xtask; go up two levels to reach the repo root.
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "could not determine repo root from xtask manifest directory".into())
+    Ok(crate::repository::RepositoryRoot::resolve(None)?
+        .as_path()
+        .to_path_buf())
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,35 +233,38 @@ fn check_subset(
     .into())
 }
 
-pub(crate) fn check_release_targets_command() -> DynResult<()> {
-    release_targets::check_release_targets()
+pub(crate) fn check_release_targets_command(repo_root: &Path) -> DynResult<()> {
+    release_targets::check_release_targets(repo_root)
 }
 
-pub(crate) fn check_ci_crate_lists_command() -> DynResult<()> {
-    let repo_root = repo_root()?;
-    workflow_checks::check_ci_script_workspace_members(&repo_root)?;
-    workflow_checks::check_ci_crate_test_coverage_files(&repo_root)?;
-    check_attestation_default_version(&repo_root)?;
-    check_runtime_event_abi_mirror(&repo_root)?;
+pub(crate) fn check_ci_crate_lists_command(repo_root: &Path) -> DynResult<()> {
+    ci_validation::check_ci_script_workspace_members(repo_root)?;
+    ci_validation::check_ci_crate_test_coverage_files(repo_root)?;
+    ci_validation::check_python_tooling(repo_root)?;
+    check_attestation_default_version(repo_root)?;
+    check_runtime_event_abi_mirror(repo_root)?;
+    product_documentation::check(repo_root)?;
     println!("repo consistency checks passed: ci-crate-lists");
     Ok(())
 }
 
 /// `mesh-llm-runtime-event-contracts` (a publishable dependency-leaf crate)
-/// mirrors the raw ABI struct `skippy_ffi::abi::SkippyRuntimeEventV1` in its
-/// own test fixture `RawNativeEventV1Fixture` rather than reading
-/// `skippy-ffi`'s source directly, because a published crate tarball
-/// contains only its own package root (see
-/// `publish_consistency::check_publish_literal_includes`). This check keeps
-/// that mirror honest by comparing both structs' field names, in
-/// declaration order, from this dev-only cross-crate-aware binary.
+/// mirrors the raw ABI struct `skippy_runtime_event_v1` in its own test
+/// fixture `RawNativeEventV1Fixture` rather than reading `skippy-ffi`'s
+/// source directly, because a published crate tarball contains only its own
+/// package root (see `publish_consistency::check_publish_literal_includes`).
+/// The ABI struct is bindgen-generated, so this check reads the committed
+/// bindings (the source of truth for the layout) and keeps the mirror honest
+/// by comparing both structs' field names, in declaration order, from this
+/// dev-only cross-crate-aware binary.
 fn check_runtime_event_abi_mirror(repo_root: &Path) -> DynResult<()> {
-    let abi_relative = Path::new("crates/skippy-ffi/src/abi.rs");
+    let abi_relative = Path::new("skippy/crates/skippy-ffi/src/bindings/skippy.rs");
     let abi_source = fs::read_to_string(repo_root.join(abi_relative))?;
-    let abi_fields = struct_field_names(&abi_source, "pub struct SkippyRuntimeEventV1 {")
+    let abi_fields = struct_field_names(&abi_source, "pub struct skippy_runtime_event_v1 {")
         .map_err(|error| format!("{}: {error}", abi_relative.display()))?;
 
-    let mirror_relative = Path::new("crates/mesh-llm-runtime-event-contracts/src/tests/native.rs");
+    let mirror_relative =
+        Path::new("mesh/crates/mesh-llm-runtime-event-contracts/src/tests/native.rs");
     let mirror_source = fs::read_to_string(repo_root.join(mirror_relative))?;
     let mirror_fields = struct_field_names(&mirror_source, "struct RawNativeEventV1Fixture {")
         .map_err(|error| format!("{}: {error}", mirror_relative.display()))?;
@@ -269,7 +272,7 @@ fn check_runtime_event_abi_mirror(repo_root: &Path) -> DynResult<()> {
     ensure_eq(
         &abi_fields.join(", "),
         &mirror_fields.join(", "),
-        "skippy-ffi SkippyRuntimeEventV1 fields mirrored by mesh-llm-runtime-event-contracts RawNativeEventV1Fixture",
+        "skippy_runtime_event_v1 fields mirrored by mesh-llm-runtime-event-contracts RawNativeEventV1Fixture",
     )
 }
 
@@ -308,16 +311,14 @@ fn struct_field_names(source: &str, decl_marker: &str) -> DynResult<Vec<String>>
     Ok(fields)
 }
 
-pub(crate) fn check_publish_crates_command() -> DynResult<()> {
-    let repo_root = repo_root()?;
-    publish_consistency::check_publish_crates_consistency(&repo_root)?;
+pub(crate) fn check_publish_crates_command(repo_root: &Path) -> DynResult<()> {
+    publish_consistency::check_publish_crates_consistency(repo_root)?;
     println!("repo consistency checks passed: publish-crates");
     Ok(())
 }
 
-pub(crate) fn check_test_all_coverage_command() -> DynResult<()> {
-    let repo_root = repo_root()?;
-    let workspace_crates = workspace_package_names(&repo_root)?;
+pub(crate) fn check_test_all_coverage_command(repo_root: &Path) -> DynResult<()> {
+    let workspace_crates = workspace_package_names(repo_root)?;
     let test_all_source = fs::read_to_string(repo_root.join("just/ci.just"))?;
     let (dynamic_targets, excluded_targets, isolated_targets) =
         test_all_test_targets(&test_all_source)?;
@@ -507,3 +508,11 @@ test-all:
         assert_eq!(actual_isolated, isolated);
     }
 }
+
+#[cfg(test)]
+#[path = "repo_consistency/logging_contracts.rs"]
+mod logging_contracts;
+
+#[cfg(test)]
+#[path = "repo_consistency/synthetic_graph_contracts.rs"]
+mod synthetic_graph_contracts;

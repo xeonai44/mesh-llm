@@ -1,0 +1,574 @@
+use super::common::{
+    ResponseRetryPolicy, RouteAttemptLoggingContext, RouteAttemptResult,
+    retryable_route_result_from_error,
+};
+use super::dispatch::{RelayAttemptContext, relay_attempted_response};
+use super::probe::probe_http_response;
+use super::served_model_headers::set_served_model_headers;
+use crate::logging::OpenAiRouteObserver;
+use crate::network::openai::client_stream::ClientStream;
+use crate::network::openai::forwarded_request::is_ingress_credential_header;
+use crate::network::openai::request_normalize::ResponseAdapter;
+use anyhow::{Context, Result};
+use mesh_llm_events::logging::identifiers::RequestId;
+use tokio::io::AsyncWriteExt;
+use url::Url;
+
+struct ExternalEndpointTarget {
+    host: String,
+    port: u16,
+    forwarded: Vec<u8>,
+}
+
+pub(in crate::network::openai) async fn route_http_endpoint_attempt(
+    tcp_stream: &mut ClientStream,
+    base_url: &str,
+    prefetched: &[u8],
+    request_path: &str,
+    logging: RouteAttemptLoggingContext<'_>,
+) -> RouteAttemptResult {
+    let RouteAttemptLoggingContext {
+        request_id,
+        retry_policy,
+        response_adapter,
+        route_observer,
+        served_by: _,
+        peer_capsule_id: _,
+    } = logging;
+    let target = match build_external_endpoint_target(base_url, request_path, prefetched) {
+        Ok(target) => target,
+        Err(()) => return RouteAttemptResult::RetryableUnavailable,
+    };
+    let mut upstream = match connect_external_endpoint(base_url, &target).await {
+        Ok(upstream) => upstream,
+        Err(result) => return result,
+    };
+    if let Err(result) = forward_external_endpoint_request(&mut upstream, base_url, &target).await {
+        return result;
+    }
+    route_http_endpoint_attempt_after_forward(
+        tcp_stream,
+        &mut upstream,
+        base_url,
+        request_id,
+        retry_policy,
+        response_adapter,
+        route_observer,
+    )
+    .await
+}
+
+// `RouteAttemptResult` is deliberately `Copy`; its usage-plus-output-digests variant
+// (three optional 32-byte digests inline) exceeds clippy's 128-byte `Err` threshold.
+#[allow(clippy::result_large_err)]
+async fn connect_external_endpoint(
+    base_url: &str,
+    target: &ExternalEndpointTarget,
+) -> std::result::Result<ClientStream, RouteAttemptResult> {
+    match ClientStream::connect(format!("{}:{}", target.host, target.port)).await {
+        Ok(upstream) => Ok(upstream),
+        Err(err) => {
+            tracing::warn!(
+                "API proxy: can't reach external inference endpoint {}: {}",
+                base_url,
+                err
+            );
+            Err(if err.kind() == std::io::ErrorKind::TimedOut {
+                RouteAttemptResult::RetryableTimeout
+            } else {
+                RouteAttemptResult::RetryableUnavailable
+            })
+        }
+    }
+}
+
+// `RouteAttemptResult` is deliberately `Copy`; its usage-plus-output-digests variant
+// (three optional 32-byte digests inline) exceeds clippy's 128-byte `Err` threshold.
+#[allow(clippy::result_large_err)]
+async fn forward_external_endpoint_request(
+    upstream: &mut ClientStream,
+    base_url: &str,
+    target: &ExternalEndpointTarget,
+) -> std::result::Result<(), RouteAttemptResult> {
+    let _ = upstream.set_nodelay(true);
+    match upstream.write_all(&target.forwarded).await {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            tracing::warn!(
+                "API proxy: failed to forward buffered request to external endpoint {}: {}",
+                base_url,
+                err
+            );
+            Err(RouteAttemptResult::RetryableUnavailable)
+        }
+    }
+}
+
+async fn route_http_endpoint_attempt_after_forward(
+    tcp_stream: &mut ClientStream,
+    upstream: &mut ClientStream,
+    base_url: &str,
+    request_id: RequestId,
+    retry_policy: ResponseRetryPolicy,
+    response_adapter: ResponseAdapter,
+    route_observer: OpenAiRouteObserver<'_>,
+) -> RouteAttemptResult {
+    match probe_http_response(upstream).await {
+        Ok(mut probe) => {
+            // A plugin backend is not this node's native runtime, so any
+            // served-model headers it sent are its own claims: strip them
+            // before a mesh peer reads this response as the node's.
+            set_served_model_headers(&mut probe, None);
+            let result = relay_attempted_response(
+                tcp_stream,
+                upstream,
+                probe,
+                RelayAttemptContext {
+                    request_id,
+                    disconnect_message: "API proxy (external endpoint): downstream client disconnected during relay",
+                    commit_message: "API proxy (external endpoint) ended after commit",
+                    served_by: None,
+                    route_observer,
+                },
+                retry_policy,
+                response_adapter,
+            )
+            .await;
+            if matches!(result, RouteAttemptResult::ClientDisconnected) {
+                let _ = upstream.shutdown().await;
+            }
+            result
+        }
+        Err(err) => {
+            tracing::warn!(
+                "API proxy: failed to read response from external endpoint {}: {}",
+                base_url,
+                err
+            );
+            retryable_route_result_from_error(&err)
+        }
+    }
+}
+
+fn build_external_endpoint_target(
+    base_url: &str,
+    request_path: &str,
+    prefetched: &[u8],
+) -> std::result::Result<ExternalEndpointTarget, ()> {
+    validate_external_endpoint_request_path(request_path)?;
+    let (url, host) = parse_external_endpoint_url(base_url)?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    let forward_path = endpoint_forward_path(&url, request_path);
+    let forwarded =
+        rewrite_external_endpoint_request(base_url, prefetched, &forward_path, &host, port)?;
+    Ok(ExternalEndpointTarget {
+        host,
+        port,
+        forwarded,
+    })
+}
+
+/// Only OpenAI-compatible inference routes may be forwarded to an external
+/// backend. The client picks the path and the model; the model selects the
+/// backend, so without this gate any other route the backend happens to serve
+/// on that listener (admin, metrics, debug) would be reachable through the
+/// mesh ingress.
+fn is_forwardable_external_endpoint_path(request_path: &str) -> bool {
+    let path_only = request_path.split('?').next().unwrap_or(request_path);
+    crate::network::openai::workload_routing::request_workload_class(path_only).is_some()
+        || matches!(path_only, "/v1/messages" | "/v1/models" | "/models")
+}
+
+fn validate_external_endpoint_request_path(request_path: &str) -> std::result::Result<(), ()> {
+    if is_forwardable_external_endpoint_path(request_path) {
+        return Ok(());
+    }
+    tracing::warn!(
+        "API proxy: refusing to forward non-inference path '{request_path}' to external inference endpoint"
+    );
+    Err(())
+}
+
+fn parse_external_endpoint_url(base_url: &str) -> std::result::Result<(Url, String), ()> {
+    let url = parse_external_endpoint_base_url(base_url)?;
+    validate_external_endpoint_scheme(base_url, &url)?;
+    let host = parse_external_endpoint_host(base_url, &url)?;
+    Ok((url, host))
+}
+
+fn parse_external_endpoint_base_url(base_url: &str) -> std::result::Result<Url, ()> {
+    Url::parse(base_url).map_err(|err| {
+        tracing::warn!("API proxy: invalid external inference endpoint '{base_url}': {err}");
+    })
+}
+
+fn validate_external_endpoint_scheme(base_url: &str, url: &Url) -> std::result::Result<(), ()> {
+    if url.scheme() == "http" {
+        return Ok(());
+    }
+    tracing::warn!(
+        "API proxy: unsupported external inference endpoint scheme '{}' for {}",
+        url.scheme(),
+        base_url
+    );
+    Err(())
+}
+
+fn parse_external_endpoint_host(base_url: &str, url: &Url) -> std::result::Result<String, ()> {
+    url.host_str().map(str::to_string).ok_or_else(|| {
+        tracing::warn!("API proxy: missing host in external inference endpoint {base_url}");
+    })
+}
+
+fn rewrite_external_endpoint_request(
+    base_url: &str,
+    prefetched: &[u8],
+    forward_path: &str,
+    host: &str,
+    port: u16,
+) -> std::result::Result<Vec<u8>, ()> {
+    match rewrite_http_request_target(prefetched, forward_path, host, port) {
+        Ok(forwarded) => Ok(forwarded),
+        Err(err) => {
+            tracing::warn!(
+                "API proxy: failed to rewrite buffered request for external endpoint {}: {}",
+                base_url,
+                err
+            );
+            Err(())
+        }
+    }
+}
+
+fn endpoint_forward_path(base_url: &Url, request_path: &str) -> String {
+    let (path_only, query) = request_path
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((request_path, None));
+    let base_path = base_url.path().trim_end_matches('/');
+    let mapped_path = if base_path.is_empty() || base_path == "/" {
+        path_only.to_string()
+    } else if let Some(suffix) = path_only.strip_prefix("/v1") {
+        if base_path.ends_with("/v1") {
+            format!("{base_path}{suffix}")
+        } else {
+            format!("{base_path}/v1{suffix}")
+        }
+    } else if let Some(suffix) = path_only.strip_prefix("/models") {
+        format!("{base_path}{suffix}")
+    } else {
+        format!("{base_path}{path_only}")
+    };
+    match query {
+        Some(query) if !query.is_empty() => format!("{mapped_path}?{query}"),
+        _ => mapped_path,
+    }
+}
+
+fn rewrite_http_request_target(
+    raw: &[u8],
+    new_path: &str,
+    host: &str,
+    port: u16,
+) -> Result<Vec<u8>> {
+    let header_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|idx| idx + 4)
+        .context("missing HTTP header terminator")?;
+    let header_text =
+        std::str::from_utf8(&raw[..header_end - 4]).context("invalid HTTP headers")?;
+    let mut lines = header_text.split("\r\n");
+    let request_line = lines.next().context("missing HTTP request line")?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().context("missing HTTP method")?;
+    let _old_path = request_parts.next().context("missing HTTP path")?;
+    let version = request_parts.next().unwrap_or("HTTP/1.1");
+
+    let mut rebuilt = format!("{method} {new_path} {version}\r\n");
+    let mut saw_host = false;
+    for line in lines {
+        if let Some((name, _value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("host") {
+                rebuilt.push_str(&format!("Host: {host}:{port}\r\n"));
+                saw_host = true;
+                continue;
+            }
+            // The external endpoint is a nonlocal hop, so it gets the same
+            // credential policy as a peer forward: the caller authenticated to
+            // this node, not to the operator's upstream server, and this hop is
+            // plaintext HTTP (#2210).
+            if is_ingress_credential_header(name) {
+                continue;
+            }
+        }
+        rebuilt.push_str(line);
+        rebuilt.push_str("\r\n");
+    }
+    if !saw_host {
+        rebuilt.push_str(&format!("Host: {host}:{port}\r\n"));
+    }
+    rebuilt.push_str("\r\n");
+
+    let mut bytes = rebuilt.into_bytes();
+    bytes.extend_from_slice(&raw[header_end..]);
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Serve `response` from a plugin backend to a mesh client and return the
+    /// bytes the client received.
+    async fn relay_plugin_response(response: &str) -> String {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_address = client_listener.local_addr().unwrap();
+        let response = response.to_owned();
+        tokio::spawn(async move {
+            let (mut backend, _) = upstream_listener.accept().await.unwrap();
+            backend.write_all(response.as_bytes()).await.unwrap();
+        });
+        let relay = tokio::spawn(async move {
+            let (client, _) = client_listener.accept().await.unwrap();
+            let mut client: ClientStream = client.into();
+            let mut upstream: ClientStream =
+                TcpStream::connect(upstream_address).await.unwrap().into();
+            route_http_endpoint_attempt_after_forward(
+                &mut client,
+                &mut upstream,
+                "http://plugin.test",
+                RequestId::new(),
+                ResponseRetryPolicy::next_target_available(false),
+                ResponseAdapter::None,
+                OpenAiRouteObserver::default(),
+            )
+            .await
+        });
+        let mut socket = TcpStream::connect(client_address).await.unwrap();
+        let mut relayed = Vec::new();
+        socket.read_to_end(&mut relayed).await.unwrap();
+        relay.await.unwrap();
+        String::from_utf8(relayed).unwrap()
+    }
+
+    /// A plugin backend's served-model headers are its own claims, not this
+    /// node's: they never reach a mesh peer that reads the response as ours.
+    #[tokio::test]
+    async fn a_plugin_backends_served_model_headers_are_stripped() {
+        let body = r#"{"id":"c","object":"chat.completion","choices":[]}"#;
+        let relayed = relay_plugin_response(&format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             x-mesh-weights-digest: forged\r\nx-mesh-model-canonical-ref: forged/ref\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        assert!(relayed.starts_with("HTTP/1.1 200 OK"), "{relayed}");
+        assert!(
+            !relayed.to_ascii_lowercase().contains("x-mesh-"),
+            "{relayed}"
+        );
+        assert!(relayed.ends_with(body));
+    }
+
+    #[test]
+    fn external_endpoint_target_only_accepts_openai_inference_routes() {
+        for path in [
+            "/v1/chat/completions",
+            "/v1/completions?trace=1",
+            "/v1/responses",
+            "/v1/embeddings",
+            "/v1/rerank",
+            "/v1/audio/speech",
+            "/v1/audio/transcriptions",
+            "/v1/messages",
+            "/v1/models",
+            "/models",
+        ] {
+            assert!(
+                is_forwardable_external_endpoint_path(path),
+                "{path} must be forwardable"
+            );
+            assert!(
+                build_external_endpoint_target(
+                    "http://127.0.0.1:9/",
+                    path,
+                    b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+                )
+                .is_ok()
+            );
+        }
+        for path in [
+            "/admin",
+            "/metrics",
+            "/v1/admin/keys",
+            "/v1/models/../admin",
+            "/",
+            "",
+        ] {
+            assert!(
+                !is_forwardable_external_endpoint_path(path),
+                "{path} must be refused"
+            );
+            assert!(
+                build_external_endpoint_target(
+                    "http://127.0.0.1:9/",
+                    path,
+                    b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_endpoint_forward_path_maps_v1_requests_onto_api_v1_base() {
+        let url = Url::parse("http://localhost:8000/api/v1").unwrap();
+        let forwarded = endpoint_forward_path(&url, "/v1/chat/completions?stream=true");
+        assert_eq!(forwarded, "/api/v1/chat/completions?stream=true");
+    }
+
+    #[test]
+    fn test_rewrite_http_request_target_updates_request_line_and_host() {
+        let raw = b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost:9337\r\nx-request-id: 4c3ca94d-bc1f-4759-912d-f4f6d77d5515\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+        let rewritten =
+            rewrite_http_request_target(raw, "/api/v1/chat/completions", "localhost", 8000)
+                .unwrap();
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        assert!(rewritten.starts_with("POST /api/v1/chat/completions HTTP/1.1\r\n"));
+        assert!(rewritten.contains("\r\nHost: localhost:8000\r\n"));
+        assert!(rewritten.contains("\r\nx-request-id: 4c3ca94d-bc1f-4759-912d-f4f6d77d5515\r\n"));
+        assert!(rewritten.ends_with("\r\n\r\n{}"));
+    }
+
+    /// Capture the exact bytes one forwarded request writes to the upstream
+    /// socket, then answer with a minimal JSON completion so the relay runs to
+    /// completion.
+    fn strip_trailing_cr(line: &[u8]) -> &[u8] {
+        let mut end = line.len();
+        while end > 0 && line[end - 1] == b'\r' {
+            end -= 1;
+        }
+        &line[..end]
+    }
+
+    async fn capture_one_forwarded_request(sink: &tokio::net::TcpListener) -> (Vec<u8>, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut upstream, _) = sink.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if upstream.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        let declared = head
+            .split(|b| *b == b'\n')
+            .find_map(|line| {
+                let line = strip_trailing_cr(line);
+                line.get(..15)
+                    .filter(|prefix| prefix.eq_ignore_ascii_case(b"content-length:"))
+                    .and_then(|_| std::str::from_utf8(&line[15..]).ok())
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; declared];
+        upstream.read_exact(&mut body).await.unwrap();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let _ = upstream.write_all(response).await;
+        let _ = upstream.shutdown().await;
+        (head, body)
+    }
+
+    /// Regression (#2210): the external endpoint is a nonlocal hop. A caller's
+    /// ingress credential must never be rewritten onto the plaintext upstream
+    /// connection in any header casing, while the rewritten request line, the
+    /// rewritten `Host`, every unrelated header, and the body stay intact.
+    #[tokio::test]
+    async fn external_endpoint_forward_strips_caller_credentials() {
+        let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = sink.local_addr().unwrap().port();
+        let body = br#"{"model":"sink-model","input":"Authorization: Bearer inside-the-body"}"#;
+        let mut prefetched = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: caller-facing:9337\r\naUtHoRiZaTiOn: Bearer caller-secret\r\nPROXY-AUTHORIZATION: Basic proxy-secret\r\nX-API-Key: anthropic-secret\r\napi-key: azure-secret\r\nX-Trace-Id: trace-123\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        prefetched.extend_from_slice(body);
+
+        let base_url = format!("http://127.0.0.1:{port}/");
+        let mut downstream = ClientStream::Null;
+        let (captured, attempt) = tokio::join!(
+            capture_one_forwarded_request(&sink),
+            route_http_endpoint_attempt(
+                &mut downstream,
+                &base_url,
+                &prefetched,
+                "/v1/chat/completions",
+                RouteAttemptLoggingContext {
+                    request_id: RequestId::new(),
+                    retry_policy: ResponseRetryPolicy::next_target_available(false),
+                    response_adapter: ResponseAdapter::OpenAiChatCompletionsJson,
+                    route_observer: OpenAiRouteObserver::default(),
+                    served_by: None,
+                    peer_capsule_id: None,
+                },
+            )
+        );
+        assert!(
+            matches!(
+                attempt,
+                RouteAttemptResult::Delivered {
+                    status_code: 200,
+                    ..
+                }
+            ),
+            "{attempt:?}"
+        );
+
+        let (head, forwarded_body) = captured;
+        let head = String::from_utf8(head).unwrap();
+        let lowered = head.to_ascii_lowercase();
+        for secret in [
+            "caller-secret",
+            "proxy-secret",
+            "anthropic-secret",
+            "azure-secret",
+        ] {
+            assert!(
+                !head.contains(secret),
+                "credential {secret} reached the external endpoint:\n{head}"
+            );
+        }
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "api-key",
+        ] {
+            assert!(
+                !lowered.contains(&format!("{name}:")),
+                "{name} reached the external endpoint:\n{head}"
+            );
+        }
+        assert!(
+            head.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains(&format!("\r\nHost: 127.0.0.1:{port}\r\n")),
+            "{head}"
+        );
+        assert!(head.contains("\r\nX-Trace-Id: trace-123\r\n"), "{head}");
+        assert!(
+            head.contains("\r\nContent-Type: application/json\r\n"),
+            "{head}"
+        );
+        assert_eq!(forwarded_body, body);
+    }
+}

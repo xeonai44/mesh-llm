@@ -1,0 +1,146 @@
+pub(crate) mod activity_policy;
+mod auto_join;
+mod capacity;
+pub(crate) mod config_state;
+mod context_planning;
+mod control_loop;
+mod daemon_startup;
+mod dashboard;
+mod discovery;
+mod embedded_readiness;
+mod failed_node_start;
+pub mod instance;
+mod instance_lifecycle;
+mod interactive;
+mod join_sources;
+pub(crate) mod kv_disk_config;
+pub(crate) mod live_request_defaults;
+mod local;
+mod local_dflash_plan;
+mod local_laya;
+mod local_memory_plan;
+mod local_model_only;
+mod local_package;
+mod local_speech;
+mod local_split;
+mod memberships;
+mod model_lifecycle;
+mod model_presentation;
+pub(crate) mod model_reconciliation;
+pub(crate) mod native_model_lifecycle;
+mod node_lifecycle_events;
+mod operational_logging;
+mod options;
+mod passive_readiness;
+mod pi_models;
+mod plugin_host_role;
+pub(crate) mod proxy;
+mod publication;
+mod release_attestation;
+mod run_auto;
+mod runtime_registry;
+pub(crate) mod serving_strategy;
+pub use serving_strategy::ServingStrategy;
+
+/// The split placement policy implied by these launch options.
+///
+/// Derived at each point of use rather than stored on [`RuntimeOptions`]: it is
+/// a pure function of `auto_balance`, `split` and `strategy`, and a cached copy
+/// on a public options struct is a field callers can set and a value that can
+/// go stale.
+pub(crate) fn placement_policy_for(
+    options: &RuntimeOptions,
+) -> split_planning::SplitPlacementPolicy {
+    serving_strategy::strategy_placement_policy(
+        options.strategy,
+        serving_strategy::StrategyContext {
+            split: options.split,
+            auto_balance_requested: options.auto_balance,
+        },
+    )
+}
+mod serving_surface;
+pub mod shared_serving;
+mod shutdown_signal;
+mod split_participant_settle;
+mod split_planning;
+mod split_topology_lock;
+pub(crate) mod stage_admission;
+mod startup_handles;
+mod startup_identity;
+mod startup_models;
+mod startup_retry;
+mod startup_update_check;
+mod status;
+pub(crate) mod survey;
+#[cfg(test)]
+mod tests;
+mod tracing_writer;
+pub(crate) mod wakeable;
+
+pub(crate) use self::capacity::runtime_model_required_bytes;
+use self::capacity::{
+    RuntimeCapacityLedger, RuntimeCapacityPool, RuntimeCapacityReservation,
+    model_fits_runtime_capacity,
+};
+use self::context_planning::RuntimeResourcePlanningProfile;
+pub(crate) use self::dashboard::runtime_status_from_process_status;
+use self::discovery::{lan_rediscovery, nostr_rediscovery, start_new_mesh};
+pub(crate) use self::instance_lifecycle::{
+    DrainCoordinator, DrainResult, InstanceAdmissionError, InstanceLifecycleRecord,
+    InstanceLifecycleState, InstanceRequestGuard,
+};
+use self::interactive::InitialPromptMode;
+use self::local::{
+    LocalOpenAiModelStartSpec, LocalRuntimeModelHandle, LocalRuntimeModelStartSpec,
+    ManagedModelController, OpenAiGuardrailPolicyHandle, RuntimeEvent, RuntimeModelSizing,
+    SplitCoordinatorAck, SplitCoordinatorEvent, SplitRuntimeReason, SplitRuntimeStart,
+    StartupRuntimePlan, add_runtime_local_target, add_serving_assignment, advertise_model_ready,
+    local_process_payload, openai_guardrail_policy_handle, remove_runtime_local_target,
+    remove_serving_assignment, resolved_model_name, runtime_model_sizing,
+    set_advertised_model_context, set_openai_guardrail_policy_mode,
+    set_runtime_verified_served_model_capabilities, start_local_openai_model,
+    start_runtime_local_model, start_runtime_split_model, startup_runtime_plan,
+    stop_split_generation_cleanup, withdraw_advertised_model,
+};
+use self::local_model_only::*;
+pub use self::memberships::{MeshMembershipConfig, MeshMembershipStatus};
+pub(crate) use self::model_reconciliation::{
+    DesiredRuntimeIntent, IntentPersistence, IntentSource, ModelIntent,
+    ModelTargetReconciliationAction, ModelTargetReconciliationCandidate,
+    ModelTargetReconciliationCapacityState, ModelTargetReconciliationInput,
+    ModelTargetReconciliationPolicy, ModelTargetReconciliationState, current_time_secs,
+    plan_model_target_reconciliation,
+};
+pub use self::options::{MeshGuardrailMode, RuntimeOptions, RuntimeSurface};
+use self::proxy::{api_proxy, bootstrap_proxy};
+use mesh_llm_events::{ConsoleSessionMode, sort_dashboard_endpoint_rows};
+pub(crate) use mesh_llm_node::serving::{UnloadOptions, UnloadTarget};
+
+pub(crate) use self::activity_policy::{ActivityPolicyGuard, AdmissionResult, IngressType};
+pub use self::auto_join::console_session_mode_for_runtime_surface;
+use self::auto_join::*;
+use self::control_loop::*;
+use self::dashboard::*;
+pub use self::discovery::nostr_relays;
+pub(crate) use self::embedded_readiness::EmbeddedRuntimeReadiness;
+use self::model_lifecycle::*;
+pub(crate) use self::operational_logging::{
+    NativeSkippyOperationalEvent, RuntimeOperationalEvent, record_native_skippy_operational_event,
+    record_runtime_operational_event, record_runtime_operational_event_with_context,
+};
+use self::pi_models::update_pi_models_json;
+use self::publication::*;
+pub use self::run_auto::load_resolved_plugins;
+use self::run_auto::*;
+pub(crate) use self::run_auto::{
+    EmbeddedRuntimeDiscoveryMode, EmbeddedRuntimeMode, EmbeddedRuntimeOptions, run, run_cli,
+    run_embedded_runtime,
+};
+use self::runtime_registry::*;
+use self::serving_surface::*;
+use self::shutdown_signal::*;
+use self::startup_handles::*;
+pub(crate) use self::startup_models::StartupPinnedGpuTarget;
+use self::startup_models::*;
+use self::tracing_writer::*;

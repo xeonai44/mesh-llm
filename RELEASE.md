@@ -1,21 +1,45 @@
 # Releasing mesh-llm
 
-## Preferred path: dispatch from GitHub
+## Prepare protected main, then dispatch
 
-Releases are normally cut by running the **Release** workflow
-(`.github/workflows/release.yml`) from the GitHub Actions UI via
-`workflow_dispatch` with the version input (for example `v0.31.0`). The
-dispatched workflow uses `scripts/release-version.sh` as the single version
-authority, commits the complete tracked version update to `main`, and only then
-starts the release build. It later generates and patches the SwiftPM manifest,
-packages SDK console assets, creates and pushes the release tag, builds all
-platform bundles, publishes the GitHub release, and asks GitHub to generate the
-release notes against the highest stable SemVer tag below the target. RC tags
+When `main` requires pull requests and successful checks, prepare the release
+version in a PR before dispatching the **Release** workflow
+(`.github/workflows/release.yml`). `scripts/release-version.sh` is the single
+version authority. From a release-preparation branch, run:
+
+```bash
+scripts/release-version.sh v0.79.0-rc1
+cargo fmt --all --check
+just check-release
+just ci-validate
+```
+
+Review the complete generated version diff, run the additional checks required
+by the changed files, and merge the PR after its required checks pass. Then
+update a clean local `main` and dispatch the release:
+
+```bash
+git pull --ff-only
+just release 0.79.0-rc1
+```
+
+Use the same preparation process for the final version, such as `0.79.0`.
+The workflow reapplies the version script before building. With the complete
+version update already on `main`, this is idempotent and its main push is
+up to date. An unprepared version makes the workflow attempt a new version
+commit, which protected branch rules can reject with `GH013`. Prepare and
+merge the version PR instead of bypassing those rules.
+
+The GitHub Actions UI can dispatch the same workflow from `main` with the
+prepared version input. The workflow builds and verifies the platform bundles,
+then prepares the SwiftPM manifest and SDK console assets. It creates and
+pushes the release tag, publishes the GitHub release, and asks GitHub to generate
+the release notes against the highest stable SemVer tag below the target. RC tags
 are never selected as the comparison base, so every RC includes all changes
 since the previous stable release, and the final release repeats that complete
 range plus any post-RC changes. The `just release <version>` recipe performs
-local preflight and
-dispatches this same workflow; it does not maintain a second version-bump path.
+local preflight and dispatches this same workflow; it does not maintain a second
+version-bump path.
 Canary dispatches build the requested version without changing `main` or
 publishing. After a complete
 stable, non-canary release with the full GPU matrix succeeds, it dispatches
@@ -105,15 +129,21 @@ means a footer was present, but signature verification failed.
 just build
 ```
 
-`just build` builds a backend-neutral dynamic host, the UI, and one adjacent
-locally packaged native runtime. It uses the same host/runtime boundary as a
-release product. Static llama.cpp compilation is confined to the runtime
-packaging primitive, never the host executable.
+`just build` first builds and packages one native Skippy runtime and the
+standalone `skippy` CLI, then builds the console and backend-neutral dynamic
+MeshLLM host beside them. It uses the
+same host/runtime boundary as a release product. Static llama.cpp compilation
+is confined to the runtime packaging primitive, never the host executable.
 
-The release build graph has three layers: one backend-neutral dynamic host per
-OS/architecture, one manifested native runtime per backend lane, and a composed
-product bundle. External `llama-server`, `rpc-server`, and `llama-moe-*`
-binaries are not packaged.
+The source tree contains two products. Skippy has one backend-neutral CLI per
+OS/architecture and a manifested native runtime per backend. MeshLLM has its
+own backend-neutral host and console and consumes those Skippy runtime assets.
+Release CI builds the Skippy CLI once per platform and publishes a distinct
+`skippy-<version>-<target>-cli.tar.gz` archive and checksum alongside native
+runtime archives. MeshLLM bundles retain their own host, selected runtime,
+and product manifest. Both products currently share the workspace version and
+release tag. External `llama-server`, `rpc-server`, and `llama-moe-*` binaries
+are not packaged.
 
 ## Bundle
 
@@ -143,12 +173,12 @@ just release-build
 just release-bundle v0.X.Y
 ```
 
-For an explicit backend, build the neutral host and selected runtime through
-the compatibility recipes, then compose:
+For an explicit backend, use its release-build recipe to build the selected
+runtime and Skippy CLI before the neutral MeshLLM host, then compose:
 
 ```bash
 just release-build-cuda
-just release-bundle-cuda v0.X.Y
+just release-bundle v0.X.Y dist cuda
 ```
 
 Before dispatching a release that should be consumable through SwiftPM,
@@ -159,7 +189,7 @@ workflow, which creates the tag:
 
 ```bash
 scripts/prepare-swift-package-release.sh v0.X.Y
-git add Package.swift sdk/swift/Sources/MeshLLM/Generated/mesh_ffi.swift
+git add Package.swift mesh/sdk/swift/Sources/MeshLLM/Generated/mesh_ffi.swift
 git commit -m "v0.X.Y: prepare Swift package artifact"
 ```
 
@@ -263,23 +293,23 @@ scripts/package-sdk-console-assets.sh --sdk all
 scripts/verify-sdk-console-assets.sh --sdk all
 ```
 
-The script builds `crates/mesh-llm-ui/dist` in release mode and copies it to
-the canonical SDK resource locations: `sdk/node/console`,
-`sdk/swift/Sources/MeshLLM/Resources/Console`, and
-`sdk/kotlin/src/main/resources/mesh-llm/console`.
+The script builds `mesh/crates/mesh-llm-ui/dist` in release mode and copies it to
+the canonical SDK resource locations: `mesh/sdk/node/console`,
+`mesh/sdk/swift/Sources/MeshLLM/Resources/Console`, and
+`mesh/sdk/kotlin/src/main/resources/mesh-llm/console`.
 
 Workflow-dispatch releases generate and force-add these resources into the
 release tag commit automatically.
 
 The chain currently publishes:
 
-1. `model-ref`
+1. `skippy-model-ref`
 2. `mesh-llm-identity`
 3. `mesh-llm-protocol`
 4. `mesh-llm-routing`
 5. `mesh-llm-types`
-6. `model-artifact`
-7. `model-hf`
+6. `skippy-model-artifact`
+7. `skippy-model-hf`
 8. `mesh-llm-client`
 9. `mesh-llm-api-client`
 10. `mesh-llm-node`
@@ -301,3 +331,47 @@ script relies on `cargo publish` to report crate versions that were already
 uploaded, continues past those already-uploaded crates, and retries HTTP 429
 new-crate rate-limit responses using the retry time from crates.io when one is
 provided.
+
+## Analytics key
+
+Release binaries report anonymous usage only when `MESH_LLM_POSTHOG_KEY` is
+present at compile time. The release workflow supplies it from the
+`MESH_LLM_POSTHOG_KEY` repository secret; `scripts/build-host.sh` prints
+whether a key was present (never the key itself), so a release log confirms
+it. A build without the secret is valid and reports nothing unless someone sets
+`MESH_LLM_POSTHOG_KEY` in the environment at run time, which is the documented
+self-hosting path.
+
+Forks build without the secret and therefore never report. See
+`website/src/docs/pages/analytics.md` for the collected surface and the
+opt-out, and `crates/mesh-llm-analytics/README.md` for the design.
+
+## Rolling downloadable previews
+
+`rolling-preview.yml` dispatches the canonical Release workflow on manual
+dispatch only (the schedule is commented out). Unique versions use
+`v<workspace-core>-preview.<run-id>.<attempt>`. It builds the full existing release
+matrix including bundled native runtimes, without publishing npm, crates.io,
+containers or downstream installers. Preview mode leaves main unchanged.
+All producers check out the release run's frozen source SHA and prepare the
+version locally. The publisher prepares an immutable tag, uploads to a draft,
+then exposes the complete prerelease without marking it latest.
+
+After merging, start the first run with:
+
+```bash
+gh workflow run rolling-preview.yml --ref main
+```
+
+Completed previews appear on the repository Releases page with a **Rolling
+preview** title. Choose the MeshLLM archive for your OS, architecture and backend,
+verify the adjacent SHA-256 checksum and extract the entire archive. Keep
+`native-runtimes` beside the executable. Model weights and GPU drivers remain
+separate prerequisites. Existing release smoke gates apply; publication is not
+proof of hardware inference on every GPU backend. The first live run and a real
+download-to-inference check remain required activation evidence.
+
+Failed uploads leave an unpublished draft for diagnosis; use a fresh version
+rather than overwriting tags. Previous previews remain available for rollback.
+This initial implementation neither deletes old releases nor skips unchanged
+source; there is no moving tag or automatic stable-user upgrade.

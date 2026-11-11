@@ -1,0 +1,598 @@
+#![allow(
+    deprecated,
+    reason = "bridge keeps legacy MCP sampling, roots, and logging methods for older peers"
+)]
+
+use anyhow::{Result, anyhow};
+use rmcp::{
+    ErrorData, RoleServer,
+    model::{
+        ClientResult, CreateMessageRequest, CreateMessageRequestParams, CustomNotification,
+        CustomRequest, ElicitRequest, ElicitRequestParams, ErrorCode, ListRootsRequest,
+        LoggingMessageNotification, LoggingMessageNotificationParam, PingRequest,
+        ResourceUpdatedNotificationParam, ServerNotification, ServerRequest,
+    },
+    service::Peer,
+    transport::streamable_http_server::{
+        StreamableHttpService, session::local::LocalSessionManager,
+    },
+};
+use serde::Serialize;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use crate::plugin::{self, PluginManager, PluginRpcBridge, RpcResult};
+
+mod external_mcp;
+pub(crate) mod invocation;
+#[cfg(test)]
+mod list_cache_metadata;
+mod result_cache;
+mod tool_dispatch;
+
+#[cfg(test)]
+mod session_isolation_tests;
+
+use external_mcp::ExternalMcpPool;
+
+#[derive(Clone, Default)]
+struct ActiveBridge {
+    invocations: invocation::Invocations,
+}
+
+#[derive(Clone)]
+struct RoutedBridge {
+    mcp: ActiveBridge,
+    host: Option<Arc<dyn PluginRpcBridge>>,
+}
+
+impl PluginRpcBridge for RoutedBridge {
+    fn handle_invocation_request(
+        &self,
+        plugin_name: String,
+        request: plugin::proto::RpcRequest,
+    ) -> crate::plugin::BridgeFuture<Result<RpcResult, plugin::proto::ErrorResponse>> {
+        if request.method.starts_with("inference/")
+            && let Some(host) = &self.host
+        {
+            return host.handle_invocation_request(plugin_name, request);
+        }
+        self.mcp.handle_invocation_request(plugin_name, request)
+    }
+
+    fn handle_invocation_notification(
+        &self,
+        plugin_name: String,
+        notification: plugin::proto::RpcNotification,
+    ) -> crate::plugin::BridgeFuture<()> {
+        self.mcp
+            .handle_invocation_notification(plugin_name, notification)
+    }
+
+    fn handle_request(
+        &self,
+        plugin_name: String,
+        method: String,
+        params_json: String,
+    ) -> crate::plugin::BridgeFuture<Result<RpcResult, plugin::proto::ErrorResponse>> {
+        if method.starts_with("inference/")
+            && let Some(host) = &self.host
+        {
+            return host.handle_request(plugin_name, method, params_json);
+        }
+        self.mcp.handle_request(plugin_name, method, params_json)
+    }
+
+    fn handle_notification(
+        &self,
+        plugin_name: String,
+        method: String,
+        params_json: String,
+    ) -> crate::plugin::BridgeFuture<()> {
+        self.mcp
+            .handle_notification(plugin_name, method, params_json)
+    }
+}
+
+impl ActiveBridge {
+    /// Record the MCP session that owns the plugin invocation now in flight.
+    ///
+    /// Only handlers that forward work to a plugin may bind. Connect-time and
+    /// read-only handlers must not, otherwise any client that merely completes a
+    /// handshake becomes the destination for callbacks another client caused.
+    #[cfg(test)]
+    async fn bind_invocation(
+        &self,
+        plugin_name: &str,
+        peer: Peer<RoleServer>,
+    ) -> invocation::InvocationGuard {
+        self.invocations.bind(plugin_name, peer).await
+    }
+
+    /// Resolve the callback destination to the bound session, rejecting it once
+    /// that session is gone rather than falling through to another client.
+    #[cfg(test)]
+    fn current_peer(
+        &self,
+        plugin_name: &str,
+    ) -> Result<Arc<invocation::Invocation>, plugin::proto::ErrorResponse> {
+        self.invocation_peer(plugin_name, None)
+    }
+
+    fn invocation_peer(
+        &self,
+        plugin_name: &str,
+        id: Option<u64>,
+    ) -> Result<Arc<invocation::Invocation>, plugin::proto::ErrorResponse> {
+        let invocation = self.invocations.resolve(plugin_name, id).ok_or_else(|| {
+            proto_error::internal(
+                "No active MCP client session: unknown, finished, or missing invocation ID",
+            )
+        })?;
+        if invocation.peer.is_transport_closed() {
+            return Err(proto_error::internal(
+                "Originating MCP client session has closed",
+            ));
+        }
+        Ok(invocation)
+    }
+}
+
+impl PluginRpcBridge for ActiveBridge {
+    #[allow(deprecated)]
+    fn handle_request(
+        &self,
+        plugin_name: String,
+        method: String,
+        params_json: String,
+    ) -> crate::plugin::BridgeFuture<Result<RpcResult, plugin::proto::ErrorResponse>> {
+        self.handle_invocation_request(
+            plugin_name,
+            plugin::proto::RpcRequest {
+                method,
+                params_json,
+                invocation_id: None,
+            },
+        )
+    }
+
+    fn handle_invocation_request(
+        &self,
+        plugin_name: String,
+        request: plugin::proto::RpcRequest,
+    ) -> crate::plugin::BridgeFuture<Result<RpcResult, plugin::proto::ErrorResponse>> {
+        let invocation = self.invocation_peer(&plugin_name, request.invocation_id);
+        let plugin::proto::RpcRequest {
+            method,
+            params_json,
+            ..
+        } = request;
+        Box::pin(async move {
+            let invocation = invocation?;
+            let peer = &invocation.peer;
+            let params = parse_optional_value(&params_json)?;
+            let result_json = match method.as_str() {
+                "ping" => {
+                    let result: ClientResult = peer
+                        .send_request(ServerRequest::PingRequest(PingRequest::default()))
+                        .await
+                        .map_err(proto_error::from_service)?;
+                    match result {
+                        ClientResult::EmptyResult(result) => to_json_string(&result),
+                        _ => Err(proto_error::internal("unexpected ping response")),
+                    }
+                }
+                "roots/list" => {
+                    let result: ClientResult = peer
+                        .send_request(ServerRequest::ListRootsRequest(ListRootsRequest::default()))
+                        .await
+                        .map_err(proto_error::from_service)?;
+                    match result {
+                        ClientResult::ListRootsResult(result) => to_json_string(&result),
+                        _ => Err(proto_error::internal("unexpected roots/list response")),
+                    }
+                }
+                "sampling/createMessage" => {
+                    let params =
+                        deserialize_required::<CreateMessageRequestParams>(params, &method)?;
+                    if (params.tools.is_some() || params.tool_choice.is_some())
+                        && !peer.supports_sampling_tools()
+                    {
+                        return Err(proto_error::invalid_params(
+                            "tools or toolChoice provided but client does not support sampling tools capability",
+                        ));
+                    }
+                    params.validate().map_err(proto_error::invalid_params)?;
+                    let result: ClientResult = peer
+                        .send_request(ServerRequest::CreateMessageRequest(
+                            CreateMessageRequest::new(params),
+                        ))
+                        .await
+                        .map_err(proto_error::from_service)?;
+                    match result {
+                        ClientResult::CreateMessageResult(result) => to_json_string(&result),
+                        _ => Err(proto_error::internal("unexpected sampling response")),
+                    }
+                }
+                "elicitation/create" => {
+                    let params =
+                        deserialize_required::<ElicitRequestParams>(params, &method)?;
+                    let result: ClientResult = peer
+                        .send_request(ServerRequest::ElicitRequest(ElicitRequest::new(params)))
+                        .await
+                        .map_err(proto_error::from_service)?;
+                    match result {
+                        ClientResult::ElicitResult(result) => to_json_string(&result),
+                        _ => Err(proto_error::internal("unexpected elicitation response")),
+                    }
+                }
+                _ => {
+                    let result: ClientResult = peer
+                        .send_request(ServerRequest::CustomRequest(CustomRequest::new(
+                            method.clone(),
+                            params,
+                        )))
+                        .await
+                        .map_err(proto_error::from_service)?;
+                    match result {
+                        ClientResult::CustomResult(result) => to_json_string(&result),
+                        _ => Err(proto_error::internal("unexpected custom response")),
+                    }
+                }
+            }
+            .map_err(|mut err| {
+                err.message = format!("bridge request '{method}': {}", err.message);
+                err
+            })?;
+
+            Ok(RpcResult { result_json })
+        })
+    }
+
+    #[allow(deprecated)]
+    fn handle_notification(
+        &self,
+        plugin_name: String,
+        method: String,
+        params_json: String,
+    ) -> crate::plugin::BridgeFuture<()> {
+        self.handle_invocation_notification(
+            plugin_name,
+            plugin::proto::RpcNotification {
+                method,
+                params_json,
+                invocation_id: None,
+            },
+        )
+    }
+
+    fn handle_invocation_notification(
+        &self,
+        plugin_name: String,
+        notification: plugin::proto::RpcNotification,
+    ) -> crate::plugin::BridgeFuture<()> {
+        let invocation = self.invocation_peer(&plugin_name, notification.invocation_id);
+        let plugin::proto::RpcNotification {
+            method,
+            params_json,
+            ..
+        } = notification;
+        Box::pin(async move {
+            let Ok(invocation) = invocation else {
+                return;
+            };
+            let peer = &invocation.peer;
+            let params = match parse_optional_value(&params_json) {
+                Ok(params) => params,
+                Err(_) => return,
+            };
+
+            match method.as_str() {
+                "notifications/resources/updated" => {
+                    if let Ok(params) =
+                        deserialize_required::<ResourceUpdatedNotificationParam>(params, &method)
+                    {
+                        let _ = peer.notify_resource_updated(params).await;
+                    }
+                }
+                "notifications/resources/list_changed" => {
+                    let _ = peer.notify_resource_list_changed().await;
+                }
+                "notifications/tools/list_changed" => {
+                    let _ = peer.notify_tool_list_changed().await;
+                }
+                "notifications/prompts/list_changed" => {
+                    let _ = peer.notify_prompt_list_changed().await;
+                }
+                "notifications/message" => {
+                    if let Ok(params) =
+                        deserialize_required::<LoggingMessageNotificationParam>(params, &method)
+                    {
+                        let _ = peer
+                            .send_notification(ServerNotification::LoggingMessageNotification(
+                                LoggingMessageNotification::new(params),
+                            ))
+                            .await;
+                    }
+                }
+                _ => {
+                    let _ = peer
+                        .send_notification(ServerNotification::CustomNotification(
+                            CustomNotification::new(method, params),
+                        ))
+                        .await;
+                }
+            }
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct PluginMcpServer {
+    plugin_manager: PluginManager,
+    bridge: ActiveBridge,
+    external_mcp: ExternalMcpPool,
+}
+
+impl PluginMcpServer {
+    fn new(plugin_manager: PluginManager, bridge: ActiveBridge) -> Self {
+        Self {
+            plugin_manager,
+            bridge,
+            external_mcp: ExternalMcpPool::default(),
+        }
+    }
+
+    async fn plugin_manifests(
+        &self,
+    ) -> Result<Vec<(String, plugin::proto::PluginManifest)>, ErrorData> {
+        let mut manifests = Vec::new();
+        for (plugin_name, _) in self.plugin_manager.list_server_infos().await {
+            let manifest = self
+                .plugin_manager
+                .manifest(&plugin_name)
+                .await
+                .map_err(internal_error)?;
+            if let Some(manifest) = manifest {
+                manifests.push((plugin_name, manifest));
+            }
+        }
+        Ok(manifests)
+    }
+
+    /// Bind `peer` as the owner of the plugin invocation this handler is serving.
+    async fn bind_invocation(
+        &self,
+        plugin_name: &str,
+        peer: Peer<RoleServer>,
+    ) -> invocation::InvocationGuard {
+        let correlated = self
+            .plugin_manager
+            .plugin_summary(plugin_name)
+            .await
+            .is_ok_and(|summary| {
+                summary.capabilities.iter().any(|capability| {
+                    capability == mesh_llm_plugin::host_capabilities::INVOCATION_CALLBACKS
+                })
+            });
+        self.bridge
+            .invocations
+            .bind_with_capability(plugin_name, peer, correlated)
+            .await
+    }
+
+    async fn broadcast_notification<P>(&self, method: &str, params: P)
+    where
+        P: Serialize + Clone,
+    {
+        for (plugin_name, _) in self.plugin_manager.list_server_infos().await {
+            let _ = self
+                .plugin_manager
+                .mcp_notify(&plugin_name, method, params.clone())
+                .await;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PluginMcpHttpEndpoint {
+    plugin_manager: PluginManager,
+    bridge: ActiveBridge,
+    bridge_installed: Arc<Mutex<bool>>,
+    session_manager: Arc<LocalSessionManager>,
+}
+
+impl PluginMcpHttpEndpoint {
+    pub(crate) fn new(plugin_manager: PluginManager) -> Self {
+        Self {
+            plugin_manager,
+            bridge: ActiveBridge::default(),
+            bridge_installed: Arc::new(Mutex::new(false)),
+            session_manager: Arc::new(LocalSessionManager::default()),
+        }
+    }
+
+    pub(crate) async fn handle(
+        &self,
+        request: http::Request<http_body_util::Full<bytes::Bytes>>,
+    ) -> http::Response<http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>>
+    {
+        let mut bridge_installed = self.bridge_installed.lock().await;
+        if !*bridge_installed {
+            let host = self.plugin_manager.current_rpc_bridge().await;
+            self.plugin_manager
+                .set_rpc_bridge(Some(Arc::new(RoutedBridge {
+                    mcp: self.bridge.clone(),
+                    host,
+                })))
+                .await;
+            *bridge_installed = true;
+        }
+        drop(bridge_installed);
+
+        let plugin_manager = self.plugin_manager.clone();
+        let bridge = self.bridge.clone();
+        let service = StreamableHttpService::new(
+            move || Ok(PluginMcpServer::new(plugin_manager.clone(), bridge.clone())),
+            self.session_manager.clone(),
+            Default::default(),
+        );
+        service.handle(request).await
+    }
+}
+
+fn internal_error(err: impl std::fmt::Display) -> ErrorData {
+    ErrorData::internal_error(err.to_string(), None)
+}
+
+fn to_json_string<T: Serialize>(value: &T) -> Result<String, plugin::proto::ErrorResponse> {
+    serde_json::to_string(value).map_err(|err| proto_error::from_anyhow(err.into()))
+}
+
+fn parse_optional_value(
+    raw: &str,
+) -> Result<Option<serde_json::Value>, plugin::proto::ErrorResponse> {
+    plugin::parse_optional_json(raw).map_err(proto_error::from_anyhow)
+}
+
+fn deserialize_required<T: serde::de::DeserializeOwned>(
+    value: Option<serde_json::Value>,
+    method: &str,
+) -> Result<T, plugin::proto::ErrorResponse> {
+    let value = value.unwrap_or(serde_json::Value::Null);
+    serde_json::from_value(value).map_err(|err| plugin::proto::ErrorResponse {
+        code: ErrorCode::INVALID_PARAMS.0,
+        message: format!("Invalid params for '{method}': {err}"),
+        data_json: String::new(),
+    })
+}
+
+async fn try_plugins<T, P>(
+    server: &PluginMcpServer,
+    peer: Peer<RoleServer>,
+    method: &str,
+    params: P,
+) -> Result<T, ErrorData>
+where
+    T: serde::de::DeserializeOwned,
+    P: Serialize + Clone,
+{
+    let mut last_error = None;
+    for (plugin_name, _) in server.plugin_manager.list_server_infos().await {
+        let _invocation = server.bind_invocation(&plugin_name, peer.clone()).await;
+        match _invocation
+            .scope(
+                server
+                    .plugin_manager
+                    .mcp_request::<T, _>(&plugin_name, method, params.clone()),
+            )
+            .await
+        {
+            Ok(value) => return Ok(value),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(internal_error(
+        last_error.unwrap_or_else(|| anyhow!("No plugin handled '{method}'")),
+    ))
+}
+
+mod proto_error {
+    use anyhow::Error;
+    use rmcp::{ServiceError, model::ErrorCode};
+
+    pub fn from_anyhow(err: Error) -> crate::plugin::proto::ErrorResponse {
+        crate::plugin::proto::ErrorResponse {
+            code: ErrorCode::INTERNAL_ERROR.0,
+            message: err.to_string(),
+            data_json: String::new(),
+        }
+    }
+
+    pub fn from_service(err: ServiceError) -> crate::plugin::proto::ErrorResponse {
+        crate::plugin::proto::ErrorResponse {
+            code: ErrorCode::INTERNAL_ERROR.0,
+            message: err.to_string(),
+            data_json: String::new(),
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> crate::plugin::proto::ErrorResponse {
+        crate::plugin::proto::ErrorResponse {
+            code: ErrorCode::INTERNAL_ERROR.0,
+            message: message.into(),
+            data_json: String::new(),
+        }
+    }
+
+    pub fn invalid_params(message: impl Into<String>) -> crate::plugin::proto::ErrorResponse {
+        crate::plugin::proto::ErrorResponse {
+            code: ErrorCode::INVALID_PARAMS.0,
+            message: message.into(),
+            data_json: String::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod routed_bridge_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct HostBridge {
+        requests: AtomicUsize,
+    }
+
+    impl PluginRpcBridge for HostBridge {
+        fn handle_request(
+            &self,
+            _plugin_name: String,
+            method: String,
+            _params_json: String,
+        ) -> crate::plugin::BridgeFuture<Result<RpcResult, plugin::proto::ErrorResponse>> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                Ok(RpcResult {
+                    result_json: serde_json::json!({"method": method}).to_string(),
+                })
+            })
+        }
+
+        fn handle_notification(
+            &self,
+            _plugin_name: String,
+            _method: String,
+            _params_json: String,
+        ) -> crate::plugin::BridgeFuture<()> {
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_bridge_preserves_host_inference_rpc() {
+        let host = Arc::new(HostBridge::default());
+        let bridge = RoutedBridge {
+            mcp: ActiveBridge::default(),
+            host: Some(host.clone()),
+        };
+
+        let response = bridge
+            .handle_request(
+                "mesh-moa".into(),
+                "inference/chat_completions".into(),
+                "{}".into(),
+            )
+            .await
+            .expect("inference request reaches host bridge");
+        assert!(response.result_json.contains("inference/chat_completions"));
+        assert_eq!(host.requests.load(Ordering::Relaxed), 1);
+
+        let error = bridge
+            .handle_request("example".into(), "roots/list".into(), "{}".into())
+            .await
+            .expect_err("non-inference methods remain MCP-owned without a session");
+        assert!(error.message.contains("No active MCP client session"));
+        assert_eq!(host.requests.load(Ordering::Relaxed), 1);
+    }
+}

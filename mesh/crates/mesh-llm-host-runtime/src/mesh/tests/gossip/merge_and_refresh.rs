@@ -1,0 +1,734 @@
+use mesh_llm_membership::announcements::{apply_transitive_ann, peer_meaningfully_changed};
+
+const NOW: u64 = 1_800_000_000_000;
+
+#[test]
+pub(crate) fn test_merge_none_to_some() {
+    let mut existing = test_peer(None);
+    let ann = test_announcement(Some(100));
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert_eq!(existing.first_joined_mesh_ts, Some(100));
+}
+
+#[test]
+pub(crate) fn test_merge_some_to_none_keeps_existing() {
+    let mut existing = test_peer(Some(100));
+    let ann = test_announcement(None);
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert_eq!(existing.first_joined_mesh_ts, Some(100));
+}
+
+#[test]
+pub(crate) fn test_merge_earlier_incoming_wins() {
+    let mut existing = test_peer(Some(200));
+    let ann = test_announcement(Some(100));
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert_eq!(existing.first_joined_mesh_ts, Some(100));
+}
+
+#[test]
+pub(crate) fn test_merge_later_incoming_loses() {
+    let mut existing = test_peer(Some(100));
+    let ann = test_announcement(Some(200));
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert_eq!(existing.first_joined_mesh_ts, Some(100));
+}
+
+#[test]
+pub(crate) fn test_merge_equal_values_unchanged() {
+    let mut existing = test_peer(Some(100));
+    let ann = test_announcement(Some(100));
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert_eq!(existing.first_joined_mesh_ts, Some(100));
+}
+
+#[test]
+pub(crate) fn test_meaningfully_changed_first_joined_mesh_ts() {
+    let old_peer = test_peer(Some(100));
+    let new_peer = test_peer(Some(200));
+
+    assert!(peer_meaningfully_changed(&old_peer, &new_peer));
+}
+
+#[test]
+pub(crate) fn test_meaningfully_changed_explicit_model_interests() {
+    let old_peer = test_peer(Some(100));
+    let mut new_peer = test_peer(Some(100));
+    new_peer.explicit_model_interests = vec!["Qwen/Qwen3-Coder-Next-GGUF@main:Q4_K_M".into()];
+
+    assert!(peer_meaningfully_changed(&old_peer, &new_peer));
+}
+
+#[test]
+pub(crate) fn test_meaningfully_changed_stage_status_list_support() {
+    let old_peer = test_peer(Some(100));
+    let mut new_peer = test_peer(Some(100));
+    new_peer.stage_status_list_supported = !old_peer.stage_status_list_supported;
+
+    assert!(peer_meaningfully_changed(&old_peer, &new_peer));
+}
+
+#[test]
+pub(crate) fn test_meaningfully_changed_stage_protocol_generation_support() {
+    let old_peer = test_peer(Some(100));
+    let mut new_peer = test_peer(Some(100));
+    new_peer.stage_protocol_generation_supported = !old_peer.stage_protocol_generation_supported;
+
+    assert!(peer_meaningfully_changed(&old_peer, &new_peer));
+}
+
+#[test]
+pub(crate) fn test_meaningfully_changed_local_gguf_content_id_support() {
+    let old_peer = test_peer(Some(100));
+    let mut new_peer = test_peer(Some(100));
+    new_peer.local_gguf_content_id_supported = !old_peer.local_gguf_content_id_supported;
+
+    assert!(peer_meaningfully_changed(&old_peer, &new_peer));
+}
+
+#[test]
+pub(crate) fn test_meaningfully_changed_ignores_cache_refresh_timestamp() {
+    let mut old_peer = test_peer(Some(100));
+    old_peer.cache_affinity = Some(
+        mesh_llm_routing::cache_inventory::CacheAffinityAdvertisement {
+            salt: [3; mesh_llm_routing::cache_inventory::CACHE_AFFINITY_SALT_BYTES],
+            epoch: 7,
+            generated_at_unix_ms: 1_000,
+            ttl_ms: 120_000,
+            entries: Vec::new(),
+        },
+    );
+    let mut new_peer = old_peer.clone();
+    new_peer
+        .cache_affinity
+        .as_mut()
+        .expect("cache advertisement")
+        .generated_at_unix_ms = 2_000;
+
+    assert!(!peer_meaningfully_changed(&old_peer, &new_peer));
+    new_peer
+        .cache_affinity
+        .as_mut()
+        .expect("cache advertisement")
+        .epoch = 8;
+    assert!(peer_meaningfully_changed(&old_peer, &new_peer));
+}
+
+#[test]
+pub(crate) fn test_transitive_merge_rejects_replayed_cache_advertisement() {
+    let mut existing = test_peer(Some(100));
+    existing.cache_affinity = Some(cache_advertisement(2_000, 8));
+    let mut ann = test_announcement(Some(100));
+    ann.cache_affinity = Some(cache_advertisement(1_000, 99));
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    let retained = existing.cache_affinity.expect("cache advertisement");
+    assert_eq!((retained.generated_at_unix_ms, retained.epoch), (2_000, 8));
+}
+
+#[tokio::test]
+pub(crate) async fn test_direct_merge_accepts_only_newer_cache_advertisements() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x47);
+    let addr = test_addr(0x47);
+    let now = crate::mesh::current_time_unix_ms();
+    let mut ann = test_announcement(Some(100));
+    ann.cache_affinity = Some(cache_advertisement(now, 7));
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+
+    ann.cache_affinity = Some(cache_advertisement(now.saturating_sub(1), 99));
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+    {
+        let state = node.state.lock().await;
+        let retained = state
+            .peers
+            .get(&peer_id)
+            .and_then(|peer| peer.cache_affinity.as_ref())
+            .expect("cache advertisement");
+        assert_eq!((retained.generated_at_unix_ms, retained.epoch), (now, 7));
+    }
+
+    ann.cache_affinity = Some(cache_advertisement(now.saturating_add(1), 8));
+    node.add_peer(peer_id, addr, &ann, None).await;
+    let state = node.state.lock().await;
+    let updated = state
+        .peers
+        .get(&peer_id)
+        .and_then(|peer| peer.cache_affinity.as_ref())
+        .expect("cache advertisement");
+    assert_eq!((updated.generated_at_unix_ms, updated.epoch), (now + 1, 8));
+}
+
+/// Issue #2213: routing state learned directly from a peer must not be
+/// replaced by what some other node says about it. Direct admission is the
+/// only provenance that authorizes models, role, capacity, and policy; a
+/// bridge may refresh mention age, never the record.
+#[tokio::test]
+pub(crate) async fn transitive_announcement_cannot_replace_direct_routing_metadata() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x4c);
+    let direct_addr = test_addr(0x4c);
+    let bridge_id = test_endpoint_id(0xed);
+    let model = "direct/Qwen3-8B-Q4_K_M";
+
+    let mut direct = test_announcement(Some(100));
+    direct.addr = direct_addr.clone();
+    direct.role = NodeRole::Host { http_port: 9337 };
+    direct.version = Some("0.78.1".into());
+    direct.models = vec![model.into()];
+    direct.serving_models = vec![model.into()];
+    direct.hosted_models = Some(vec![model.into()]);
+    direct.vram_bytes = 16 * 1024 * 1024 * 1024;
+    direct.mesh_id = Some("direct-mesh".into());
+    direct.mesh_policy_hash = Some("direct-policy".into());
+    node.add_peer(peer_id, direct_addr.clone(), &direct, None)
+        .await;
+
+    let direct_owner = mesh_llm_identity::OwnershipSummary {
+        owner_id: Some("direct-owner".into()),
+        verified: true,
+        ..Default::default()
+    };
+    let direct_seen = {
+        let mut state = node.state.lock().await;
+        let peer = state
+            .peers
+            .get_mut(&peer_id)
+            .expect("direct admission must be tracked");
+        peer.owner_summary = direct_owner.clone();
+        assert!(peer.is_admitted(), "direct gossip admits the peer");
+        peer.last_seen
+    };
+
+    // The bridge relays a different description of the same endpoint id.
+    let mut relayed = direct.clone();
+    relayed.role = NodeRole::Worker;
+    relayed.models = vec!["relayed-model".into()];
+    relayed.serving_models = vec!["relayed-model".into()];
+    relayed.hosted_models = Some(vec!["relayed-model".into()]);
+    relayed.vram_bytes = 2 * 1024 * 1024 * 1024;
+    relayed.mesh_id = Some("relayed-mesh".into());
+    relayed.mesh_policy_hash = Some("relayed-policy".into());
+    node.update_transitive_peer(peer_id, &direct_addr, &relayed, bridge_id)
+        .await;
+
+    let state = node.state.lock().await;
+    let peer = state
+        .peers
+        .get(&peer_id)
+        .expect("direct peer remains tracked");
+    assert!(
+        peer.is_admitted(),
+        "transitive gossip must not revoke a direct admission"
+    );
+    assert_eq!(
+        peer.last_seen, direct_seen,
+        "a bridge must not touch direct proof-of-life"
+    );
+    assert_eq!(peer.role, direct.role, "relay must not replace role");
+    assert_eq!(peer.owner_summary, direct_owner, "relay must not replace owner");
+    assert_eq!(peer.models, direct.models, "relay must not replace models");
+    assert_eq!(
+        peer.serving_models, direct.serving_models,
+        "relay must not replace served models"
+    );
+    assert_eq!(
+        peer.hosted_models,
+        direct.hosted_models.unwrap_or_default(),
+        "relay must not replace hosted models"
+    );
+    assert_eq!(
+        peer.vram_bytes, direct.vram_bytes,
+        "relay must not replace capacity"
+    );
+    assert_eq!(
+        peer.mesh_id, direct.mesh_id,
+        "relay must not replace mesh identity"
+    );
+    assert_eq!(
+        peer.mesh_policy_hash, direct.mesh_policy_hash,
+        "relay must not replace policy"
+    );
+}
+
+#[test]
+pub(crate) fn test_apply_transitive_ann_refreshes_explicit_model_interests() {
+    let mut existing = test_peer(Some(100));
+    let mut ann = test_announcement(Some(100));
+    ann.explicit_model_interests = vec!["Qwen/Qwen3-Coder-Next-GGUF@main:Q4_K_M".into()];
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert_eq!(
+        existing.explicit_model_interests,
+        vec!["Qwen/Qwen3-Coder-Next-GGUF@main:Q4_K_M".to_string()]
+    );
+}
+
+#[test]
+pub(crate) fn test_apply_transitive_ann_refreshes_stage_status_list_support() {
+    let mut existing = test_peer(Some(100));
+    existing.stage_status_list_supported = false;
+    let mut ann = test_announcement(Some(100));
+    ann.stage_status_list_supported = true;
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert!(existing.stage_status_list_supported);
+}
+
+#[test]
+pub(crate) fn test_apply_transitive_ann_cannot_promote_stage_protocol_generation_support() {
+    let mut existing = test_peer(Some(100));
+    existing.stage_protocol_generation_supported = false;
+    let mut ann = test_announcement(Some(100));
+    ann.stage_protocol_generation_supported = true;
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert!(!existing.stage_protocol_generation_supported);
+}
+
+#[test]
+pub(crate) fn test_apply_transitive_ann_preserves_direct_stage_protocol_generation_support() {
+    let mut existing = test_peer(Some(100));
+    existing.stage_protocol_generation_supported = true;
+    let mut old_relay_ann = test_announcement(Some(100));
+    old_relay_ann.stage_protocol_generation_supported = false;
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &old_relay_ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert!(existing.stage_protocol_generation_supported);
+}
+
+#[test]
+pub(crate) fn test_apply_transitive_ann_cannot_promote_local_gguf_content_id_support() {
+    let mut existing = test_peer(Some(100));
+    existing.local_gguf_content_id_supported = false;
+    let mut ann = test_announcement(Some(100));
+    ann.local_gguf_content_id_supported = true;
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert!(!existing.local_gguf_content_id_supported);
+}
+
+#[test]
+pub(crate) fn test_apply_transitive_ann_preserves_direct_local_gguf_content_id_support() {
+    let mut existing = test_peer(Some(100));
+    existing.local_gguf_content_id_supported = true;
+    let mut old_relay_ann = test_announcement(Some(100));
+    old_relay_ann.local_gguf_content_id_supported = false;
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &old_relay_ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert!(existing.local_gguf_content_id_supported);
+}
+
+#[tokio::test]
+pub(crate) async fn test_transitive_peer_cannot_establish_local_gguf_content_id_support() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x4a);
+    let addr = test_addr(0x4a);
+    let bridge_id = test_endpoint_id(0xeb);
+    let mut ann = test_announcement(Some(100));
+    ann.addr = addr.clone();
+    ann.local_gguf_content_id_supported = true;
+
+    node.update_transitive_peer(peer_id, &addr, &ann, bridge_id)
+        .await;
+    {
+        let state = node.state.lock().await;
+        let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+        assert!(!peer.local_gguf_content_id_supported);
+        assert!(!peer.is_admitted());
+    }
+
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+    {
+        let state = node.state.lock().await;
+        let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+        assert!(peer.local_gguf_content_id_supported);
+        assert!(peer.is_admitted());
+    }
+
+    ann.local_gguf_content_id_supported = false;
+    node.update_transitive_peer(peer_id, &addr, &ann, bridge_id)
+        .await;
+    let state = node.state.lock().await;
+    let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+    assert!(peer.local_gguf_content_id_supported);
+}
+
+#[tokio::test]
+pub(crate) async fn test_transitive_peer_cannot_override_direct_stage_protocol_generation() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x4b);
+    let addr = test_addr(0x4b);
+    let bridge_id = test_endpoint_id(0xec);
+    let mut ann = test_announcement(Some(100));
+    ann.addr = addr.clone();
+    ann.stage_protocol_generation_supported = true;
+
+    node.update_transitive_peer(peer_id, &addr, &ann, bridge_id)
+        .await;
+    {
+        let state = node.state.lock().await;
+        let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+        assert!(!peer.stage_protocol_generation_supported);
+        assert!(!peer.is_admitted());
+    }
+
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+    {
+        let state = node.state.lock().await;
+        let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+        assert!(peer.stage_protocol_generation_supported);
+        assert!(peer.is_admitted());
+    }
+
+    ann.stage_protocol_generation_supported = false;
+    node.update_transitive_peer(peer_id, &addr, &ann, bridge_id)
+        .await;
+    let state = node.state.lock().await;
+    let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+    assert!(peer.stage_protocol_generation_supported);
+}
+
+#[test]
+pub(crate) fn test_apply_transitive_ann_refreshes_advertised_model_throughput() {
+    let mut existing = test_peer(Some(100));
+    let mut ann = test_announcement(Some(100));
+    ann.advertised_model_throughput = vec![crate::network::metrics::ModelThroughputHint {
+        model_name: "qwen".to_string(),
+        avg_tokens_per_second_milli: 35_000,
+        throughput_samples: 4,
+        measurement: None,
+        prefill: None,
+    }];
+
+    apply_transitive_ann(
+        &mut existing,
+        &test_addr(0x33),
+        &ann,
+        test_endpoint_id(0xee),
+        NOW,
+    );
+
+    assert_eq!(
+        existing.advertised_model_throughput,
+        ann.advertised_model_throughput
+    );
+}
+
+#[tokio::test]
+pub(crate) async fn test_add_peer_refreshes_stage_status_list_support() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x44);
+    let addr = test_addr(0x44);
+    let mut ann = test_announcement(Some(100));
+    ann.stage_status_list_supported = false;
+
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+    ann.stage_status_list_supported = true;
+    node.add_peer(peer_id, addr, &ann, None).await;
+
+    let state = node.state.lock().await;
+    let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+    assert!(peer.stage_status_list_supported);
+}
+
+#[tokio::test]
+pub(crate) async fn test_add_peer_refreshes_stage_protocol_generation_support() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x45);
+    let addr = test_addr(0x45);
+    let mut ann = test_announcement(Some(100));
+    ann.stage_protocol_generation_supported = false;
+
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+    ann.stage_protocol_generation_supported = true;
+    node.add_peer(peer_id, addr, &ann, None).await;
+
+    let state = node.state.lock().await;
+    let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+    assert!(peer.stage_protocol_generation_supported);
+}
+
+#[tokio::test]
+pub(crate) async fn test_add_peer_refreshes_local_gguf_content_id_support() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x48);
+    let addr = test_addr(0x48);
+    let mut ann = test_announcement(Some(100));
+    ann.local_gguf_content_id_supported = false;
+
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+    ann.local_gguf_content_id_supported = true;
+    node.add_peer(peer_id, addr, &ann, None).await;
+
+    let state = node.state.lock().await;
+    let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+    assert!(peer.local_gguf_content_id_supported);
+}
+
+#[tokio::test]
+pub(crate) async fn test_direct_announcement_clears_local_gguf_content_id_support() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x49);
+    let addr = test_addr(0x49);
+    let mut ann = test_announcement(Some(100));
+    ann.local_gguf_content_id_supported = true;
+
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+    ann.local_gguf_content_id_supported = false;
+    node.add_peer(peer_id, addr, &ann, None).await;
+
+    let state = node.state.lock().await;
+    let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+    assert!(!peer.local_gguf_content_id_supported);
+}
+
+#[tokio::test]
+pub(crate) async fn test_add_peer_refreshes_advertised_model_throughput() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x46);
+    let addr = test_addr(0x46);
+    let mut ann = test_announcement(Some(100));
+    ann.advertised_model_throughput = vec![crate::network::metrics::ModelThroughputHint {
+        model_name: "qwen".to_string(),
+        avg_tokens_per_second_milli: 20_000,
+        throughput_samples: 2,
+        measurement: None,
+        prefill: None,
+    }];
+
+    node.add_peer(peer_id, addr.clone(), &ann, None).await;
+    ann.advertised_model_throughput[0].avg_tokens_per_second_milli = 48_000;
+    ann.advertised_model_throughput[0].throughput_samples = 9;
+    node.add_peer(peer_id, addr, &ann, None).await;
+
+    let state = node.state.lock().await;
+    let peer = state.peers.get(&peer_id).expect("peer should be tracked");
+    assert_eq!(
+        peer.advertised_model_throughput,
+        ann.advertised_model_throughput
+    );
+}
+
+/// A peer's throughput hint ranks only while its measuring node says it is
+/// recent; an older peer's hint, which carries no measurement, never does.
+#[tokio::test]
+pub(crate) async fn test_peer_throughput_hint_counts_only_while_fresh() {
+    use crate::network::metrics::{
+        ModelThroughputHint, ThroughputMeasurement, ThroughputMeasurementKind,
+    };
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x47);
+    let addr = test_addr(0x47);
+    let now = crate::mesh::current_time_unix_ms();
+    let window_ms = 15 * 60 * 1000;
+    let hint = |model: &str, measurement| ModelThroughputHint {
+        model_name: model.to_string(),
+        avg_tokens_per_second_milli: 30_000,
+        throughput_samples: 5,
+        measurement,
+        prefill: None,
+    };
+    let measured = |age_ms: u64| {
+        Some(ThroughputMeasurement {
+            observed_at_unix_ms: now - age_ms,
+            window_ms,
+            kind: ThroughputMeasurementKind::EndToEndAttempt,
+        })
+    };
+    let mut ann = test_announcement(Some(100));
+    ann.advertised_model_throughput = vec![
+        hint("fresh", measured(60_000)),
+        hint("stale", measured(window_ms + 60_000)),
+        hint("legacy", None),
+    ];
+
+    node.add_peer(peer_id, addr, &ann, None).await;
+
+    assert!(
+        node.peer_model_throughput_hint(peer_id, "fresh")
+            .await
+            .is_some()
+    );
+    assert!(
+        node.peer_model_throughput_hint(peer_id, "stale")
+            .await
+            .is_none()
+    );
+    assert!(
+        node.peer_model_throughput_hint(peer_id, "legacy")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+pub(crate) async fn test_collect_announcements_includes_self_explicit_model_interests() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    node.set_explicit_model_interests(vec![
+        "Qwen/Qwen3-Coder-Next-GGUF@main:Q4_K_M".into(),
+        "Qwen/Qwen3-Coder-Next-GGUF@main:Q4_K_M".into(),
+    ])
+    .await;
+
+    let announcements = node.collect_announcements().await;
+    let self_announcement = announcements
+        .iter()
+        .find(|announcement| announcement.addr.id == node.id())
+        .expect("self announcement must be present");
+
+    assert_eq!(
+        self_announcement.explicit_model_interests,
+        vec!["Qwen/Qwen3-Coder-Next-GGUF@main:Q4_K_M".to_string()]
+    );
+}
+fn cache_advertisement(
+    generated_at_unix_ms: u64,
+    epoch: u64,
+) -> mesh_llm_routing::cache_inventory::CacheAffinityAdvertisement {
+    mesh_llm_routing::cache_inventory::CacheAffinityAdvertisement {
+        salt: [3; mesh_llm_routing::cache_inventory::CACHE_AFFINITY_SALT_BYTES],
+        epoch,
+        generated_at_unix_ms,
+        ttl_ms: 120_000,
+        entries: Vec::new(),
+    }
+}
+
+/// The other half of the #2213 gate: once direct proof-of-life goes stale the
+/// bridge is the only remaining source, so it must regain full authority.
+/// Without this, protecting a live direct record would freeze a peer that
+/// really did move onto different models.
+#[tokio::test]
+pub(crate) async fn transitive_announcement_updates_a_direct_record_once_proof_of_life_is_stale() {
+    let node = Node::new_for_tests(NodeRole::Worker).await.unwrap();
+    let peer_id = test_endpoint_id(0x4d);
+    let direct_addr = test_addr(0x4d);
+    let bridge_id = test_endpoint_id(0xee);
+
+    let mut direct = test_announcement(Some(100));
+    direct.addr = direct_addr.clone();
+    direct.models = vec!["direct-model".into()];
+    direct.serving_models = vec!["direct-model".into()];
+    direct.hosted_models = Some(vec!["direct-model".into()]);
+    node.add_peer(peer_id, direct_addr.clone(), &direct, None)
+        .await;
+
+    // The direct session goes quiet for longer than the stale window.
+    {
+        let mut state = node.state.lock().await;
+        let peer = state.peers.get_mut(&peer_id).expect("direct peer");
+        peer.last_seen = std::time::Instant::now()
+            - std::time::Duration::from_secs(
+                mesh_llm_membership::peer_state::PEER_STALE_SECS + 1,
+            );
+    }
+
+    let mut relayed = direct.clone();
+    relayed.models = vec!["relayed-model".into()];
+    relayed.serving_models = vec!["relayed-model".into()];
+    relayed.hosted_models = Some(vec!["relayed-model".into()]);
+    node.update_transitive_peer(peer_id, &direct_addr, &relayed, bridge_id)
+        .await;
+
+    let state = node.state.lock().await;
+    let peer = state
+        .peers
+        .get(&peer_id)
+        .expect("peer remains tracked once stale");
+    assert_eq!(
+        peer.models, relayed.models,
+        "a bridge must be able to refresh a peer whose direct proof-of-life went stale"
+    );
+    assert_eq!(peer.serving_models, relayed.serving_models);
+    assert_eq!(peer.hosted_models, vec!["relayed-model".to_string()]);
+}

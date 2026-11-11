@@ -3,6 +3,26 @@ name: CI Web Slice
 on:
   workflow_call:
     inputs:
+      authority_linux_x64:
+        description: Exact same-run protected native producer identity JSON, source SHA, artifact ID, independent digest, OS, and architecture.
+        required: false
+        default: ''
+        type: string
+      authority_linux_arm64:
+        description: Exact same-run protected native producer identity JSON, source SHA, artifact ID, independent digest, OS, and architecture.
+        required: false
+        default: ''
+        type: string
+      authority_macos_arm64:
+        description: Exact same-run protected native producer identity JSON, source SHA, artifact ID, independent digest, OS, and architecture.
+        required: false
+        default: ''
+        type: string
+      authority_windows_x64:
+        description: Exact same-run protected native producer identity JSON, source SHA, artifact ID, independent digest, OS, and architecture.
+        required: false
+        default: ''
+        type: string
       source_sha:
         description: Immutable product source revision.
         required: false
@@ -30,6 +50,12 @@ on:
 permissions:
   contents: read
   packages: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_BENCH_DEBUG: "0"
 
 jobs:
   runner_policy:
@@ -72,9 +98,6 @@ jobs:
     timeout-minutes: 20
     container:
       image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:37dc12322bd2efaefc59e51ad58d8cd3284974cb23721d13f0ff3564715037bb
-    defaults:
-      run:
-        working-directory: crates/mesh-llm-ui
     steps:
       - uses: Mesh-LLM/mesh-llm/.github/actions/audit-depot-pr-isolation@ed07043b84d720aab30e75ed2f038f7042576f16
         with:
@@ -86,6 +109,9 @@ jobs:
         with:
           ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
+      - name: Resolve product source layout
+        id: layout
+        uses: Mesh-LLM/mesh-llm/.github/actions/resolve-source-layout@5c8fb4d472bc57058c8153761c561daa77dd5b94 # product-layout compatibility helpers
       # The container image bakes a warm pnpm store at
       # /home/runner/.local/share/pnpm/store (mesh-llm-runner-images
       # scripts/warm-dependencies.sh). Point pnpm at it directly instead of
@@ -96,14 +122,19 @@ jobs:
       # didn't land where pnpm looks for them (#1392). Using the image's
       # own store sidesteps both and needs no cache round trip at all.
       - name: Point pnpm at the image's baked store
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: pnpm config set store-dir /home/runner/.local/share/pnpm/store
       - name: Install UI dependencies
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: pnpm i --frozen-lockfile
       - name: Lint UI
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: pnpm run lint
       - name: Type-check UI
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: pnpm run typecheck
       - name: Test UI
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: pnpm test
 
   ui_e2e:
@@ -114,9 +145,6 @@ jobs:
     timeout-minutes: 20
     container:
       image: ghcr.io/mesh-llm/mesh-llm-cuda-runner@sha256:6bc7df4166f2729d7c8e8bb070c14ae261cb67116d6b025760dcb4b56eea3cfd
-    defaults:
-      run:
-        working-directory: crates/mesh-llm-ui
     steps:
       - uses: Mesh-LLM/mesh-llm/.github/actions/audit-depot-pr-isolation@ed07043b84d720aab30e75ed2f038f7042576f16
         with:
@@ -128,11 +156,16 @@ jobs:
         with:
           ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
+      - name: Resolve product source layout
+        id: layout
+        uses: Mesh-LLM/mesh-llm/.github/actions/resolve-source-layout@5c8fb4d472bc57058c8153761c561daa77dd5b94 # product-layout compatibility helpers
       # See ui_quality's "Point pnpm at the image's baked store" step for why
       # this doesn't use the Actions cache (#1392).
       - name: Point pnpm at the image's baked store
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: pnpm config set store-dir /home/runner/.local/share/pnpm/store
       - name: Install UI dependencies
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: pnpm i --frozen-lockfile
       - name: Verify prebuilt web environment
         # The image bakes PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1, so a stray
@@ -144,19 +177,21 @@ jobs:
         # jobs' run: steps to sh, and the <<< here-string below is a
         # bashism dash/sh rejects ("Syntax error: redirection unexpected").
         shell: bash
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: |
           resolved="$(pnpm exec playwright --version | head -n1 | awk '{print $NF}')"
           grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$resolved" \
             || { echo "unexpected playwright --version output: $resolved" >&2; exit 1; }
           verify-runner-image public browser "" "" "" "" "$resolved"
       - name: Run console E2E
+        working-directory: ${{ steps.layout.outputs.ui_dir }}
         run: pnpm run test:e2e
       - name: Upload E2E failure artifacts
         if: failure()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ui-e2e-test-results
-          path: crates/mesh-llm-ui/test-results/
+          path: ${{ steps.layout.outputs.ui_dir }}/test-results/
           if-no-files-found: warn
           retention-days: 1
 
@@ -179,11 +214,22 @@ jobs:
         with:
           ref: ${{ inputs.source_sha || github.sha }}
           persist-credentials: false
+      - name: Resolve product source layout
+        id: layout
+        uses: Mesh-LLM/mesh-llm/.github/actions/resolve-source-layout@5c8fb4d472bc57058c8153761c561daa77dd5b94 # product-layout compatibility helpers
       - name: Install website dependencies
-        working-directory: website
+        working-directory: ${{ steps.layout.outputs.website_dir }}
         run: npm ci
       - name: Build public website
+        env:
+          MESH_LLM_WEBSITE_DIR: ${{ steps.layout.outputs.website_dir }}
         run: just website-build
       - name: Validate CLI explorer in desktop and mobile browsers
-        working-directory: website
+        working-directory: ${{ steps.layout.outputs.website_dir }}
         run: npm run test:cli-explorer
+      - name: Validate website data sources
+        working-directory: ${{ steps.layout.outputs.website_dir }}
+        run: npm run test:website-data
+      - name: Validate catalog filter attributes
+        working-directory: ${{ steps.layout.outputs.website_dir }}
+        run: npm run test:catalog-filters

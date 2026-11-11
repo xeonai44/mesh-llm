@@ -7,12 +7,17 @@ if [[ "$#" -ne 4 ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+automation=(cargo run --quiet --manifest-path "$REPO_ROOT/tools/xtask/Cargo.toml" --)
+if [[ -n "${MESH_LLM_AUTOMATION_BIN:-}" ]]; then
+    automation=("$MESH_LLM_AUTOMATION_BIN")
+fi
 download_dir="$1"
 build_dir="$2"
 expected_target="$3"
 expected_backend="$4"
 expected_basename="build-stage-abi-static"
 expected_toolchain_epoch="${MESH_LLM_LLAMA_TOOLCHAIN_EPOCH:-}"
+prepared_sha_file="${LLAMA_WORKDIR:-$REPO_ROOT/.deps/llama.cpp}/.mesh-llm-patched-sha"
 
 if [[ -z "$expected_toolchain_epoch" ||
       ! "$expected_toolchain_epoch" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
@@ -60,11 +65,11 @@ if [[ "${#download_entries[@]}" -ne 2 ||
     echo "static ABI input must contain exactly its archive and checksum" >&2
     exit 1
 fi
-python3 "$REPO_ROOT/scripts/verify-checksum-sidecar.py" "$archive"
+"${automation[@]}" artifact verify-checksum "$archive"
 
 extract_root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/mesh-static-abi.XXXXXX")"
 trap 'rm -rf -- "$extract_root"' EXIT
-python3 "$REPO_ROOT/scripts/safe-extract-tar.py" \
+"${automation[@]}" artifact extract-tar \
     "$archive" \
     "$extract_root"
 
@@ -92,6 +97,11 @@ required_archives=(
 test -s "$manifest"
 test -s "$build_stamp"
 test -f "$cmake_cache"
+# Speech recognition is optional: its archive is required only when the build
+# stamp records the whisper.cpp pin it was built from.
+if grep -Eq '^whisper-sha=.+' "$build_stamp"; then
+    required_archives+=("$restored_dir/whisper/src/libwhisper.a")
+fi
 for archive in "${required_archives[@]}"; do
     if [[ ! -s "$archive" ]]; then
         echo "static ABI is missing required archive: $archive" >&2
@@ -104,53 +114,30 @@ if [[ ! -s "$restored_dir/ggml/src/libggml-cpu.a" &&
     exit 1
 fi
 
-python3 - \
+"${automation[@]}" prepared-input static-abi-manifest verify \
     "$manifest" \
     "$build_stamp" \
     "$expected_target" \
     "$expected_backend" \
     "$expected_basename" \
-    "$expected_toolchain_epoch" <<'PY'
-import hashlib
-import json
-import sys
-
-(
-    manifest_path,
-    stamp_path,
-    target,
-    backend,
-    build_directory,
-    toolchain_epoch,
-) = sys.argv[1:]
-with open(manifest_path, encoding="utf-8") as handle:
-    manifest = json.load(handle)
-expected = {
-    "schema_version": 3,
-    "contract": "mesh-llm-static-abi-v3",
-    "target_triple": target,
-    "backend": backend,
-    "build_directory": build_directory,
-    "toolchain_epoch": toolchain_epoch,
-}
-for field, value in expected.items():
-    if manifest.get(field) != value:
-        raise SystemExit(
-            f"static ABI manifest {field} mismatch: "
-            f"expected {value!r}, got {manifest.get(field)!r}"
-        )
-with open(stamp_path, "rb") as handle:
-    stamp_bytes = handle.read()
-stamp_sha256 = hashlib.sha256(stamp_bytes).hexdigest()
-if manifest.get("build_stamp_sha256") != stamp_sha256:
-    raise SystemExit("static ABI build stamp checksum mismatch")
-PY
-python3 "$REPO_ROOT/scripts/verify-static-abi-build-stamp.py" \
+    "$expected_toolchain_epoch"
+"${automation[@]}" prepared-input static-abi-stamp \
     "$build_stamp" \
     --backend "$expected_backend" \
     --link-mode static \
     --stamp-version 3 \
     --toolchain-epoch "$expected_toolchain_epoch"
+
+if [[ ! -s "$prepared_sha_file" ]]; then
+    echo "prepared llama.cpp patched SHA is missing: $prepared_sha_file" >&2
+    exit 1
+fi
+prepared_sha="$(tr -d '[:space:]' < "$prepared_sha_file")"
+if [[ ! "$prepared_sha" =~ ^[0-9a-f]{40}$ ]] ||
+   ! grep -Fxq "patched-sha=$prepared_sha" "$build_stamp"; then
+    echo "static ABI patched SHA does not match prepared llama.cpp" >&2
+    exit 1
+fi
 
 mkdir -p "$(dirname "$build_dir")"
 cp -a "$restored_dir" "$build_dir"

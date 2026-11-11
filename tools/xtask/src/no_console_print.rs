@@ -307,9 +307,14 @@ fn is_capability_probe_at(lines: &[&str], mut cursor: SourceCursor) -> bool {
 /// product `.rs` file under `crates/`, using the explicit scope rules in
 /// `scope`. Build scripts use print macros for Cargo directives. Paths carry
 /// the `crates/` prefix so reported violations are repo-relative.
-fn collect_rs_files(crates_dir: &Path) -> std::io::Result<Vec<String>> {
+fn collect_rs_files(repo_root: &Path) -> std::io::Result<Vec<String>> {
     let mut files = Vec::new();
-    collect_rs_files_recursive(crates_dir, "crates/", &mut files)?;
+    for relative in ["crates", "mesh/crates", "skippy/crates"] {
+        let directory = repo_root.join(relative);
+        if directory.is_dir() {
+            collect_rs_files_recursive(&directory, &format!("{relative}/"), &mut files)?;
+        }
+    }
     files.sort();
     Ok(files)
 }
@@ -345,11 +350,10 @@ fn collect_rs_files_recursive(
 pub(crate) fn check_no_console_prints(repo_root: &Path) -> DynResult<()> {
     check_retired_allowlist_absent(repo_root)?;
 
-    let crates_dir = repo_root.join("crates");
-    let files = collect_rs_files(&crates_dir).map_err(|error| {
+    let files = collect_rs_files(repo_root).map_err(|error| {
         format!(
             "failed to list Rust sources under {}: {error}",
-            crates_dir.display()
+            repo_root.display()
         )
     })?;
     let mut macro_violations: Vec<String> = Vec::new();
@@ -425,13 +429,12 @@ fn read_source(repo_root: &Path, file: &str) -> DynResult<String> {
 }
 
 /// Entry point for `xtask repo-consistency no-console-print`.
-pub(crate) fn check_no_console_print_command(rest: &[String]) -> DynResult<()> {
+pub(crate) fn check_no_console_print_command(repo_root: &Path, rest: &[String]) -> DynResult<()> {
     if !rest.is_empty() {
         return Err("usage: cargo run -p xtask -- repo-consistency no-console-print".into());
     }
-    let repo_root = crate::repo_consistency::repo_root()?;
-    scope::check_exempt_crates(&repo_root)?;
-    check_no_console_prints(&repo_root)?;
+    scope::check_exempt_crates(repo_root)?;
+    check_no_console_prints(repo_root)?;
     println!("repo consistency checks passed: no-console-print");
     Ok(())
 }
@@ -602,7 +605,7 @@ fn f() {
 
     #[test]
     fn no_console_print_command_rejects_trailing_arguments() {
-        let error = check_no_console_print_command(&["--regen".to_owned()])
+        let error = check_no_console_print_command(Path::new("."), &["--regen".to_owned()])
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -671,7 +674,7 @@ fn f() {
     fn console_output_owners_may_hold_terminal_handles() {
         let owner = scope::CONSOLE_OUTPUT_OWNERS
             .iter()
-            .find(|path| path.starts_with("crates/mesh-llm-events/"))
+            .find(|path| path.starts_with("mesh/crates/mesh-llm-events/"))
             .expect("an events-crate owner");
         let repo_root =
             temp_repo_with_files(&[(owner, "fn f() {\n    let mut out = std::io::stderr();\n}\n")]);
@@ -694,7 +697,7 @@ fn f() {
                 "fn main() { println!(\"tool\"); }",
             ),
             (
-                "crates/skippy-bench/src/lib.rs",
+                "skippy/crates/metrics-server/src/lib.rs",
                 "fn f() { println!(\"bench\"); }",
             ),
         ]);
@@ -707,7 +710,7 @@ fn f() {
             "crates/demo/src/lib.rs:1",
             "crates/demo/tests/integration.rs",
             "crates/demo/src/bin/tool.rs",
-            "crates/skippy-bench/src/lib.rs",
+            "skippy/crates/metrics-server/src/lib.rs",
         ] {
             assert!(!error.contains(out_of_scope), "{out_of_scope}: {error}");
         }

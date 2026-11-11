@@ -15,9 +15,7 @@ use crate::repo_consistency::{CargoMetadata, workspace_metadata};
 /// future product dependency. `mesh-client` is deliberately NOT exempt: the
 /// shipping host now depends on the `mesh-llm-client` package.
 const NON_PRODUCT_CRATES: &[&str] = &[
-    "skippy-prompt",
-    "skippy-bench",
-    "skippy-model-package",
+    "skippy-package-builder",
     "llama-spec-bench",
     "skippy-quantize",
     "skippy-correctness",
@@ -37,21 +35,22 @@ const NON_PRODUCT_CRATES: &[&str] = &[
 /// - the TUI's own output manager, fd capture, and terminal backend,
 /// - the runtime's tracing writer, the last-resort path used when event
 ///   emission itself fails,
-/// - skippy-server's stderr telemetry sink, whose entire purpose is writing
+/// - skippy-serving's stderr telemetry sink, whose entire purpose is writing
 ///   newline-delimited events to stderr,
 /// - CLI presentation surfaces that render to the user's terminal by design.
 pub(super) const CONSOLE_OUTPUT_OWNERS: &[&str] = &[
-    "crates/mesh-llm-events/src/console.rs",
-    "crates/mesh-llm-events/src/command_lifecycle.rs",
-    "crates/mesh-llm-events/src/terminal_progress.rs",
-    "crates/mesh-llm-tui/src/terminal_progress.rs",
-    "crates/mesh-llm-tui/src/output/console_capture.rs",
-    "crates/mesh-llm-tui/src/output/formatting.rs",
-    "crates/mesh-llm-tui/src/output/terminal_out.rs",
-    "crates/mesh-llm-host-runtime/src/runtime/tracing_writer.rs",
-    "crates/skippy-server/src/telemetry.rs",
-    "crates/mesh-llm-cli/src/pager.rs",
-    "crates/mesh-llm-commands/src/gpus/tune_runner.rs",
+    "mesh/crates/mesh-llm-events/src/console.rs",
+    "mesh/crates/mesh-llm-events/src/command_lifecycle.rs",
+    "mesh/crates/mesh-llm-events/src/terminal_progress.rs",
+    "mesh/crates/mesh-llm-tui/src/terminal_progress.rs",
+    "mesh/crates/mesh-llm-tui/src/output/console_capture.rs",
+    "mesh/crates/mesh-llm-tui/src/output/formatting.rs",
+    "mesh/crates/mesh-llm-tui/src/output/terminal_out.rs",
+    "mesh/crates/mesh-llm-host-runtime/src/runtime/tracing_writer.rs",
+    "skippy/crates/skippy-serving/src/telemetry.rs",
+    "skippy/crates/skippy-commands/src/console.rs",
+    "mesh/crates/mesh-llm-cli/src/pager.rs",
+    "mesh/crates/mesh-llm-commands/src/gpus/tune_runner.rs",
 ];
 
 pub(super) fn owns_console_output(path: &str) -> bool {
@@ -59,6 +58,10 @@ pub(super) fn owns_console_output(path: &str) -> bool {
 }
 
 pub(super) fn is_product_source(path: &str) -> bool {
+    let path = path
+        .strip_prefix("mesh/")
+        .or_else(|| path.strip_prefix("skippy/"))
+        .unwrap_or(path);
     let parts: Vec<_> = path.split('/').collect();
     if parts.len() < 3 || parts[0] != "crates" {
         return false;
@@ -69,6 +72,10 @@ pub(super) fn is_product_source(path: &str) -> bool {
         && *name != "tests.rs"
         && !name.ends_with("_tests.rs")
         && *name != "build.rs"
+        // Build-script support modules (e.g. skippy-ffi's build/native_link.rs)
+        // ship build.rs policy split into includable units; like build.rs they
+        // legitimately emit cargo directives with println!.
+        && parts.get(2) != Some(&"build")
         && name.ends_with(".rs")
         // release_targets.rs ships only mesh-llm's src/main.rs. Other src/bin
         // targets are auxiliary tools; src/main.rs remains checked everywhere.

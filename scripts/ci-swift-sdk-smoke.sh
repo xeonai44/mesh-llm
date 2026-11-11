@@ -14,6 +14,7 @@ elif [[ "$#" -ne 6 ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO_ROOT/scripts/lib/automation.sh"
 cd "$REPO_ROOT"
 
 # Pull requests execute the protected default-branch workflow definition. Until
@@ -34,7 +35,7 @@ fi
 SWIFT_INPUT_ARCHIVE="$4"
 SWIFT_INPUT_MODE="$5"
 SWIFT_INPUT_BINDING="$6"
-SWIFT_TRACKED_BINDING="sdk/swift/Sources/MeshLLM/Generated/mesh_ffi.swift"
+SWIFT_TRACKED_BINDING="mesh/sdk/swift/Sources/MeshLLM/Generated/mesh_ffi.swift"
 
 if [[ ! -f "$SWIFT_INPUT_BINDING" || -L "$SWIFT_INPUT_BINDING" ]]; then
     echo "immutable generated Swift binding is missing or unsafe: $SWIFT_INPUT_BINDING" >&2
@@ -57,9 +58,9 @@ scripts/verify-swift-release-artifact.sh \
 
 SWIFT_EXTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "$SWIFT_EXTRACT_DIR"' EXIT
-scripts/safe-extract-zip.py "$SWIFT_INPUT_ARCHIVE" "$SWIFT_EXTRACT_DIR"
+mesh_automation artifact extract-zip "$SWIFT_INPUT_ARCHIVE" "$SWIFT_EXTRACT_DIR"
 
-SWIFT_GENERATED_DIR="sdk/swift/Generated"
+SWIFT_GENERATED_DIR="mesh/sdk/swift/Generated"
 if [[ -L "$SWIFT_GENERATED_DIR" ]] \
     || [[ -e "$SWIFT_GENERATED_DIR" && ! -d "$SWIFT_GENERATED_DIR" ]]; then
     echo "Swift generated artifact directory is unsafe: $SWIFT_GENERATED_DIR" >&2
@@ -75,7 +76,7 @@ rm -rf "$SWIFT_XCFRAMEWORK"
 mv "$SWIFT_EXTRACT_DIR/MeshLLMFFI.xcframework" "$SWIFT_XCFRAMEWORK"
 
 scripts/verify-swift-privacy-manifest.sh \
-    sdk/swift/PrivacyInfo.xcprivacy \
+    mesh/sdk/swift/PrivacyInfo.xcprivacy \
     "$SWIFT_XCFRAMEWORK"
 
 native_runtime_dir="$(
@@ -86,13 +87,15 @@ native_runtime_dir="$(
 )"
 export MESHLLM_NATIVE_RUNTIME_ARTIFACT_DIR="$native_runtime_dir"
 
+export MESH_SDK_REPOSITORY_ROOT="$REPO_ROOT"
+
 # shellcheck disable=SC2016 # The nested shell expands exported fixture variables.
 scripts/ci-sdk-fixture.sh "$1" "$2" "$3" -- \
     bash -lc '
         set -euo pipefail
-        cd '"$REPO_ROOT"'
+        cd "$MESH_SDK_REPOSITORY_ROOT"
         swift run \
-            --package-path sdk/swift/example/MeshExampleApp \
+            --package-path mesh/sdk/swift/example/MeshExampleApp \
             MeshExampleApp \
             "$MESH_SDK_INVITE_TOKEN"
     '

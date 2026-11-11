@@ -1,0 +1,725 @@
+use super::config::{MeshConfig, PluginConfigEntry};
+use super::*;
+
+fn private_host_mode() -> PluginHostMode {
+    PluginHostMode {
+        mesh_visibility: MeshVisibility::Private,
+    }
+}
+
+fn web_ui_manifest() -> proto::PluginWebUiManifest {
+    proto::PluginWebUiManifest {
+        pages: vec![proto::PluginWebUiPageManifest {
+            id: "home".into(),
+            label: "Home".into(),
+            icon: Some("icons/home.svg".into()),
+            route: "index.html".into(),
+            bundle_id: "main".into(),
+            entry_script: "assets/app.js".into(),
+            placement: proto::PluginWebUiPagePlacement::Auxiliary as i32,
+            host_header: None,
+        }],
+        config_sections: vec![proto::PluginWebUiConfigSectionManifest {
+            id: "settings".into(),
+            title: "Settings".into(),
+            entry_script: "assets/settings.js".into(),
+            parent_tab: Some("integrations".into()),
+            bundle_id: "main".into(),
+        }],
+        contributions: vec![proto::PluginWebUiContributionManifest {
+            id: "note".into(),
+            slot: "logs_request".into(),
+            label: "Note".into(),
+            bundle_id: "main".into(),
+            entry_script: "assets/note.js".into(),
+        }],
+        bundles: vec![proto::PluginWebUiBundleManifest {
+            id: "main".into(),
+            root_path: "web".into(),
+        }],
+    }
+}
+
+#[test]
+fn plugin_manifest_overview_includes_web_ui_declaration() {
+    let manifest = proto::PluginManifest {
+        web_ui: Some(web_ui_manifest()),
+        ..proto::PluginManifest::default()
+    };
+
+    let overview = plugin_manifest_overview(&manifest);
+
+    let web_ui = overview.web_ui.expect("web UI overview should be present");
+    assert_eq!(web_ui.pages[0].id, "home");
+    assert_eq!(web_ui.config_sections[0].id, "settings");
+    assert_eq!(web_ui.contributions[0].slot, "logs_request");
+}
+
+fn virtual_route(plugin_name: &str, model_id: &str) -> VirtualModelRoute {
+    VirtualModelRoute {
+        plugin_name: plugin_name.into(),
+        model_id: model_id.into(),
+        handler: "chat".into(),
+        input_modalities: vec!["text".into()],
+        output_modalities: vec!["text".into()],
+        supports_tools: false,
+        supports_streaming: false,
+        requires_candidates: false,
+        progress_lines: Vec::new(),
+    }
+}
+
+#[test]
+fn runtime_virtual_model_lookup_omits_only_concrete_collisions() {
+    let routes = vec![
+        virtual_route("colliding", "shared"),
+        virtual_route("healthy", "virtual-only"),
+    ];
+    let concrete_models = BTreeSet::from(["shared".to_string()]);
+
+    let routes = apply_virtual_model_collision_policy(
+        routes,
+        &concrete_models,
+        VirtualModelCollisionPolicy::Omit,
+    )
+    .expect("runtime routes");
+
+    assert_eq!(routes, vec![virtual_route("healthy", "virtual-only")]);
+}
+
+#[test]
+fn startup_virtual_model_lookup_rejects_concrete_collisions() {
+    let error = apply_virtual_model_collision_policy(
+        vec![virtual_route("colliding", "shared")],
+        &BTreeSet::from(["shared".to_string()]),
+        VirtualModelCollisionPolicy::Reject,
+    )
+    .expect_err("startup must reject the collision");
+
+    assert!(
+        error
+            .to_string()
+            .contains("collides with a concrete plugin model")
+    );
+}
+
+// The tests that check everything `resolve_plugins` returns are serial: it
+// also lists the store `MESH_LLM_PLUGIN_DIR` names, and the serial plugin
+// store tests point that variable at stores of their own while they run.
+#[test]
+#[serial_test::serial]
+fn resolves_default_builtin_plugins() {
+    let resolved = resolve_plugins(&MeshConfig::default(), private_host_mode()).unwrap();
+    assert_eq!(resolved.externals.len(), 1);
+    assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
+    assert!(resolved.externals[0].startup.optional);
+    assert!(resolved.inactive.is_empty());
+}
+
+#[test]
+fn builtin_plugin_arguments_follow_the_plugin_flag() {
+    let spec = super::config::builtin_plugin_spec(
+        BLOBSTORE_PLUGIN_ID,
+        &["--root".into(), "/srv/blobs".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        spec.args,
+        [
+            "--log-format",
+            "json",
+            "--plugin",
+            BLOBSTORE_PLUGIN_ID,
+            "--plugin-arg=--root",
+            "--plugin-arg=/srv/blobs",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn builtin_plugin_without_arguments_refuses_them() {
+    let error = run_plugin_process(BLOBSTORE_PLUGIN_ID.into(), vec!["--verbose".into()])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("takes no arguments"), "{error}");
+}
+
+#[test]
+#[serial_test::serial]
+fn external_capability_plugin_is_an_ordinary_plugin() {
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: "vault-provider".into(),
+            enabled: Some(true),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: Some("/opt/plugins/vault-provider".into()),
+            args: Vec::new(),
+            url: None,
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        defaults: None,
+        ..MeshConfig::default()
+    };
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    let names: Vec<_> = resolved.externals.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["vault-provider", BLOBSTORE_PLUGIN_ID]);
+    assert!(!resolved.externals[0].startup.optional);
+}
+
+#[test]
+#[serial_test::serial]
+fn external_plugin_can_be_configured() {
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: "demo".into(),
+            enabled: Some(true),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: Some("mesh-llm-plugin-demo".into()),
+            args: vec!["--stdio".into()],
+            url: None,
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        defaults: None,
+        ..MeshConfig::default()
+    };
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    assert_eq!(resolved.externals.len(), 2);
+    assert_eq!(resolved.externals[0].name, "demo");
+    assert_eq!(resolved.externals[0].command, "mesh-llm-plugin-demo");
+    assert_eq!(resolved.externals[0].args, ["--stdio"]);
+    assert_eq!(resolved.externals[0].endpoint_models, None);
+    assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+    assert!(resolved.inactive.is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn external_plugin_carries_its_endpoint_model_allowlist() {
+    let config: MeshConfig = toml::from_str(
+        r#"
+[[plugin]]
+name = "openai-endpoint"
+command = "mesh-llm-plugin-openai-endpoint"
+url = "http://127.0.0.1:8888/v1"
+models = ["deepseek-v4-1-flash"]
+"#,
+    )
+    .unwrap();
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    assert_eq!(resolved.externals[0].name, "openai-endpoint");
+    assert_eq!(
+        resolved.externals[0].endpoint_models.as_deref(),
+        Some(&["deepseek-v4-1-flash".to_string()][..])
+    );
+}
+
+/// A minimal built-in plugin stanza used as a template by the tests below.
+fn wallet_entry(enabled: Option<bool>) -> PluginConfigEntry {
+    PluginConfigEntry {
+        name: "wallet".into(),
+        enabled,
+        web_ui_enabled: None,
+        web_ui_primary_tab: None,
+        allow_peer_blocks: None,
+        allow_inference_observation: None,
+        openai_exchange_grant: None,
+        operation_bindings: Vec::new(),
+        command: None,
+        args: Vec::new(),
+        url: None,
+        models: None,
+        settings: Default::default(),
+        startup: Default::default(),
+    }
+}
+
+#[test]
+fn builtin_plugin_entry_rejects_an_endpoint_model_allowlist() {
+    let mut entry = wallet_entry(Some(true));
+    entry.name = BLOBSTORE_PLUGIN_ID.into();
+    entry.models = Some(vec!["anything".into()]);
+    let config = MeshConfig {
+        plugins: vec![entry],
+        ..MeshConfig::default()
+    };
+    let error = resolve_plugins(&config, private_host_mode())
+        .expect_err("a built-in plugin exposes no endpoint models to restrict");
+    assert!(error.to_string().contains("only `enabled` may be set"));
+}
+
+#[test]
+fn failed_plugin_summary_redacts_urls_before_serialization() {
+    let spec = ExternalPluginSpec {
+        operation_bindings: Vec::new(),
+        openai_exchange_grant: None,
+        name: "remote".into(),
+        command: "mesh-llm-plugin-remote".into(),
+        args: Vec::new(),
+        url: Some("https://plugin.example.test/v1".into()),
+        env: BTreeMap::new(),
+        settings: Default::default(),
+        startup: PluginStartupOptions {
+            optional: true,
+            ..PluginStartupOptions::default()
+        },
+        web_ui_enabled: None,
+        web_ui_primary_tab: None,
+        endpoint_models: None,
+        installed_metadata: None,
+    };
+    let error = anyhow::anyhow!(
+        "connection to tcp://user:secret@127.0.0.1:19091/control?token=private failed"
+    );
+
+    let summary = PluginManager::plugin_load_failure_summary(&spec, &error);
+    let serialized = serde_json::to_string(&summary).expect("summary serializes");
+
+    assert!(!serialized.contains("user"));
+    assert!(!serialized.contains("secret"));
+    assert!(!serialized.contains("private"));
+}
+
+#[test]
+#[serial_test::serial]
+fn blobstore_can_be_disabled() {
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: BLOBSTORE_PLUGIN_ID.into(),
+            enabled: Some(false),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: None,
+            args: Vec::new(),
+            url: None,
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        defaults: None,
+        ..MeshConfig::default()
+    };
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    assert!(resolved.externals.is_empty());
+    assert!(resolved.inactive.is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn external_plugin_can_be_enabled_with_url() {
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: "endpoint-plugin".into(),
+            enabled: Some(true),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: Some("endpoint-plugin".into()),
+            args: Vec::new(),
+            url: Some("http://gpu-box:8000/v1".into()),
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        defaults: None,
+        ..MeshConfig::default()
+    };
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    assert_eq!(resolved.externals.len(), 2);
+    assert_eq!(resolved.externals[0].name, "endpoint-plugin");
+    assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+    let spec = &resolved.externals[0];
+    assert_eq!(spec.command, "endpoint-plugin");
+    assert!(spec.args.is_empty());
+    assert_eq!(spec.url.as_deref(), Some("http://gpu-box:8000/v1"));
+}
+
+#[test]
+#[serial_test::serial]
+fn external_plugin_rejects_url_that_is_empty_after_normalization() {
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: "endpoint-plugin".into(),
+            enabled: Some(true),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: Some("endpoint-plugin".into()),
+            args: Vec::new(),
+            url: Some("\u{2003}\t\n".into()),
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        ..MeshConfig::default()
+    };
+
+    let error = resolve_plugins(&config, private_host_mode())
+        .expect_err("normalized plugin URL must not be empty");
+    assert!(error.to_string().contains("plugin URL must not be empty"));
+}
+
+#[test]
+#[serial_test::serial]
+fn remote_plugin_control_url_is_rejected_without_authentication() {
+    let raw_url = "\u{2003}tcp://user:secret@127.0.0.1:19091/control?token=private\u{2003}";
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: "remote-plugin".into(),
+            enabled: Some(true),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: None,
+            args: Vec::new(),
+            url: Some(raw_url.into()),
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        defaults: None,
+        ..MeshConfig::default()
+    };
+
+    let error = resolve_plugins(&config, private_host_mode())
+        .expect_err("unauthenticated remote plugin control must be rejected");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("authenticated capability handshake"));
+    assert!(!diagnostic.contains("user"));
+    assert!(!diagnostic.contains("secret"));
+    assert!(!diagnostic.contains("private"));
+    assert!(!diagnostic.contains(raw_url));
+}
+
+#[test]
+#[serial_test::serial]
+fn external_plugin_can_be_enabled_with_command_args() {
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: "endpoint-plugin".into(),
+            enabled: Some(true),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: Some("/opt/plugins/endpoint-plugin".into()),
+            args: vec!["--verbose".into()],
+            url: None,
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        defaults: None,
+        ..MeshConfig::default()
+    };
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    assert_eq!(resolved.externals.len(), 2);
+    assert_eq!(resolved.externals[0].name, "endpoint-plugin");
+    assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+    let spec = &resolved.externals[0];
+    assert_eq!(spec.command, "/opt/plugins/endpoint-plugin");
+    assert_eq!(spec.args, vec!["--verbose"]);
+}
+
+#[test]
+#[serial_test::serial]
+fn external_plugin_ignores_disabled_entry_without_install() {
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: "endpoint-plugin".into(),
+            enabled: Some(false),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: None,
+            args: Vec::new(),
+            url: Some("http://gpu-box:8000/v1".into()),
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        defaults: None,
+        ..MeshConfig::default()
+    };
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    assert_eq!(resolved.externals.len(), 1);
+    assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
+}
+
+#[test]
+#[serial_test::serial]
+fn default_builtins_are_resolved_on_public_meshes() {
+    let resolved = resolve_plugins(
+        &MeshConfig::default(),
+        PluginHostMode {
+            mesh_visibility: MeshVisibility::Public,
+        },
+    )
+    .unwrap();
+    assert_eq!(resolved.externals.len(), 1);
+    assert_eq!(resolved.externals[0].name, BLOBSTORE_PLUGIN_ID);
+    assert!(resolved.inactive.is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn resolves_external_plugin() {
+    let config = MeshConfig {
+        plugins: vec![PluginConfigEntry {
+            operation_bindings: Vec::new(),
+            name: "demo".into(),
+            enabled: Some(true),
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            allow_peer_blocks: None,
+            allow_inference_observation: None,
+            openai_exchange_grant: None,
+            command: Some("/tmp/demo".into()),
+            args: vec!["--flag".into()],
+            url: None,
+            models: None,
+            settings: Default::default(),
+            startup: Default::default(),
+        }],
+        defaults: None,
+        ..MeshConfig::default()
+    };
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    assert_eq!(resolved.externals.len(), 2);
+    assert_eq!(resolved.externals[0].name, "demo");
+    assert_eq!(resolved.externals[1].name, BLOBSTORE_PLUGIN_ID);
+    assert!(resolved.inactive.is_empty());
+}
+
+#[tokio::test]
+async fn plugin_load_failure_keeps_declared_web_ui_metadata() {
+    let specs = ResolvedPlugins {
+        externals: vec![ExternalPluginSpec {
+            operation_bindings: Vec::new(),
+            openai_exchange_grant: None,
+            name: "demo".into(),
+            command: "mesh-llm-definitely-missing-plugin-binary".into(),
+            args: Vec::new(),
+            url: None,
+            env: BTreeMap::new(),
+            settings: Default::default(),
+            startup: PluginStartupOptions {
+                optional: true,
+                ..PluginStartupOptions::default()
+            },
+            web_ui_enabled: None,
+            web_ui_primary_tab: None,
+            endpoint_models: None,
+            installed_metadata: Some(installed_metadata_with_web_ui(
+                InstalledPluginWebUiValidationStatus::Valid,
+                Some("web"),
+            )),
+        }],
+        inactive: Vec::new(),
+    };
+    let (mesh_tx, _mesh_rx) = mpsc::channel(1);
+
+    let manager = PluginManager::start(&specs, private_host_mode(), mesh_tx)
+        .await
+        .expect("broken plugin should not stop manager startup");
+    let summaries = manager.list().await;
+    manager.shutdown().await;
+
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].name, "demo");
+    assert_eq!(summaries[0].status, "error");
+    assert_eq!(
+        summaries[0].web_ui.state,
+        PluginWebUiStateKind::PluginNotRunning
+    );
+    assert_eq!(summaries[0].web_ui.pages.len(), 1);
+    assert_eq!(summaries[0].web_ui.config_sections.len(), 1);
+}
+
+#[test]
+fn instance_ids_include_pid_and_random_suffix() {
+    let instance_id = make_instance_id();
+    let prefix = format!("p{}-", std::process::id());
+    assert!(instance_id.starts_with(&prefix));
+    assert_eq!(instance_id.len(), prefix.len() + 8);
+    assert!(
+        instance_id[prefix.len()..]
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_socket_path_is_namespaced_by_instance_id() {
+    let path = unix_socket_path("p1234-deadbeef", "Pipes").unwrap();
+    assert_eq!(
+        path.file_name().and_then(|value| value.to_str()),
+        Some("p1234-deadbeef-Pipes.sock")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_pipe_name_is_namespaced_by_instance_id() {
+    assert_eq!(
+        windows_pipe_name("p1234-deadbeef", "Pipes"),
+        r"\\.\pipe\mesh-llm-p1234-deadbeef-Pipes"
+    );
+}
+
+/// A built-in plugin is listed among the resolved externals whenever it is
+/// enabled, but this host serves it itself and neither built-in exposes
+/// inference. Naming one as a model's provider must fail loudly instead of
+/// resolving and then serving nothing: native startup skips provider models.
+#[test]
+#[serial_test::serial]
+fn built_in_plugin_is_not_a_model_provider() {
+    let config: MeshConfig = toml::from_str(
+        r#"
+[[models]]
+model = "mystery"
+provider = "blobstore"
+"#,
+    )
+    .expect("config should parse");
+
+    let error = resolve_plugins(&config, private_host_mode())
+        .expect_err("a built-in plugin must not resolve as a model provider");
+    assert!(
+        error
+            .to_string()
+            .contains("selects unavailable provider 'blobstore'"),
+        "got: {error}"
+    );
+}
+
+/// The provider check must stay a check on *inference-capable* externals: a
+/// configured plugin command still resolves and still receives the model
+/// selection it serves.
+#[test]
+#[serial_test::serial]
+fn external_plugin_still_resolves_as_a_model_provider() {
+    let config: MeshConfig = toml::from_str(
+        r#"
+[[plugin]]
+name = "endpoint-plugin"
+command = "/opt/plugins/endpoint-plugin"
+
+[[models]]
+model = "mystery"
+provider = "endpoint-plugin"
+"#,
+    )
+    .expect("config should parse");
+
+    let resolved = resolve_plugins(&config, private_host_mode())
+        .expect("an external plugin command is a model provider");
+    let plugin = resolved
+        .externals
+        .iter()
+        .find(|spec| spec.name == "endpoint-plugin")
+        .expect("the configured plugin must resolve");
+    let models = plugin
+        .env
+        .get(mesh_llm_plugin::models::CONFIG_ENV)
+        .expect("the plugin must receive its model selection");
+    assert!(
+        models.contains("\"provider\":\"endpoint-plugin\""),
+        "got: {models}"
+    );
+}
+
+#[test]
+fn managed_sources_preserve_relative_config_and_resolve_runtime_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        r#"
+[[plugin]]
+name = "onnx"
+command = "/opt/onnx"
+[[models]]
+model = "owner/model@pin"
+provider = "onnx"
+[models.source]
+local_dir = "weights"
+"#,
+    )
+    .unwrap();
+    let config = load_config(Some(&path)).unwrap();
+    assert_eq!(
+        config.models[0].source.local_dir.as_deref(),
+        Some(std::path::Path::new("weights"))
+    );
+    assert!(
+        config_to_toml(&config)
+            .unwrap()
+            .contains("local_dir = \"weights\"")
+    );
+    let resolved = resolve_plugins(&config, private_host_mode()).unwrap();
+    let spec = resolved
+        .externals
+        .iter()
+        .find(|spec| spec.name == "onnx")
+        .unwrap();
+    let models: Vec<mesh_llm_plugin::models::ManagedModelConfig> =
+        serde_json::from_str(&spec.env[mesh_llm_plugin::models::CONFIG_ENV]).unwrap();
+    assert_eq!(models[0].source.local_dir, Some(dir.path().join("weights")));
+}
+
+#[test]
+fn unavailable_providers_fail_file_validation_and_snapshot_parsing() {
+    for provider in ["blobstore", "payments", "missing-provider"] {
+        let raw = format!("[[models]]\nmodel = 'owner/model@pin'\nprovider = '{provider}'\n");
+        assert!(
+            parse_config_toml(&raw)
+                .unwrap_err()
+                .to_string()
+                .contains("unavailable provider")
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &raw).unwrap();
+        assert!(
+            validate_config_file(Some(&path))
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("unavailable provider"))
+        );
+    }
+}
